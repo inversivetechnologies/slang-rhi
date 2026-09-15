@@ -75,7 +75,7 @@ if(SLANG_RHI_ENABLE_ASAN OR SLANG_RHI_ENABLE_UBSAN OR SLANG_RHI_ENABLE_TSAN)
         set(SLANG_RHI_SANITIZERS)
         if(SLANG_RHI_ENABLE_ASAN)
             list(APPEND SLANG_RHI_SANITIZERS address)
-        endif()
+        endif()     
         if(SLANG_RHI_ENABLE_UBSAN)
             list(APPEND SLANG_RHI_SANITIZERS undefined)
         endif()
@@ -1197,6 +1197,10 @@ if(SLANG_RHI_BUILD_EXAMPLES)
             target_include_directories(${name} PRIVATE examples/base)
             target_link_libraries(${name} PRIVATE slang-rhi slang glfw)
             if(WIN32)
+                # Steam Controller support in examples/base/steam-controller.h reads the
+                # controller's HID interfaces directly.
+                target_link_libraries(${name} PRIVATE setupapi hid)
+
                 # Hide the console window in Release builds (Debug keeps it for log output).
                 if(MSVC)
                     target_link_options(${name} PRIVATE $<$<CONFIG:Release>:/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup>)

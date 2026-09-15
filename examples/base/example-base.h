@@ -1,6 +1,8 @@
 #pragma once
 
 #include "utils.h"
+#include "steam-controller.h"
+#include "steam-keyboard.h"
 
 #include <slang.h>
 #include <slang-rhi.h>
@@ -51,6 +53,41 @@ public:
     virtual void onScroll(float x, float y) {}
     // Called when a key is pressed, released, or repeated.
     virtual void onKey(int key, int scancode, int action, int mods) {}
+    // Called when a Steam Controller is connected to or disconnected from a slot.
+    virtual void onControllerConnect(int slot, bool connected) {}
+    // Called when a Steam Controller button is pressed or released.
+    // `button` is one of SteamControllerButtons.
+    virtual void onControllerButton(int slot, uint32_t button, bool pressed) {}
+
+    // Accessors for Steam Controller state
+
+    // Returns the state of the given controller slot.
+    // Slots without a controller report a default (disconnected, all-zero) state.
+    const SteamControllerState& getControllerState(int slot = 0) const
+    {
+        static const SteamControllerState kEmptyState;
+        return (slot >= 0 && slot < kMaxSteamControllers) ? m_controllerStates[slot] : kEmptyState;
+    }
+
+    // Returns the state of the lowest slot with a connected controller, or a default
+    // (disconnected, all-zero) state if no controller is connected.
+    const SteamControllerState& getPrimaryControllerState() const
+    {
+        return getControllerState(m_primaryController);
+    }
+
+    // Returns the lowest slot with a connected controller, or -1 if there is none.
+    int getPrimaryController() const { return m_primaryController; }
+
+    // Returns true if the given controller slot has a connected controller.
+    bool isControllerConnected(int slot = 0) const { return getControllerState(slot).connected; }
+
+    // Returns true if the specified button (one of SteamControllerButtons) is currently
+    // down on the given controller slot.
+    bool isControllerButtonDown(uint32_t button, int slot = 0) const
+    {
+        return getControllerState(slot).button(button);
+    }
 
     // Accessors for mouse state
 
@@ -82,6 +119,20 @@ public:
 
     float m_mousePos[2] = {0.0f, 0.0f};
     bool m_mouseDown[3] = {false, false, false};
+
+    // Escape gives the pointer back; see dispatchPendingKeyEvents() and
+    // updateCursorModes(). m_cursorHidden tracks what has actually been applied, so
+    // the mode is only set when it changes.
+    bool m_cursorReleased = false;
+    bool m_cursorHidden = false;
+
+    // F11 fullscreen toggle: the windowed placement to put back, and which mode the
+    // window is in now.
+    int m_windowedRect[4] = {0, 0, 0, 0}; // x, y, width, height
+    bool m_fullscreen = false;
+
+    SteamControllerState m_controllerStates[kMaxSteamControllers];
+    int m_primaryController = -1;
 };
 
 namespace detail {
@@ -94,6 +145,7 @@ static void glfwCursorPosCallback(GLFWwindow* window, double xpos, double ypos);
 static void glfwMouseButtonCallback(GLFWwindow* window, int button, int action, int mods);
 static void glfwScrollCallback(GLFWwindow* window, double xoffset, double yoffset);
 static void glfwKeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods);
+static void glfwWindowCloseCallback(GLFWwindow* window);
 
 static std::vector<ExampleBase*>& getExamples()
 {
@@ -142,6 +194,7 @@ Result ExampleBase::createWindow(IDevice* device, const char* title, uint32_t wi
     glfwSetMouseButtonCallback(m_window, detail::glfwMouseButtonCallback);
     glfwSetScrollCallback(m_window, detail::glfwScrollCallback);
     glfwSetKeyCallback(m_window, detail::glfwKeyCallback);
+    glfwSetWindowCloseCallback(m_window, detail::glfwWindowCloseCallback);
 
     return SLANG_OK;
 }
@@ -313,6 +366,14 @@ static void glfwMouseButtonCallback(GLFWwindow* window, int button, int action, 
     {
         if (button < SLANG_COUNT_OF(example->m_mouseDown))
             example->m_mouseDown[button] = (action == GLFW_PRESS);
+        // A click re-arms the hiding that Escape released. GLFW only reports buttons
+        // over the content area -- the title bar and frame belong to the window
+        // manager and never reach here -- so this is already "in the body". Matched
+        // on `window` so a click only re-arms the example it landed in.
+        if (action == GLFW_PRESS && example->m_window == window)
+        {
+            example->m_cursorReleased = false;
+        }
         example->onMouseButton(button, action, mods);
     }
 }
@@ -325,14 +386,366 @@ static void glfwScrollCallback(GLFWwindow* window, double xoffset, double yoffse
     }
 }
 
+// A Steam Controller's desktop emulation (the puck firmware's "lizard mode", and Steam
+// Input's desktop layout) types on the keyboard for us: the d-pad and left stick send
+// arrow keys, which reach the window as ordinary key events that no API distinguishes
+// from a real keypress. Controller input is only meant to be displayed by the examples,
+// never to drive them, so key events are queued here and dispatched later, once the
+// controller has been polled and its state can be used to recognize them.
+struct PendingKeyEvent
+{
+    int key;
+    int scancode;
+    int action;
+    int mods;
+};
+
+static std::vector<PendingKeyEvent>& getPendingKeyEvents()
+{
+    static std::vector<PendingKeyEvent> pendingKeyEvents;
+    return pendingKeyEvents;
+}
+
+// Close requests are queued for the same reason as key events: whatever the desktop
+// layout types for the Menu button (Alt+F4 reaches us as a close request, not as keys)
+// arrives before the controller has been polled, so the decision to honor it has to
+// wait until its state is at least as recent as the request.
+static std::vector<GLFWwindow*>& getPendingCloseRequests()
+{
+    static std::vector<GLFWwindow*> pendingCloseRequests;
+    return pendingCloseRequests;
+}
+
 static void glfwKeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods)
+{
+    getPendingKeyEvents().push_back({key, scancode, action, mods});
+}
+
+static void glfwWindowCloseCallback(GLFWwindow* window)
+{
+    // GLFW has already raised the close flag by the time this runs, so take it back
+    // down and re-raise it in dispatchPendingCloseRequests() if the request survives.
+    glfwSetWindowShouldClose(window, GLFW_FALSE);
+    getPendingCloseRequests().push_back(window);
+}
+
+// The Steam Controller session is shared by all example windows, the same way GLFW input
+// callbacks are broadcast to all of them: HID input has no notion of window focus, so
+// every example sees the same controller state.
+static SteamKeyboardGuard& getSteamKeyboardGuard()
+{
+    static SteamKeyboardGuard guard;
+    return guard;
+}
+
+static StartMenuGuard& getStartMenuGuard()
+{
+    static StartMenuGuard guard;
+    return guard;
+}
+
+static CursorMotionGuard& getCursorMotionGuard()
+{
+    static CursorMotionGuard guard;
+    return guard;
+}
+
+static SteamControllerSession& getSteamControllerSession()
+{
+    static SteamControllerSession session;
+    return session;
+}
+
+// Steam's desktop layout hands us the keystroke or close request a beat after the
+// button that produced it, so sampling "is it held right now" at the moment the request
+// arrives is not enough: a quick tap, or one of two buttons pressed together, lands when
+// the pad already reads as idle and the request goes through.
+//
+// So these buttons are recorded on their press edge -- the event stream reports presses
+// that are over before the next poll, which the polled state alone would miss entirely --
+// and stay accountable for a grace window afterwards.
+static constexpr double kQuitButtonGrace = 0.5; // seconds
+
+static bool isQuitButton(uint32_t button)
+{
+    return button == SteamControllerButtons::Menu || button == SteamControllerButtons::View ||
+           button == SteamControllerButtons::B;
+}
+
+static double& getLastQuitButtonTime()
+{
+    static double lastQuitButtonTime = -1000.0;
+    return lastQuitButtonTime;
+}
+
+static void pollSteamControllers()
+{
+    SteamControllerSession& session = getSteamControllerSession();
+    session.update();
+
+    for (const SteamControllerEvent& event : session.getEvents())
+    {
+        if (event.type == SteamControllerEvent::Type::ButtonDown && isQuitButton(event.button))
+        {
+            getLastQuitButtonTime() = glfwGetTime();
+        }
+    }
+
+    for (ExampleBase* example : getExamples())
+    {
+        for (int slot = 0; slot < kMaxSteamControllers; ++slot)
+        {
+            example->m_controllerStates[slot] = session.getState(slot);
+        }
+        example->m_primaryController = session.getPrimarySlot();
+
+        for (const SteamControllerEvent& event : session.getEvents())
+        {
+            switch (event.type)
+            {
+            case SteamControllerEvent::Type::Connected:
+                example->onControllerConnect(event.slot, true);
+                break;
+            case SteamControllerEvent::Type::Disconnected:
+                example->onControllerConnect(event.slot, false);
+                break;
+            case SteamControllerEvent::Type::ButtonDown:
+                example->onControllerButton(event.slot, event.button, true);
+                break;
+            case SteamControllerEvent::Type::ButtonUp:
+                example->onControllerButton(event.slot, event.button, false);
+                break;
+            }
+        }
+    }
+}
+
+// Returns true if a quit-suppressing button is accountable for whatever just arrived --
+// held right now, or pressed within the last kQuitButtonGrace seconds. Whatever the
+// desktop layout does with these buttons, closing the window is not something the
+// examples want from them.
+static bool isControllerQuitSuppressed()
+{
+    SteamControllerSession& session = getSteamControllerSession();
+    int slot = session.getPrimarySlot();
+    if (slot < 0)
+    {
+        return false;
+    }
+    // Still held counts too, for a press that outlasts the grace window.
+    const SteamControllerState& state = session.getState(slot);
+    if (state.button(SteamControllerButtons::Menu) || state.button(SteamControllerButtons::View) ||
+        state.button(SteamControllerButtons::B))
+    {
+        return true;
+    }
+    return (glfwGetTime() - getLastQuitButtonTime()) < kQuitButtonGrace;
+}
+
+// Honors the close requests queued during glfwPollEvents(), dropping the ones a
+// controller button is accountable for. Must run after pollSteamControllers(), for the
+// same reason dispatchPendingKeyEvents() must.
+static void dispatchPendingCloseRequests()
+{
+    std::vector<GLFWwindow*>& pendingCloseRequests = getPendingCloseRequests();
+    for (GLFWwindow* window : pendingCloseRequests)
+    {
+        if (isControllerQuitSuppressed())
+        {
+            continue;
+        }
+        glfwSetWindowShouldClose(window, GLFW_TRUE);
+    }
+    pendingCloseRequests.clear();
+}
+
+
+// Returns true if the current controller state accounts for this key event, i.e. the
+// controller's desktop emulation synthesized it rather than someone pressing the key.
+// Only the keys that emulation is known to produce are recognized; a controller that
+// is disconnected (or whose state doesn't match) never suppresses a key.
+static bool isControllerEmulatedKey(int key)
+{
+    SteamControllerSession& session = getSteamControllerSession();
+    int slot = session.getPrimarySlot();
+    if (slot < 0)
+    {
+        return false;
+    }
+    const SteamControllerState& state = session.getState(slot);
+    // Emulation starts typing well before the stick is at its limit.
+    static const float kDeadzone = 0.25f;
+    switch (key)
+    {
+    case GLFW_KEY_LEFT:
+        return state.button(SteamControllerButtons::DPadLeft) || state.leftStick[0] < -kDeadzone;
+    case GLFW_KEY_RIGHT:
+        return state.button(SteamControllerButtons::DPadRight) || state.leftStick[0] > kDeadzone;
+    case GLFW_KEY_UP:
+        return state.button(SteamControllerButtons::DPadUp) || state.leftStick[1] > kDeadzone;
+    case GLFW_KEY_DOWN:
+        return state.button(SteamControllerButtons::DPadDown) || state.leftStick[1] < -kDeadzone;
+    // The desktop layout types Escape for B, and for Menu/View depending on how it is
+    // configured, which dispatchPendingKeyEvents() would otherwise read as "quit". A
+    // keyboard Escape with none of them recently pressed still closes the window.
+    case GLFW_KEY_ESCAPE:
+        return isControllerQuitSuppressed();
+    default:
+        return false;
+    }
+}
+
+// Switches a window between fullscreen on the primary monitor and the placement it had
+// before, remembering that placement on the way in.
+//
+// Fullscreen here is the "borderless at the monitor's current video mode" kind: the mode
+// passed to glfwSetWindowMonitor() is the one already in use, so nothing changes
+// resolution. Like the code this replaces, it always uses the primary monitor rather
+// than the one the window happens to be sitting on -- GLFW has no call for the latter,
+// it takes comparing the window's rect against every monitor's.
+//
+// This resizes the window, which fires the framebuffer callback and reconfigures the
+// surface, so it must not run before the surface exists.
+static void toggleFullscreen(ExampleBase* example)
+{
+    if (!example->m_window)
+    {
+        return;
+    }
+    if (example->m_fullscreen)
+    {
+        glfwSetWindowMonitor(
+            example->m_window,
+            nullptr,
+            example->m_windowedRect[0],
+            example->m_windowedRect[1],
+            example->m_windowedRect[2],
+            example->m_windowedRect[3],
+            GLFW_DONT_CARE
+        );
+        example->m_fullscreen = false;
+    }
+    else
+    {
+        glfwGetWindowPos(example->m_window, &example->m_windowedRect[0], &example->m_windowedRect[1]);
+        glfwGetWindowSize(example->m_window, &example->m_windowedRect[2], &example->m_windowedRect[3]);
+        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+        const GLFWvidmode* mode = monitor ? glfwGetVideoMode(monitor) : nullptr;
+        if (!mode)
+        {
+            return;
+        }
+        glfwSetWindowMonitor(
+            example->m_window,
+            monitor,
+            0,
+            0,
+            mode->width,
+            mode->height,
+            mode->refreshRate
+        );
+        example->m_fullscreen = true;
+    }
+}
+
+// Delivers the key events queued during glfwPollEvents(), skipping the ones the
+// controller typed. Must run after pollSteamControllers(), so that events are checked
+// against controller state that is at least as recent as the events themselves.
+static void dispatchPendingKeyEvents()
+{
+    std::vector<PendingKeyEvent>& pendingKeyEvents = getPendingKeyEvents();
+    for (const PendingKeyEvent& event : pendingKeyEvents)
+    {
+        if (isControllerEmulatedKey(event.key))
+        {
+            continue;
+        }
+        for (ExampleBase* example : getExamples())
+        {
+            example->onKey(event.key, event.scancode, event.action, event.mods);
+            if (event.key == GLFW_KEY_ESCAPE && event.action == GLFW_PRESS)
+            {
+                // The first Escape hands the pointer back, the second one quits, so
+                // there's still a way out that doesn't need the mouse. A B press on a
+                // Steam controller never gets this far -- isControllerEmulatedKey()
+                // has already dropped the Escape its desktop layout types.
+                if (!example->m_cursorReleased)
+                {
+                    example->m_cursorReleased = true;
+                }
+                else
+                {
+                    glfwSetWindowShouldClose(example->m_window, GLFW_TRUE);
+                }
+            }
+            if (event.key == GLFW_KEY_F11 && event.action == GLFW_PRESS)
+            {
+                toggleFullscreen(example);
+            }
+        }
+    }
+    pendingKeyEvents.clear();
+}
+
+// Hides the pointer while a window has focus, so it doesn't sit over what the example
+// is drawing, and shows it again once Escape has released it or focus has gone
+// elsewhere.
+//
+// GLFW_CURSOR_HIDDEN, not GLFW_CURSOR_DISABLED: disabled would also grab the pointer
+// and switch it to unbounded virtual motion, which would wreck the window-relative
+// coordinates examples read through getMouseX()/getMouseY().
+// Arms the desktop suppressions only while an example window has focus -- so a Steam
+// keyboard opened over any other application is left alone, and the Windows key works
+// normally everywhere else -- and puts focus back on the window that lost it when a
+// keyboard is hidden.
+static void updateSteamDesktopGuards()
+{
+    // Remembered across frames: once the keyboard has taken focus, nothing of ours is
+    // focused any more, so "the window to restore" has to be the last one that was.
+    static ExampleBase* lastFocused = nullptr;
+
+    ExampleBase* focused = nullptr;
+    for (ExampleBase* example : getExamples())
+    {
+        if (example->m_window && glfwGetWindowAttrib(example->m_window, GLFW_FOCUSED))
+        {
+            focused = example;
+            break;
+        }
+    }
+    if (focused)
+    {
+        lastFocused = focused;
+    }
+
+    SteamKeyboardGuard& guard = getSteamKeyboardGuard();
+    guard.setArmed(focused != nullptr);
+    getStartMenuGuard().setArmed(focused != nullptr);
+    getCursorMotionGuard().setArmed(focused != nullptr);
+    if (guard.takeFocusRequest() && lastFocused && lastFocused->m_window)
+    {
+        glfwFocusWindow(lastFocused->m_window);
+    }
+}
+
+static void updateCursorModes()
 {
     for (ExampleBase* example : getExamples())
     {
-        example->onKey(key, scancode, action, mods);
-        if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
+        if (!example->m_window)
         {
-            glfwSetWindowShouldClose(example->m_window, GLFW_TRUE);
+            continue;
+        }
+        bool focused = glfwGetWindowAttrib(example->m_window, GLFW_FOCUSED) != 0;
+        bool hide = focused && !example->m_cursorReleased;
+        if (hide != example->m_cursorHidden)
+        {
+            glfwSetInputMode(
+                example->m_window,
+                GLFW_CURSOR,
+                hide ? GLFW_CURSOR_HIDDEN : GLFW_CURSOR_NORMAL
+            );
+            example->m_cursorHidden = hide;
         }
     }
 }
@@ -379,6 +792,10 @@ static int main(int argc, const char** argv)
 
     layoutWindows();
 
+    getSteamKeyboardGuard().install();
+    getStartMenuGuard().install();
+    getCursorMotionGuard().install();
+
     if (examples.size() > 0)
     {
         while (true)
@@ -398,6 +815,11 @@ static int main(int argc, const char** argv)
             }
 
             glfwPollEvents();
+            pollSteamControllers();
+            dispatchPendingKeyEvents();
+            dispatchPendingCloseRequests();
+            updateSteamDesktopGuards();
+            updateCursorModes();
 
             double time = glfwGetTime();
 
@@ -416,6 +838,9 @@ static int main(int argc, const char** argv)
         }
     }
 
+    getSteamKeyboardGuard().uninstall();
+    getStartMenuGuard().uninstall();
+    getCursorMotionGuard().uninstall();
     glfwTerminate();
 
     return 0;

@@ -10,6 +10,7 @@ static const std::vector<const char*> kShaders = {
     "circle.slang",
     "ocean.slang",
     "sdfs2d.slang",
+    "controller.slang",
 };
 
 // Example for running "ShaderToy"-style shaders using a compute shader to render to a texture.
@@ -27,12 +28,6 @@ public:
         SLANG_RETURN_ON_FAIL(createDevice(deviceType, {Feature::Surface}, {}, m_device.writeRef()));
         SLANG_RETURN_ON_FAIL(createWindow(m_device, "ShaderToy"));
         SLANG_RETURN_ON_FAIL(createSurface(m_device, Format::Undefined, m_surface.writeRef()));
-
-        // Make the window fullscreen on the primary monitor.
-        // Done after the surface is created since this triggers a resize callback that accesses it.
-        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
-        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
-        glfwSetWindowMonitor(m_window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
 
         SLANG_RETURN_ON_FAIL(m_device->getQueue(QueueType::Graphics, m_queue.writeRef()));
 
@@ -137,6 +132,7 @@ public:
             m_combinedMouseClicked ? 1.f : 0.f
         };
         cursor["iMouse"].setData(mouse);
+        bindSteamControllerState(cursor["iController"], getPrimaryControllerState());
         cursor["texture"].setBinding(m_texture);
         passEncoder->dispatchCompute((width + 15) / 16, (height + 15) / 16, 1);
         passEncoder->end();
