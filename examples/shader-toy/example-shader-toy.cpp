@@ -1,7 +1,10 @@
 #include "example-base.h"
 
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
+#include <string>
 
 using namespace rhi;
 
@@ -34,6 +37,15 @@ public:
         m_blitter = std::make_unique<Blitter>(m_device);
 
         m_pipelines.resize(kShaders.size());
+        m_watched.resize(kShaders.size());
+        for (size_t i = 0; i < kShaders.size(); ++i)
+        {
+            std::error_code ec;
+            m_watched[i].known = std::filesystem::last_write_time(shaderPath(i), ec);
+        }
+        printf("[shader-toy] watching '%s' for shader edits\n", EXAMPLE_DIR);
+        fflush(stdout);
+
         loadShader();
         return SLANG_OK;
     }
@@ -55,6 +67,12 @@ public:
         }
         m_timeDelta = time - m_time;
         m_time = time;
+
+        if (time - m_lastWatchTime >= kWatchInterval)
+        {
+            m_lastWatchTime = time;
+            pollShaderFiles();
+        }
         m_frameRate = 0.9 * m_frameRate + 0.1 * (m_timeDelta > 0.0 ? (1.0 / m_timeDelta) : 0.0);
 
         if (isMouseDown(0))
@@ -181,6 +199,104 @@ public:
         }
     }
 
+    std::string shaderPath(size_t index) const
+    {
+        return std::string(EXAMPLE_DIR) + "/" + kShaders[index];
+    }
+
+    // Looks for edited shaders. A changed timestamp has to survive one further check
+    // before it counts: editors write in more than one step, and compiling a half-written
+    // file just produces errors for something that is about to be valid.
+    void pollShaderFiles()
+    {
+        for (size_t i = 0; i < kShaders.size(); ++i)
+        {
+            std::error_code ec;
+            std::filesystem::file_time_type stamp = std::filesystem::last_write_time(shaderPath(i), ec);
+            if (ec)
+            {
+                continue; // mid-write, or gone: try again next time
+            }
+            WatchedShader& watched = m_watched[i];
+            if (stamp == watched.known)
+            {
+                watched.hasPending = false;
+                continue;
+            }
+            if (!watched.hasPending || stamp != watched.pending)
+            {
+                watched.pending = stamp;
+                watched.hasPending = true;
+                continue;
+            }
+            watched.known = stamp;
+            watched.hasPending = false;
+            onShaderFileChanged(i);
+        }
+    }
+
+    void onShaderFileChanged(size_t index)
+    {
+        // The pipeline about to be replaced may still be referenced by work in flight.
+        m_queue->waitOnHost();
+
+        if (index == size_t(m_shaderIndex))
+        {
+            reloadCurrentShader();
+        }
+        else
+        {
+            // Not on screen: drop it so selecting it compiles the new source.
+            m_pipelines[index].setNull();
+        }
+    }
+
+    // Compiles the current shader afresh, keeping the running build if it doesn't
+    // compile -- a syntax error while typing should cost you the frame, not the session.
+    void reloadCurrentShader()
+    {
+        std::string path = shaderPath(m_shaderIndex);
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+        {
+            printf("[shader-toy] could not open '%s'\n", path.c_str());
+            fflush(stdout);
+            return;
+        }
+        std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+        // The session keys loaded modules by name *and* by path, and holding either
+        // against an already-loaded module is an error ("The key already exists in
+        // Dictionary"), so both have to be new on every reload. The suffix goes on the
+        // file name rather than the directory: #include is resolved relative to the
+        // path's directory, which has to stay the real one.
+        ++m_reloadSerial;
+        char moduleName[256];
+        snprintf(moduleName, sizeof(moduleName), "%s-reload%u", kShaders[m_shaderIndex], m_reloadSerial);
+        char virtualPath[512];
+        snprintf(virtualPath, sizeof(virtualPath), "%s-reload%u", path.c_str(), m_reloadSerial);
+
+        SLANG_RHI_DEVICE_SCOPE(m_device);
+        ComPtr<IComputePipeline> pipeline;
+        if (SLANG_FAILED(createComputePipelineFromNamedSource(
+                m_device,
+                moduleName,
+                virtualPath,
+                source.c_str(),
+                "mainCompute",
+                pipeline.writeRef()
+            )))
+        {
+            printf("[shader-toy] '%s' failed to compile, keeping the running build\n", kShaders[m_shaderIndex]);
+            fflush(stdout);
+            return;
+        }
+
+        m_pipelines[m_shaderIndex] = pipeline;
+        printf("[shader-toy] reloaded '%s'\n", kShaders[m_shaderIndex]);
+        fflush(stdout);
+    }
+
     void loadShader()
     {
         if (m_pipelines[m_shaderIndex])
@@ -224,6 +340,18 @@ public:
     uint32_t m_frame = 0;
 
     int m_shaderIndex = 0;
+
+    // Shader hot reload.
+    static constexpr double kWatchInterval = 0.15; // seconds between checks
+    struct WatchedShader
+    {
+        std::filesystem::file_time_type known{};
+        std::filesystem::file_time_type pending{};
+        bool hasPending = false;
+    };
+    std::vector<WatchedShader> m_watched;
+    double m_lastWatchTime = 0.0;
+    uint32_t m_reloadSerial = 0;
 };
 
 EXAMPLE_MAIN(ExampleShaderToy)

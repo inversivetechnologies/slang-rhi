@@ -229,6 +229,60 @@ inline Result createComputePipeline(
     return _createComputePipeline(device, path, false, entryPointName, outPipeline);
 }
 
+// Builds a compute pipeline from source text loaded under an explicit module name.
+//
+// Reloading an edited shader needs this rather than createComputePipeline(): the Slang
+// session caches modules by name, so asking it for the same file again hands back the
+// build it already has, edits and all ignored. A fresh module name per reload sidesteps
+// the cache. `path` is still passed so diagnostics point at the real file.
+inline Result createComputePipelineFromNamedSource(
+    IDevice* device,
+    const char* moduleName,
+    const char* path,
+    const char* source,
+    const char* entryPointName,
+    IComputePipeline** outPipeline
+)
+{
+    ComPtr<slang::IBlob> diagnostics;
+    slang::IModule* module =
+        device->getSlangSession()->loadModuleFromSourceString(moduleName, path, source, diagnostics.writeRef());
+    PRINT_DIAGNOSTICS(diagnostics);
+    if (!module)
+    {
+        printf("Failed to load Slang module from '%s'\n", path);
+        return SLANG_FAIL;
+    }
+
+    slang::IEntryPoint* entryPoint;
+    if (!SLANG_SUCCEEDED(module->findEntryPointByName(entryPointName, &entryPoint)))
+    {
+        printf("Failed to find entry point '%s' in module '%s'\n", entryPointName, path);
+        return SLANG_FAIL;
+    }
+    slang::IComponentType* entryPoints[] = {entryPoint};
+
+    ShaderProgramDesc programDesc = {};
+    programDesc.linkingStyle = LinkingStyle::SingleProgram;
+    programDesc.slangEntryPoints = entryPoints;
+    programDesc.slangEntryPointCount = 1;
+    programDesc.slangGlobalScope = module;
+
+    ComPtr<IShaderProgram> program;
+    diagnostics.setNull();
+    device->createShaderProgram(programDesc, program.writeRef(), diagnostics.writeRef());
+    PRINT_DIAGNOSTICS(diagnostics);
+    if (!program)
+    {
+        printf("Failed to create program for module '%s'\n", path);
+        return SLANG_FAIL;
+    }
+
+    ComputePipelineDesc pipelineDesc = {};
+    pipelineDesc.program = program;
+    return device->createComputePipeline(pipelineDesc, outPipeline);
+}
+
 inline Result createComputePipelineFromSource(
     IDevice* device,
     const char* source,
