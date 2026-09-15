@@ -82,8 +82,11 @@ float Radial (float2 p)
 
 float3 ColorSDF (float3 inner, float3 outer, float thickness, float d)
 {
-    float h = clamp(round(frac(d/ thickness)), 0, 1);
-    h = clamp(0, 1, h + .5);
+    // Half-brightness on one stripe, full on the next. Written as an explicit
+    // comparison rather than round(): at exactly 0.5 the tie direction of round() is
+    // implementation-chosen in SPIR-V and ties-to-even in WGSL, and this threshold is
+    // the whole function.
+    float h = frac(d / thickness) < 0.5 ? 0.5 : 1.0;
     float3 c = d < 0.0f ? inner/h : outer*h;
     return c;
 }
