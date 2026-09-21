@@ -665,18 +665,11 @@ static void dispatchPendingKeyEvents()
             example->onKey(event.key, event.scancode, event.action, event.mods);
             if (event.key == GLFW_KEY_ESCAPE && event.action == GLFW_PRESS)
             {
-                // The first Escape hands the pointer back, the second one quits, so
-                // there's still a way out that doesn't need the mouse. A B press on a
-                // Steam controller never gets this far -- isControllerEmulatedKey()
-                // has already dropped the Escape its desktop layout types.
-                if (!example->m_cursorReleased)
-                {
-                    example->m_cursorReleased = true;
-                }
-                else
-                {
-                    glfwSetWindowShouldClose(example->m_window, GLFW_TRUE);
-                }
+                // Escape hands the pointer back, and that is all it does -- closing is
+                // the window's close box or Alt+F4. A B press on a Steam controller
+                // never gets this far: isControllerEmulatedKey() has already dropped
+                // the Escape its desktop layout types.
+                example->m_cursorReleased = true;
             }
             if (event.key == GLFW_KEY_F11 && event.action == GLFW_PRESS)
             {
