@@ -8,6 +8,7 @@ external/optix
 .idea/
 
 *.nsys-rep
+*.ply
 
 /.claude/scheduled_tasks.lock
 /.claude/settings.local.json
