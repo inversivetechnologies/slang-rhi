@@ -1228,7 +1228,7 @@ if(SLANG_RHI_BUILD_EXAMPLES)
         endif()
 
         # One host runs every example: each one is a Lua script next to its shaders,
-        # picked on the command line (e.g. `example-lua triangle`).
+        # picked on the command line (e.g. `example-lua scene`).
         add_example(example-lua examples/lua/example-lua.cpp)
         target_compile_definitions(example-lua PRIVATE EXAMPLES_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/examples")
         target_link_libraries(example-lua PRIVATE slang-rhi-lua)

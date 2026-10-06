@@ -1,24 +1,26 @@
--- Every example in one script: the surface clear, the triangle and the ShaderToy shaders,
--- one after another in the same window.
+-- Every example in one script: the surface clear, the lit scene and the ShaderToy
+-- shaders, one after another in the same window.
 --
 --   Left / Right arrows     previous / next mode
 --   1 .. 6                  jump to a mode
 --   Steam Controller LB/RB  previous / next mode
---   Left mouse button       moves iMouse in the ShaderToy modes
+--   Left mouse button       moves iMouse in the ShaderToy modes, orbits the scene's camera
+--
+-- The scene has more controls of its own; see ../scene/scene-mode.lua.
 --
 -- Edit this script or any of the shaders while it runs; they reload when saved.
 
 config = {
     title = "Showcase",
     device = "vulkan",              -- the graphics API; `--api d3d12` etc. overrides it
-    features = { "rasterization" }, -- the triangle mode rasterizes
+    features = { "rasterization" }, -- the surface and scene modes rasterize
 }
 
 -- -------------------------------------------------------------------------------------
 -- State shared by the modes
 -- -------------------------------------------------------------------------------------
 
--- The surface and triangle modes clear to a grey that ramps up and wraps around.
+-- The surface mode clears to a grey that ramps up and wraps around.
 local grey = 0.5
 
 local clock = { time = 0, dt = 0, frameRate = 0 }
@@ -38,7 +40,10 @@ local controller
 -- Modes
 --
 -- A mode is a table with a `name`, an optional `init()` -- run the first time the mode is
--- shown, so nothing is compiled before it is needed -- and `draw(frame)`.
+-- shown, so nothing is compiled before it is needed -- and `draw(frame)`. It can also
+-- have `on_enter()` and `on_leave()`, called each time it is shown and hidden, and
+-- `update` and input callbacks, which are forwarded to the current mode. A mode that sets
+-- up a render graph (the scene) needs no `draw`: the host runs the graph.
 -- -------------------------------------------------------------------------------------
 
 -- Clears the window: the smallest thing a frame can do.
@@ -51,31 +56,21 @@ local function surfaceMode()
     }
 end
 
--- A vertex-colored triangle drawn with a render pipeline and a vertex buffer.
-local function triangleMode()
-    local mode = { name = "Triangle" }
-    local pipeline, vertices
+local current = 1
+local modes
 
-    function mode.init()
-        pipeline = rhi.render_pipeline {
-            shader = "../triangle/triangle.slang",
-            vertex = "vertexMain",
-            fragment = "fragmentMain",
-            -- One interleaved stream: offsets and stride follow from the formats.
-            layout = { { "POSITION", "rgb32f" }, { "COLOR", "rgb32f" } },
-        }
-        vertices = rhi.vertex_buffer {
-            -0.5, -0.5, 0.0,   1, 0, 0, -- red
-             0.5, -0.5, 0.0,   0, 1, 0, -- green
-             0.0,  0.5, 0.0,   0, 0, 1, -- blue
-        }
-    end
+local function modeTitle(index)
+    return string.format("Showcase: %s (%d/%d)", modes[index].name, index, #modes)
+end
 
-    function mode.draw(frame)
-        frame:draw(pipeline, { vertices = vertices, clear = { grey, grey, grey, 1 } })
-    end
-
-    return mode
+-- The lit scene with point light shadows, shared with ../scene/scene.lua. rhi.include()
+-- runs it from there (and reloads the showcase when it is saved); the scene's parameters
+-- go in the title after the mode's.
+local function sceneMode()
+    local createScene = rhi.include("../scene/scene-mode.lua")
+    return createScene("../scene/", function(details)
+        rhi.set_title(modeTitle(current) .. " | " .. details)
+    end)
 end
 
 -- A ShaderToy-style shader: a compute shader runs mainImage() (see
@@ -110,26 +105,33 @@ local function shaderToyMode(name, file)
     return mode
 end
 
-local modes = {
+modes = {
     surfaceMode(),
-    triangleMode(),
+    sceneMode(),
     shaderToyMode("Circle", "circle.slang"),
     shaderToyMode("Ocean", "ocean.slang"),
     shaderToyMode("2D SDFs", "sdfs2d.slang"),
     shaderToyMode("Controller", "controller.slang"),
 }
 
-local current = 1
-
 -- Shows mode `index`, wrapping around at either end.
 local function switchTo(index)
+    local previous = modes[current]
+    if previous.ready and previous.on_leave then previous.on_leave() end
     current = (index - 1) % #modes + 1
     local mode = modes[current]
     if mode.init and not mode.ready then
         mode.init()
         mode.ready = true
     end
-    rhi.set_title(string.format("Showcase: %s (%d/%d)", mode.name, current, #modes))
+    rhi.set_title(modeTitle(current))
+    if mode.on_enter then mode.on_enter() end
+end
+
+-- Passes a callback on to the current mode, if it has one.
+local function forward(name, ...)
+    local handler = modes[current][name]
+    if handler then handler(...) end
 end
 
 -- -------------------------------------------------------------------------------------
@@ -154,24 +156,33 @@ function update(time, dt)
     local down = left or input.mouse_down(input.MOUSE_RIGHT) or input.mouse_down(input.MOUSE_MIDDLE)
     mouse.clicked = down and not mouse.down
     mouse.down = down
+
+    forward("update", time, dt)
 end
 
 function draw(frame)
-    modes[current].draw(frame)
+    forward("draw", frame)
 end
 
-function on_key(key, action)
-    if action ~= input.PRESS then return end
-    if key == keys.RIGHT then
+function on_key(key, action, mods)
+    if action == input.PRESS and key == keys.RIGHT then
         switchTo(current + 1)
-    elseif key == keys.LEFT then
+    elseif action == input.PRESS and key == keys.LEFT then
         switchTo(current - 1)
     else
         for i = 1, math.min(#modes, 9) do
-            if key == keys[tostring(i)] then switchTo(i) end
+            if action == input.PRESS and key == keys[tostring(i)] then
+                switchTo(i)
+                return
+            end
         end
+        forward("on_key", key, action, mods)
     end
 end
+
+function on_mouse_button(button, action, mods) forward("on_mouse_button", button, action, mods) end
+function on_mouse_move(x, y) forward("on_mouse_move", x, y) end
+function on_scroll(x, y) forward("on_scroll", x, y) end
 
 function on_controller_button(slot, button, pressed)
     if not pressed then return end

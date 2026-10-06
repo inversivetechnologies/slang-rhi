@@ -1,4 +1,5 @@
-// A vertex of a generated mesh, as spherified-cube.slang writes it and mesh.slang reads it.
+// A vertex of a scene mesh, as stored in the meshes' structured buffers: written by
+// spherified-cube.slang for the sphere, and from Lua for the cube and the floor.
 //
 // Only float4s, so the layout (32 bytes) is the same on every backend: a float3 would be
 // padded differently by D3D and Vulkan structured buffers.

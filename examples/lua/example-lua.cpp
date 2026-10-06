@@ -1,7 +1,7 @@
 // Scriptable example host: every example is a Lua script that drives slang-rhi.
 //
 // A script lives next to its shaders (examples/<name>/<name>.lua) and is picked on the
-// command line: `example-lua triangle`, or a path to any .lua file. The script and every
+// command line: `example-lua scene`, or a path to any .lua file. The script and every
 // shader it uses -- includes too -- reload when saved.
 //
 // See examples/lua/README.md for the script API.
@@ -354,8 +354,10 @@ struct Pipeline
     std::vector<VertexAttribute> attributes;
     uint32_t vertexStride = 0;
     PrimitiveTopology topology = PrimitiveTopology::TriangleList;
-    // Test and write the frame's depth buffer.
+    // Test and write the depth buffer of whatever the pipeline draws into.
     bool depth = false;
+    // Color target format; Undefined means the window's.
+    Format colorFormat = Format::Undefined;
 
     // The latest build that compiled; kept when an edit doesn't.
     ComPtr<IComputePipeline> compute;
@@ -374,8 +376,11 @@ struct Texture
 {
     ComPtr<ITexture> texture;
     Format format = Format::RGBA32Float;
-    // Render targets are resized with the window.
+    // Render targets are resized with the window, to `scale` times its size.
     bool followsSurface = false;
+    float scale = 1.0f;
+    // Depth buffer for depth-tested draws into this texture, created on first use.
+    ComPtr<ITexture> depth;
 };
 
 struct Buffer
@@ -384,11 +389,113 @@ struct Buffer
     uint64_t size = 0;
 };
 
+// A shader parameter value captured from Lua, so it can be applied without the Lua state:
+// by the render graph every frame, or straight away by frame:draw() and frame:dispatch().
+struct ParamValue
+{
+    enum class Kind
+    {
+        Numbers,
+        Table,
+        Texture,
+        Buffer,
+        Controller,
+    };
+    Kind kind = Kind::Numbers;
+    std::vector<double> numbers; // Numbers
+    // Table: the string-keyed fields, and the elements 1..n.
+    std::vector<std::string> fieldNames;
+    std::vector<ParamValue> fieldValues;
+    std::vector<ParamValue> elements;
+    std::shared_ptr<Texture> texture;
+    std::shared_ptr<Buffer> buffer;
+    int controllerSlot = -1;
+};
+
+// Named shader parameter values, shared by every draw and dispatch that lists the block.
+// Changing a value in it changes what all of them get from the next frame on.
+struct ParamBlock
+{
+    std::vector<std::string> names;
+    std::vector<ParamValue> values;
+
+    void set(const std::string& name, ParamValue value)
+    {
+        auto it = std::find(names.begin(), names.end(), name);
+        if (it != names.end())
+        {
+            values[it - names.begin()] = std::move(value);
+            return;
+        }
+        names.push_back(name);
+        values.push_back(std::move(value));
+    }
+};
+
+// ---------------------------------------------------------------------------------------
+// Render graph
+//
+// Built by the script (normally once, in init()) and run by the host every frame, without
+// calling into Lua: a list of compute dispatches and render passes, each render pass a
+// list of draws. Their inputs are parameter blocks, which the script can change at any time.
+// ---------------------------------------------------------------------------------------
+
+struct GraphDraw
+{
+    std::shared_ptr<Pipeline> pipeline;
+    std::shared_ptr<Buffer> vertices;
+    uint32_t count = 3;
+    std::vector<std::shared_ptr<ParamBlock>> params;
+    bool enabled = true;
+    // An error was printed for this draw; don't repeat it every frame.
+    bool reported = false;
+};
+
+struct GraphNode
+{
+    std::string name;
+    bool enabled = true;
+    bool isDispatch = false;
+    bool reported = false;
+
+    // Render pass.
+    std::shared_ptr<Texture> target; // null: the window
+    bool clear = false;
+    float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    enum class ViewportMode
+    {
+        Full,
+        Pixels,
+        Fraction, // of the target's size
+    };
+    ViewportMode viewportMode = ViewportMode::Full;
+    float viewport[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<std::shared_ptr<GraphDraw>> draws;
+
+    // Dispatch.
+    std::shared_ptr<Pipeline> pipeline;
+    std::vector<std::shared_ptr<ParamBlock>> params;
+    uint32_t threads[3] = {1, 1, 1};
+    // Run once, then again only when asked (rerun()) or when the pipeline is rebuilt.
+    bool once = false;
+    bool pending = true;
+    uint32_t ranVersion = 0;
+};
+
+struct Graph
+{
+    std::vector<std::shared_ptr<GraphNode>> nodes;
+};
+
 const char* kPipelineType = "rhi.Pipeline";
 const char* kTextureType = "rhi.Texture";
 const char* kBufferType = "rhi.Buffer";
 const char* kControllerType = "rhi.Controller";
 const char* kFrameType = "rhi.Frame";
+const char* kParamsType = "rhi.Params";
+const char* kGraphType = "rhi.Graph";
+const char* kNodeType = "rhi.Pass";
+const char* kDrawType = "rhi.Draw";
 
 // Script handles hold a shared_ptr to the host-side object.
 template<typename T>
@@ -397,6 +504,19 @@ void pushHandle(lua_State* L, std::shared_ptr<T> object, const char* type)
     void* memory = lua_newuserdatauv(L, sizeof(std::shared_ptr<T>), 0);
     new (memory) std::shared_ptr<T>(std::move(object));
     luaL_setmetatable(L, type);
+}
+
+template<typename T>
+std::shared_ptr<T> testShared(lua_State* L, int index, const char* type)
+{
+    auto* handle = static_cast<std::shared_ptr<T>*>(luaL_testudata(L, index, type));
+    return handle ? *handle : nullptr;
+}
+
+template<typename T>
+std::shared_ptr<T> checkShared(lua_State* L, int index, const char* type)
+{
+    return *static_cast<std::shared_ptr<T>*>(luaL_checkudata(L, index, type));
 }
 
 template<typename T>
@@ -496,6 +616,7 @@ public:
         m_queue->waitOnHost();
         callScript("shutdown");
         closeScript();
+        m_graph.reset();
         m_pipelines.clear();
         m_renderTargets.clear();
         m_blitter.reset();
@@ -527,8 +648,9 @@ public:
     Result draw() override
     {
         // Skip rendering if surface is not configured (eg. when window is minimized), or
-        // while the script is waiting to be fixed.
-        if (!m_surface->getConfig() || !m_lua || m_scriptFailed)
+        // while the script is waiting to be fixed -- unless it set up a render graph, which
+        // runs without it.
+        if (!m_surface->getConfig() || !m_lua || (m_scriptFailed && !m_graph))
         {
             return SLANG_OK;
         }
@@ -545,7 +667,15 @@ public:
         resizeRenderTargets(width, height);
 
         ComPtr<ICommandEncoder> commandEncoder = m_queue->createCommandEncoder();
-        m_frame = {commandEncoder, image, width, height, true, false};
+        m_frame.encoder = commandEncoder;
+        m_frame.image = image;
+        m_frame.width = width;
+        m_frame.height = height;
+        m_frame.active = true;
+        if (m_graph)
+        {
+            runGraph(*m_graph);
+        }
         callScript("draw", FrameArg{});
         m_frame = {};
 
@@ -649,6 +779,7 @@ public:
         }
         callScript("shutdown");
         closeScript();
+        m_graph.reset(); // the new script sets up its own
         m_lua = L;
         m_scriptFailed = false;
         printf("[lua] reloaded '%s'\n", m_scriptPath.filename().string().c_str());
@@ -818,7 +949,12 @@ public:
             fflush(stdout);
         }
 
-        if (changedFiles.count(pathKey(m_scriptPath)))
+        bool scriptChanged = changedFiles.count(pathKey(m_scriptPath)) != 0;
+        for (const std::string& file : m_includedScripts)
+        {
+            scriptChanged = scriptChanged || changedFiles.count(file) != 0;
+        }
+        if (scriptChanged)
         {
             reloadScript();
         }
@@ -881,7 +1017,7 @@ public:
         }
 
         ColorTargetDesc colorTarget = {};
-        colorTarget.format = m_surface->getInfo().preferredFormat;
+        colorTarget.format = resolveColorFormat(pipeline);
         RenderPipelineDesc desc = {};
         desc.program = compiled.program;
         desc.inputLayout = inputLayout;
@@ -922,6 +1058,7 @@ public:
         }
         key += "|" + std::to_string(int(desc->topology));
         key += desc->depth ? "|depth" : "";
+        key += "|" + std::to_string(int(desc->colorFormat));
 
         auto it = m_pipelines.find(key);
         if (it != m_pipelines.end())
@@ -948,12 +1085,26 @@ public:
         desc.size.width = std::max<uint32_t>(width, 1);
         desc.size.height = std::max<uint32_t>(height, 1);
         desc.format = texture.format;
-        desc.usage = TextureUsage::UnorderedAccess | TextureUsage::ShaderResource | TextureUsage::CopySource |
-                     TextureUsage::CopyDestination;
+        desc.usage = TextureUsage::UnorderedAccess | TextureUsage::ShaderResource | TextureUsage::RenderTarget |
+                     TextureUsage::CopySource | TextureUsage::CopyDestination;
         ComPtr<ITexture> created;
         SLANG_RETURN_ON_FAIL(m_device->createTexture(desc, nullptr, created.writeRef()));
+
+        // D3D12 requires a texture that can be a render target to be cleared before
+        // anything else uses it; this also means every texture starts out zeroed. Submitted
+        // on its own, so it lands before whatever frame uses the texture.
+        ComPtr<ICommandEncoder> encoder = m_queue->createCommandEncoder();
+        float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        encoder->clearTextureFloat(created, kEntireTexture, zero);
+        m_queue->submit(encoder->finish());
+
         texture.texture = created;
         return SLANG_OK;
+    }
+
+    static uint32_t scaledSize(uint32_t size, float scale)
+    {
+        return std::max<uint32_t>(1, uint32_t(float(size) * scale + 0.5f));
     }
 
     void resizeRenderTargets(uint32_t width, uint32_t height)
@@ -966,10 +1117,12 @@ public:
         for (const std::weak_ptr<Texture>& weak : m_renderTargets)
         {
             std::shared_ptr<Texture> texture = weak.lock();
+            uint32_t scaledWidth = scaledSize(width, texture->scale);
+            uint32_t scaledHeight = scaledSize(height, texture->scale);
             const TextureDesc& desc = texture->texture->getDesc();
-            if (desc.size.width != width || desc.size.height != height)
+            if (desc.size.width != scaledWidth || desc.size.height != scaledHeight)
             {
-                allocateTexture(*texture, width, height);
+                allocateTexture(*texture, scaledWidth, scaledHeight);
             }
         }
     }
@@ -979,52 +1132,81 @@ public:
         return slot < 0 ? getPrimaryControllerState() : getControllerState(slot);
     }
 
-    // The frame's depth buffer, sized to the window. Created when a depth-tested pipeline
-    // first draws.
-    Result ensureDepthTexture()
+    Format resolveColorFormat(const Pipeline& pipeline) const
     {
-        if (m_depthTexture && m_depthTexture->getDesc().size.width == m_frame.width &&
-            m_depthTexture->getDesc().size.height == m_frame.height)
+        return pipeline.colorFormat == Format::Undefined ? m_surface->getInfo().preferredFormat : pipeline.colorFormat;
+    }
+
+    // What a render pass draws into: the window image, or a texture.
+    struct Destination
+    {
+        ITexture* color = nullptr;
+        Format format = Format::Undefined;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        // Where the destination's depth buffer lives.
+        ComPtr<ITexture>* depth = nullptr;
+    };
+
+    Destination windowDestination()
+    {
+        return {m_frame.image, m_surface->getInfo().preferredFormat, m_frame.width, m_frame.height, std::addressof(m_depthTexture)};
+    }
+
+    static Destination textureDestination(Texture& texture)
+    {
+        const TextureDesc& desc = texture.texture->getDesc();
+        return {texture.texture, texture.format, desc.size.width, desc.size.height, std::addressof(texture.depth)};
+    }
+
+    // Makes `slot` a depth buffer of the given size.
+    Result ensureDepthTexture(ComPtr<ITexture>& slot, uint32_t width, uint32_t height)
+    {
+        if (slot && slot->getDesc().size.width == width && slot->getDesc().size.height == height)
         {
             return SLANG_OK;
         }
         TextureDesc desc = {};
         desc.type = TextureType::Texture2D;
-        desc.size.width = std::max<uint32_t>(m_frame.width, 1);
-        desc.size.height = std::max<uint32_t>(m_frame.height, 1);
+        desc.size.width = std::max<uint32_t>(width, 1);
+        desc.size.height = std::max<uint32_t>(height, 1);
         desc.format = kDepthFormat;
         desc.usage = TextureUsage::DepthStencil;
         desc.defaultState = ResourceState::DepthWrite;
         desc.label = "Depth Buffer";
-        m_depthTexture.setNull();
-        return m_device->createTexture(desc, nullptr, m_depthTexture.writeRef());
+        slot.setNull();
+        return m_device->createTexture(desc, nullptr, slot.writeRef());
     }
 
-    // Begins a pass on the window image. A clear color clears it (and the depth buffer, if
-    // the pass uses it); otherwise the pass draws over what is there. The depth buffer is
+    // Begins a pass on a destination. A clear color clears it (and its depth buffer, if
+    // the pass uses it); otherwise the pass draws over what is there. A depth buffer is
     // also cleared the first time it is used in a frame.
-    IRenderPassEncoder* beginRenderPass(const float* clearColor, bool depth = false)
+    IRenderPassEncoder* beginRenderPass(const Destination& destination, const float* clearColor, bool depth = false)
     {
         RenderPassColorAttachment colorAttachment = {};
-        colorAttachment.view = m_frame.image->getDefaultView();
+        colorAttachment.view = destination.color->getDefaultView();
         colorAttachment.loadOp = clearColor ? LoadOp::Clear : LoadOp::Load;
         if (clearColor)
         {
             std::copy_n(clearColor, 4, colorAttachment.clearValue);
-            m_frame.depthValid = false;
+            if (*destination.depth)
+            {
+                m_frame.validDepth.erase(destination.depth->get());
+            }
         }
         RenderPassDesc renderPass = {};
         renderPass.colorAttachments = &colorAttachment;
         renderPass.colorAttachmentCount = 1;
 
         RenderPassDepthStencilAttachment depthAttachment = {};
-        if (depth && SLANG_SUCCEEDED(ensureDepthTexture()))
+        if (depth && SLANG_SUCCEEDED(ensureDepthTexture(*destination.depth, destination.width, destination.height)))
         {
-            depthAttachment.view = m_depthTexture->getDefaultView();
-            depthAttachment.depthLoadOp = m_frame.depthValid ? LoadOp::Load : LoadOp::Clear;
+            ITexture* depthTexture = destination.depth->get();
+            depthAttachment.view = depthTexture->getDefaultView();
+            depthAttachment.depthLoadOp = m_frame.validDepth.count(depthTexture) ? LoadOp::Load : LoadOp::Clear;
             depthAttachment.depthClearValue = 1.0f;
             renderPass.depthStencilAttachment = &depthAttachment;
-            m_frame.depthValid = true;
+            m_frame.validDepth.insert(depthTexture);
         }
         return m_frame.encoder->beginRenderPass(renderPass);
     }
@@ -1131,89 +1313,331 @@ public:
         return true;
     }
 
-    // Sets one shader parameter from the Lua value at `index`, following the shader's
-    // type: tables of named fields fill structs, arrays fill arrays, numbers fill
-    // scalars/vectors/matrices, and handles bind resources. Parameters the shader doesn't
-    // declare are skipped, so one script can feed shaders that use different subsets.
-    static void setParam(lua_State* L, int index, const ShaderCursor& cursor, const char* name)
+    // Captures the Lua value at `index` as a ParamValue.
+    static ParamValue toParamValue(lua_State* L, int index)
     {
-        if (!cursor.isValid())
-        {
-            return;
-        }
         index = lua_absindex(L, index);
-
-        if (Texture* texture = testHandle<Texture>(L, index, kTextureType))
+        ParamValue value;
+        if (auto texture = testShared<Texture>(L, index, kTextureType))
         {
-            cursor.setBinding(texture->texture);
-            return;
+            value.kind = ParamValue::Kind::Texture;
+            value.texture = texture;
+            return value;
         }
-        if (Buffer* buffer = testHandle<Buffer>(L, index, kBufferType))
+        if (auto buffer = testShared<Buffer>(L, index, kBufferType))
         {
-            cursor.setBinding(buffer->buffer);
-            return;
+            value.kind = ParamValue::Kind::Buffer;
+            value.buffer = buffer;
+            return value;
         }
         if (int* slot = static_cast<int*>(luaL_testudata(L, index, kControllerType)))
         {
-            bindSteamControllerState(cursor, get(L)->controllerState(*slot));
-            return;
+            value.kind = ParamValue::Kind::Controller;
+            value.controllerSlot = *slot;
+            return value;
+        }
+        switch (lua_type(L, index))
+        {
+        case LUA_TNUMBER:
+            value.numbers.push_back(lua_tonumber(L, index));
+            return value;
+        case LUA_TBOOLEAN:
+            value.numbers.push_back(lua_toboolean(L, index) ? 1.0 : 0.0);
+            return value;
+        case LUA_TTABLE:
+        {
+            value.kind = ParamValue::Kind::Table;
+            lua_Integer count = lua_Integer(lua_rawlen(L, index));
+            for (lua_Integer i = 1; i <= count; ++i)
+            {
+                lua_rawgeti(L, index, i);
+                value.elements.push_back(toParamValue(L, -1));
+                lua_pop(L, 1);
+            }
+            lua_pushnil(L);
+            while (lua_next(L, index))
+            {
+                if (lua_type(L, -2) == LUA_TSTRING)
+                {
+                    value.fieldNames.push_back(lua_tostring(L, -2));
+                    value.fieldValues.push_back(toParamValue(L, -1));
+                }
+                lua_pop(L, 1);
+            }
+            return value;
+        }
+        default:
+            luaL_error(L, "a %s can't be a shader parameter", luaL_typename(L, index));
+            return value;
+        }
+    }
+
+    // All the numbers in a value, depth first, for scalars, vectors and matrices.
+    static void flattenNumbers(const ParamValue& value, std::vector<double>& out)
+    {
+        out.insert(out.end(), value.numbers.begin(), value.numbers.end());
+        for (const ParamValue& element : value.elements)
+        {
+            flattenNumbers(element, out);
+        }
+    }
+
+    // Sets one shader parameter, following the shader's type: tables of named fields fill
+    // structs, arrays fill arrays, numbers fill scalars/vectors/matrices, and handles bind
+    // resources. Parameters the shader doesn't declare are skipped, so one set of values
+    // can feed shaders that use different subsets. Returns an error message, or "".
+    std::string applyParam(const ParamValue& value, const ShaderCursor& cursor, const std::string& name)
+    {
+        if (!cursor.isValid())
+        {
+            return {};
+        }
+        switch (value.kind)
+        {
+        case ParamValue::Kind::Texture:
+            cursor.setBinding(value.texture->texture);
+            return {};
+        case ParamValue::Kind::Buffer:
+            cursor.setBinding(value.buffer->buffer);
+            return {};
+        case ParamValue::Kind::Controller:
+            bindSteamControllerState(cursor, controllerState(value.controllerSlot));
+            return {};
+        default:
+            break;
         }
 
         switch (cursor.getTypeLayout()->getKind())
         {
         case slang::TypeReflection::Kind::Struct:
-            if (!lua_istable(L, index))
+            if (value.kind != ParamValue::Kind::Table)
             {
-                luaL_error(L, "shader parameter '%s' is a struct, pass a table", name);
+                return "shader parameter '" + name + "' is a struct, pass a table";
             }
-            setParams(L, index, cursor);
-            return;
+            return applyFields(value, cursor);
         case slang::TypeReflection::Kind::Array:
-            if (lua_istable(L, index))
+            if (value.kind == ParamValue::Kind::Table && !value.elements.empty())
             {
-                lua_Integer count = lua_Integer(lua_rawlen(L, index));
+                size_t count = value.elements.size();
                 size_t capacity = cursor.getTypeLayout()->getElementCount();
                 if (capacity != 0)
                 {
-                    count = std::min<lua_Integer>(count, lua_Integer(capacity));
+                    count = std::min(count, capacity);
                 }
-                for (lua_Integer i = 1; i <= count; ++i)
+                for (size_t i = 0; i < count; ++i)
                 {
-                    lua_rawgeti(L, index, i);
-                    setParam(L, -1, cursor.getElement(uint32_t(i - 1)), name);
-                    lua_pop(L, 1);
+                    std::string error = applyParam(value.elements[i], cursor.getElement(uint32_t(i)), name);
+                    if (!error.empty())
+                    {
+                        return error;
+                    }
                 }
-                return;
+                return {};
             }
             break;
         default:
         {
-            std::vector<lua_Number> values;
-            collectNumbers(L, index, values);
-            if (!values.empty() && setNumbers(cursor, values))
+            std::vector<double> numbers;
+            flattenNumbers(value, numbers);
+            if (!numbers.empty() && setNumbers(cursor, numbers))
             {
-                return;
+                return {};
             }
             break;
         }
         }
-        luaL_error(L, "can't set shader parameter '%s' from a %s", name, luaL_typename(L, index));
+        return "can't set shader parameter '" + name + "' from this value";
+    }
+
+    // Sets the shader parameters named by a table's fields.
+    std::string applyFields(const ParamValue& table, const ShaderCursor& cursor)
+    {
+        for (size_t i = 0; i < table.fieldNames.size(); ++i)
+        {
+            const std::string& name = table.fieldNames[i];
+            std::string error = applyParam(table.fieldValues[i], cursor[name.c_str()], name);
+            if (!error.empty())
+            {
+                return error;
+            }
+        }
+        return {};
+    }
+
+    std::string applyBlocks(const ShaderCursor& root, const std::vector<std::shared_ptr<ParamBlock>>& blocks)
+    {
+        for (const std::shared_ptr<ParamBlock>& block : blocks)
+        {
+            for (size_t i = 0; i < block->names.size(); ++i)
+            {
+                const std::string& name = block->names[i];
+                std::string error = applyParam(block->values[i], root[name.c_str()], name);
+                if (!error.empty())
+                {
+                    return error;
+                }
+            }
+        }
+        return {};
+    }
+
+    // Values the host provides to every draw and dispatch, if the shader declares them:
+    // `time` (seconds) and `viewportSize` (pixels). Set before the script's parameters,
+    // which can override them.
+    void applyBuiltins(const ShaderCursor& root, float viewportWidth, float viewportHeight)
+    {
+        ShaderCursor time = root["time"];
+        if (time.isValid())
+        {
+            setNumbers(time, {glfwGetTime()});
+        }
+        ShaderCursor viewportSize = root["viewportSize"];
+        if (viewportSize.isValid())
+        {
+            setNumbers(viewportSize, {viewportWidth, viewportHeight});
+        }
     }
 
     // Sets the shader parameters named by the keys of the table at `index`.
     static void setParams(lua_State* L, int index, const ShaderCursor& cursor)
     {
-        index = lua_absindex(L, index);
         luaL_checktype(L, index, LUA_TTABLE);
-        lua_pushnil(L);
-        while (lua_next(L, index))
+        ParamValue table = toParamValue(L, index);
+        std::string error = get(L)->applyFields(table, cursor);
+        if (!error.empty())
         {
-            if (lua_type(L, -2) == LUA_TSTRING)
+            luaL_error(L, "%s", error.c_str());
+        }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Running the render graph
+    // -----------------------------------------------------------------------------------
+
+    static void report(bool& reported, const std::string& where, const std::string& error)
+    {
+        if (!error.empty() && !reported)
+        {
+            printf("[lua] graph '%s': %s\n", where.c_str(), error.c_str());
+            fflush(stdout);
+            reported = true;
+        }
+    }
+
+    static RenderState renderStateFor(const float viewport[4])
+    {
+        RenderState renderState = {};
+        Viewport& vp = renderState.viewports[0];
+        vp.originX = viewport[0];
+        vp.originY = viewport[1];
+        vp.extentX = viewport[2];
+        vp.extentY = viewport[3];
+        vp.minZ = 0.0f;
+        vp.maxZ = 1.0f;
+        renderState.viewportCount = 1;
+        ScissorRect& scissor = renderState.scissorRects[0];
+        scissor.minX = uint32_t(std::max(0.0f, viewport[0]));
+        scissor.minY = uint32_t(std::max(0.0f, viewport[1]));
+        scissor.maxX = uint32_t(std::max(0.0f, viewport[0] + viewport[2]));
+        scissor.maxY = uint32_t(std::max(0.0f, viewport[1] + viewport[3]));
+        renderState.scissorRectCount = 1;
+        return renderState;
+    }
+
+    void runDispatch(GraphNode& node)
+    {
+        Pipeline* pipeline = node.pipeline.get();
+        if (!pipeline->compute || node.threads[0] == 0 || node.threads[1] == 0 || node.threads[2] == 0)
+        {
+            return;
+        }
+        if (node.once && !node.pending && node.ranVersion == pipeline->version)
+        {
+            return;
+        }
+        IComputePassEncoder* pass = m_frame.encoder->beginComputePass();
+        PassScope<IComputePassEncoder> scope{pass};
+        ShaderCursor root(pass->bindPipeline(pipeline->compute));
+        applyBuiltins(root, float(m_frame.width), float(m_frame.height));
+        report(node.reported, node.name, applyBlocks(root, node.params));
+        pass->dispatchCompute(
+            divRoundUp(node.threads[0], pipeline->threadGroupSize[0]),
+            divRoundUp(node.threads[1], pipeline->threadGroupSize[1]),
+            divRoundUp(node.threads[2], pipeline->threadGroupSize[2])
+        );
+        node.pending = false;
+        node.ranVersion = pipeline->version;
+    }
+
+    void runRenderPass(GraphNode& node)
+    {
+        Destination destination = node.target ? textureDestination(*node.target) : windowDestination();
+        float viewport[4] = {0.0f, 0.0f, float(destination.width), float(destination.height)};
+        if (node.viewportMode == GraphNode::ViewportMode::Pixels)
+        {
+            std::copy_n(node.viewport, 4, viewport);
+        }
+        else if (node.viewportMode == GraphNode::ViewportMode::Fraction)
+        {
+            viewport[0] = node.viewport[0] * destination.width;
+            viewport[1] = node.viewport[1] * destination.height;
+            viewport[2] = node.viewport[2] * destination.width;
+            viewport[3] = node.viewport[3] * destination.height;
+        }
+
+        bool depth = false;
+        for (const std::shared_ptr<GraphDraw>& draw : node.draws)
+        {
+            depth = depth || (draw->enabled && draw->pipeline->depth);
+        }
+
+        IRenderPassEncoder* pass = beginRenderPass(destination, node.clear ? node.clearColor : nullptr, depth);
+        PassScope<IRenderPassEncoder> scope{pass};
+        for (const std::shared_ptr<GraphDraw>& draw : node.draws)
+        {
+            Pipeline* pipeline = draw->pipeline.get();
+            if (!draw->enabled || !pipeline->render || draw->count == 0)
             {
-                const char* name = lua_tostring(L, -2);
-                setParam(L, -1, cursor[name], name);
+                continue;
             }
-            lua_pop(L, 1);
+            if (resolveColorFormat(*pipeline) != destination.format)
+            {
+                report(draw->reported, node.name, "a draw's pipeline format doesn't match the pass's target");
+                continue;
+            }
+            ShaderCursor root(pass->bindPipeline(pipeline->render));
+            applyBuiltins(root, viewport[2], viewport[3]);
+            report(draw->reported, node.name, applyBlocks(root, draw->params));
+
+            RenderState renderState = renderStateFor(viewport);
+            if (draw->vertices)
+            {
+                renderState.vertexBuffers[0].buffer = draw->vertices->buffer;
+                renderState.vertexBufferCount = 1;
+            }
+            pass->setRenderState(renderState);
+            DrawArguments drawArgs = {};
+            drawArgs.vertexCount = draw->count;
+            pass->draw(drawArgs);
+        }
+    }
+
+    void runGraph(Graph& graph)
+    {
+        for (const std::shared_ptr<GraphNode>& node : graph.nodes)
+        {
+            if (!node->enabled)
+            {
+                continue;
+            }
+            if (node->isDispatch)
+            {
+                runDispatch(*node);
+            }
+            else
+            {
+                runRenderPass(*node);
+            }
         }
     }
 
@@ -1310,19 +1734,33 @@ public:
         desc->depth = lua_toboolean(L, -1);
         lua_pop(L, 1);
 
+        if (lua_getfield(L, 1, "format") != LUA_TNIL)
+        {
+            desc->colorFormat = checkFormat(L, luaL_checkstring(L, -1))->format;
+        }
+        lua_pop(L, 1);
+
         pushHandle(L, app->getPipeline(desc), kPipelineType);
         return 1;
     }
 
-    // rhi.render_target([format = "rgba32f"]): a texture that follows the window size.
+    // rhi.render_target([format = "rgba32f" [, scale = 1]]): a texture that follows the
+    // window size (times `scale`).
     static int apiRenderTarget(lua_State* L)
     {
         LuaApp* app = requireDevice(L);
         auto texture = std::make_shared<Texture>();
         texture->format = checkFormat(L, luaL_optstring(L, 1, "rgba32f"))->format;
         texture->followsSurface = true;
+        texture->scale = float(luaL_optnumber(L, 2, 1.0));
+        if (texture->scale <= 0.0f)
+        {
+            luaL_error(L, "render_target scale must be positive");
+        }
         const SurfaceConfig* config = app->m_surface->getConfig();
-        if (SLANG_FAILED(app->allocateTexture(*texture, config ? config->width : 1, config ? config->height : 1)))
+        uint32_t width = scaledSize(config ? config->width : 1, texture->scale);
+        uint32_t height = scaledSize(config ? config->height : 1, texture->scale);
+        if (SLANG_FAILED(app->allocateTexture(*texture, width, height)))
         {
             luaL_error(L, "could not create render target");
         }
@@ -1425,6 +1863,356 @@ public:
     static int apiTime(lua_State* L)
     {
         lua_pushnumber(L, glfwGetTime());
+        return 1;
+    }
+
+    // rhi.include(path): runs a Lua file (relative to the script) and returns what it
+    // returns. Saving the file reloads the script, as for the script itself.
+    static int apiInclude(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        fs::path path = app->m_scriptDir / luaL_checkstring(L, 1);
+        std::string key = pathKey(path);
+        app->m_watcher.watch(key);
+        app->m_includedScripts.insert(key);
+        lua_settop(L, 1);
+        if (luaL_loadfile(L, path.string().c_str()) != LUA_OK)
+        {
+            lua_error(L);
+        }
+        lua_call(L, 0, 1);
+        return 1;
+    }
+
+    // -----------------------------------------------------------------------------------
+    // API: parameter blocks and render graphs
+    // -----------------------------------------------------------------------------------
+
+    // A block from the string keys of the table at `index`.
+    static std::shared_ptr<ParamBlock> blockFromTable(lua_State* L, int index)
+    {
+        index = lua_absindex(L, index);
+        auto block = std::make_shared<ParamBlock>();
+        lua_pushnil(L);
+        while (lua_next(L, index))
+        {
+            if (lua_type(L, -2) == LUA_TSTRING)
+            {
+                block->set(lua_tostring(L, -2), toParamValue(L, -1));
+            }
+            lua_pop(L, 1);
+        }
+        return block;
+    }
+
+    // A `params` option: a block, a list of blocks and tables, or one table of values.
+    static std::vector<std::shared_ptr<ParamBlock>> checkBlocks(lua_State* L, int index)
+    {
+        index = lua_absindex(L, index);
+        std::vector<std::shared_ptr<ParamBlock>> blocks;
+        if (lua_isnoneornil(L, index))
+        {
+            return blocks;
+        }
+        if (auto block = testShared<ParamBlock>(L, index, kParamsType))
+        {
+            blocks.push_back(block);
+            return blocks;
+        }
+        luaL_checktype(L, index, LUA_TTABLE);
+        lua_Integer count = lua_Integer(lua_rawlen(L, index));
+        if (count == 0)
+        {
+            blocks.push_back(blockFromTable(L, index));
+            return blocks;
+        }
+        for (lua_Integer i = 1; i <= count; ++i)
+        {
+            lua_rawgeti(L, index, i);
+            if (auto block = testShared<ParamBlock>(L, -1, kParamsType))
+            {
+                blocks.push_back(block);
+            }
+            else
+            {
+                luaL_checktype(L, -1, LUA_TTABLE);
+                blocks.push_back(blockFromTable(L, -1));
+            }
+            lua_pop(L, 1);
+        }
+        return blocks;
+    }
+
+    // rhi.params{ name = value, ... }
+    static int apiParams(lua_State* L)
+    {
+        std::shared_ptr<ParamBlock> block =
+            lua_isnoneornil(L, 1) ? std::make_shared<ParamBlock>() : (luaL_checktype(L, 1, LUA_TTABLE), blockFromTable(L, 1));
+        pushHandle(L, block, kParamsType);
+        return 1;
+    }
+
+    // block.name = value
+    static int paramsNewIndex(lua_State* L)
+    {
+        auto block = checkShared<ParamBlock>(L, 1, kParamsType);
+        block->set(luaL_checkstring(L, 2), toParamValue(L, 3));
+        return 0;
+    }
+
+    // block:set{ name = value, ... }
+    static int paramsSet(lua_State* L)
+    {
+        auto block = checkShared<ParamBlock>(L, 1, kParamsType);
+        luaL_checktype(L, 2, LUA_TTABLE);
+        std::shared_ptr<ParamBlock> values = blockFromTable(L, 2);
+        for (size_t i = 0; i < values->names.size(); ++i)
+        {
+            block->set(values->names[i], values->values[i]);
+        }
+        return 0;
+    }
+
+    static int paramsIndex(lua_State* L)
+    {
+        lua_pushvalue(L, lua_upvalueindex(1));
+        lua_getfield(L, -1, luaL_checkstring(L, 2));
+        return 1;
+    }
+
+    // rhi.graph()
+    static int apiGraph(lua_State* L)
+    {
+        pushHandle(L, std::make_shared<Graph>(), kGraphType);
+        return 1;
+    }
+
+    // rhi.set_graph(graph or nil): the graph the host runs every frame, before draw().
+    static int apiSetGraph(lua_State* L)
+    {
+        get(L)->m_graph = lua_isnoneornil(L, 1) ? nullptr : checkShared<Graph>(L, 1, kGraphType);
+        return 0;
+    }
+
+    static void readColor(lua_State* L, int index, float color[4])
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            lua_rawgeti(L, index, i + 1);
+            color[i] = float(luaL_optnumber(L, -1, color[i]));
+            lua_pop(L, 1);
+        }
+    }
+
+    static void readThreads(lua_State* L, int index, uint32_t threads[3])
+    {
+        luaL_checktype(L, index, LUA_TTABLE);
+        for (int i = 0; i < 3; ++i)
+        {
+            lua_rawgeti(L, index, i + 1);
+            threads[i] = uint32_t(luaL_optinteger(L, -1, 1));
+            lua_pop(L, 1);
+        }
+    }
+
+    // graph:render_pass{ name, target = texture, clear = {r,g,b,a},
+    //                    viewport = {x,y,w,h} | viewport_fraction = {x,y,w,h} }
+    static int graphRenderPass(lua_State* L)
+    {
+        auto graph = checkShared<Graph>(L, 1, kGraphType);
+        if (lua_isnoneornil(L, 2))
+        {
+            lua_newtable(L);
+            lua_replace(L, 2);
+        }
+        luaL_checktype(L, 2, LUA_TTABLE);
+        auto node = std::make_shared<GraphNode>();
+        node->name = "render pass " + std::to_string(graph->nodes.size() + 1);
+
+        if (lua_getfield(L, 2, "name") == LUA_TSTRING)
+            node->name = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "target");
+        if (!lua_isnil(L, -1))
+            node->target = checkShared<Texture>(L, -1, kTextureType);
+        lua_pop(L, 1);
+        if (lua_getfield(L, 2, "clear") == LUA_TTABLE)
+        {
+            node->clear = true;
+            readColor(L, lua_gettop(L), node->clearColor);
+        }
+        lua_pop(L, 1);
+        if (lua_getfield(L, 2, "viewport") == LUA_TTABLE)
+        {
+            node->viewportMode = GraphNode::ViewportMode::Pixels;
+            readColor(L, lua_gettop(L), node->viewport);
+        }
+        lua_pop(L, 1);
+        if (lua_getfield(L, 2, "viewport_fraction") == LUA_TTABLE)
+        {
+            node->viewportMode = GraphNode::ViewportMode::Fraction;
+            readColor(L, lua_gettop(L), node->viewport);
+        }
+        lua_pop(L, 1);
+
+        graph->nodes.push_back(node);
+        pushHandle(L, node, kNodeType);
+        return 1;
+    }
+
+    // graph:dispatch{ name, pipeline, params, threads = {x,y,z}, once = false }
+    static int graphDispatch(lua_State* L)
+    {
+        auto graph = checkShared<Graph>(L, 1, kGraphType);
+        luaL_checktype(L, 2, LUA_TTABLE);
+        auto node = std::make_shared<GraphNode>();
+        node->isDispatch = true;
+        node->name = "dispatch " + std::to_string(graph->nodes.size() + 1);
+
+        if (lua_getfield(L, 2, "name") == LUA_TSTRING)
+            node->name = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "pipeline");
+        node->pipeline = checkShared<Pipeline>(L, -1, kPipelineType);
+        lua_pop(L, 1);
+        if (!node->pipeline->isCompute)
+            luaL_error(L, "dispatch needs a compute pipeline");
+        lua_getfield(L, 2, "params");
+        node->params = checkBlocks(L, -1);
+        lua_pop(L, 1);
+        if (lua_getfield(L, 2, "threads") != LUA_TNIL)
+            readThreads(L, lua_gettop(L), node->threads);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "once");
+        node->once = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+
+        graph->nodes.push_back(node);
+        pushHandle(L, node, kNodeType);
+        return 1;
+    }
+
+    // pass:draw{ pipeline, vertices, count = 3, params }
+    static int nodeDraw(lua_State* L)
+    {
+        auto node = checkShared<GraphNode>(L, 1, kNodeType);
+        if (node->isDispatch)
+            luaL_error(L, "draw() is for render passes");
+        luaL_checktype(L, 2, LUA_TTABLE);
+        auto draw = std::make_shared<GraphDraw>();
+
+        lua_getfield(L, 2, "pipeline");
+        draw->pipeline = checkShared<Pipeline>(L, -1, kPipelineType);
+        lua_pop(L, 1);
+        if (draw->pipeline->isCompute)
+            luaL_error(L, "draw needs a render pipeline");
+        lua_getfield(L, 2, "vertices");
+        if (!lua_isnil(L, -1))
+            draw->vertices = checkShared<Buffer>(L, -1, kBufferType);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "count");
+        uint32_t defaultCount = (draw->vertices && draw->pipeline->vertexStride)
+                                    ? uint32_t(draw->vertices->size / draw->pipeline->vertexStride)
+                                    : 3;
+        draw->count = uint32_t(luaL_optinteger(L, -1, defaultCount));
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "params");
+        draw->params = checkBlocks(L, -1);
+        lua_pop(L, 1);
+
+        node->draws.push_back(draw);
+        pushHandle(L, draw, kDrawType);
+        return 1;
+    }
+
+    // node:rerun(): runs a `once` dispatch again on the next frame.
+    static int nodeRerun(lua_State* L)
+    {
+        checkShared<GraphNode>(L, 1, kNodeType)->pending = true;
+        return 0;
+    }
+
+    static int nodeIndex(lua_State* L)
+    {
+        auto node = checkShared<GraphNode>(L, 1, kNodeType);
+        const char* key = luaL_checkstring(L, 2);
+        if (strcmp(key, "enabled") == 0)
+            lua_pushboolean(L, node->enabled);
+        else if (strcmp(key, "name") == 0)
+            lua_pushstring(L, node->name.c_str());
+        else
+        {
+            lua_pushvalue(L, lua_upvalueindex(1));
+            lua_getfield(L, -1, key);
+        }
+        return 1;
+    }
+
+    // node.enabled = bool, node.threads = {x,y,z}, node.clear = {r,g,b,a} or false,
+    // node.viewport = ..., node.viewport_fraction = ...
+    static int nodeNewIndex(lua_State* L)
+    {
+        auto node = checkShared<GraphNode>(L, 1, kNodeType);
+        const char* key = luaL_checkstring(L, 2);
+        if (strcmp(key, "enabled") == 0)
+            node->enabled = lua_toboolean(L, 3);
+        else if (strcmp(key, "threads") == 0)
+            readThreads(L, 3, node->threads);
+        else if (strcmp(key, "clear") == 0)
+        {
+            node->clear = lua_istable(L, 3);
+            if (node->clear)
+                readColor(L, 3, node->clearColor);
+        }
+        else if (strcmp(key, "viewport") == 0 || strcmp(key, "viewport_fraction") == 0)
+        {
+            if (lua_isnil(L, 3))
+                node->viewportMode = GraphNode::ViewportMode::Full;
+            else
+            {
+                luaL_checktype(L, 3, LUA_TTABLE);
+                node->viewportMode = strcmp(key, "viewport") == 0 ? GraphNode::ViewportMode::Pixels
+                                                                  : GraphNode::ViewportMode::Fraction;
+                readColor(L, 3, node->viewport);
+            }
+        }
+        else
+            luaL_error(L, "can't set '%s' on a graph pass", key);
+        return 0;
+    }
+
+    static int drawIndex(lua_State* L)
+    {
+        auto draw = checkShared<GraphDraw>(L, 1, kDrawType);
+        const char* key = luaL_checkstring(L, 2);
+        if (strcmp(key, "count") == 0)
+            lua_pushinteger(L, draw->count);
+        else if (strcmp(key, "enabled") == 0)
+            lua_pushboolean(L, draw->enabled);
+        else
+            lua_pushnil(L);
+        return 1;
+    }
+
+    // draw.count = n, draw.enabled = bool
+    static int drawNewIndex(lua_State* L)
+    {
+        auto draw = checkShared<GraphDraw>(L, 1, kDrawType);
+        const char* key = luaL_checkstring(L, 2);
+        if (strcmp(key, "count") == 0)
+            draw->count = uint32_t(luaL_checkinteger(L, 3));
+        else if (strcmp(key, "enabled") == 0)
+            draw->enabled = lua_toboolean(L, 3);
+        else
+            luaL_error(L, "can't set '%s' on a graph draw", key);
+        return 0;
+    }
+
+    // rhi.window_srgb(): true if the window's format encodes sRGB itself.
+    static int apiWindowSrgb(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        lua_pushboolean(L, app->m_surface && getFormatInfo(app->m_surface->getInfo().preferredFormat).isSrgb);
         return 1;
     }
 
@@ -1593,6 +2381,8 @@ public:
             lua_pushinteger(L, app->m_frame.height);
         else if (strcmp(key, "index") == 0)
             lua_pushinteger(L, app->m_frameIndex);
+        else if (strcmp(key, "srgb") == 0)
+            lua_pushboolean(L, app->m_surface && getFormatInfo(app->m_surface->getInfo().preferredFormat).isSrgb);
         else
         {
             lua_pushvalue(L, lua_upvalueindex(1));
@@ -1601,7 +2391,18 @@ public:
         return 1;
     }
 
-    // frame:clear(r, g, b [, a = 1])
+    // The destination named by a `target` value: the window if nil, else a texture.
+    static Destination checkDestination(lua_State* L, int index)
+    {
+        LuaApp* app = get(L);
+        if (lua_isnoneornil(L, index))
+        {
+            return app->windowDestination();
+        }
+        return textureDestination(*checkHandle<Texture>(L, index, kTextureType));
+    }
+
+    // frame:clear(r, g, b [, a = 1 [, target = window]])
     static int frameClear(lua_State* L)
     {
         LuaApp* app = checkFrame(L);
@@ -1611,7 +2412,7 @@ public:
             float(luaL_optnumber(L, 4, 0.0)),
             float(luaL_optnumber(L, 5, 1.0)),
         };
-        app->beginRenderPass(color)->end();
+        app->beginRenderPass(checkDestination(L, 6), color)->end();
         return 0;
     }
 
@@ -1636,6 +2437,7 @@ public:
         IComputePassEncoder* pass = app->m_frame.encoder->beginComputePass();
         PassScope<IComputePassEncoder> scope{pass};
         ShaderCursor cursor(pass->bindPipeline(pipeline->compute));
+        app->applyBuiltins(cursor, float(app->m_frame.width), float(app->m_frame.height));
         if (!lua_isnoneornil(L, 3))
         {
             setParams(L, 3, cursor);
@@ -1648,7 +2450,8 @@ public:
         return 0;
     }
 
-    // frame:draw(pipeline, { vertices = buffer, count = n, params = {...}, clear = {r,g,b,a} })
+    // frame:draw(pipeline, { vertices = buffer, count = n, params = {...}, clear = {r,g,b,a},
+    //                       target = texture, viewport = {x, y, width, height} })
     static int frameDraw(lua_State* L)
     {
         LuaApp* app = checkFrame(L);
@@ -1681,19 +2484,40 @@ public:
         // The vertex buffer handle stays referenced by the options table.
         lua_pop(L, 3);
 
+        lua_getfield(L, 3, "target");
+        Destination destination = checkDestination(L, -1);
+        lua_pop(L, 1);
+        if (pipeline->render && app->resolveColorFormat(*pipeline) != destination.format)
+        {
+            luaL_error(L, "the pipeline's format doesn't match the target's (see render_pipeline's `format`)");
+        }
+
+        float viewport[4] = {0.0f, 0.0f, float(destination.width), float(destination.height)};
+        if (lua_getfield(L, 3, "viewport") == LUA_TTABLE)
+        {
+            for (int i = 0; i < 4; ++i)
+            {
+                lua_rawgeti(L, -1, i + 1);
+                viewport[i] = float(luaL_checknumber(L, -1));
+                lua_pop(L, 1);
+            }
+        }
+        lua_pop(L, 1);
+
         if (!pipeline->render)
         {
             // Never compiled: still honor the clear, so the window shows something.
             if (clear)
             {
-                app->beginRenderPass(clearColor)->end();
+                app->beginRenderPass(destination, clearColor)->end();
             }
             return 0;
         }
 
-        IRenderPassEncoder* pass = app->beginRenderPass(clear ? clearColor : nullptr, pipeline->depth);
+        IRenderPassEncoder* pass = app->beginRenderPass(destination, clear ? clearColor : nullptr, pipeline->depth);
         PassScope<IRenderPassEncoder> scope{pass};
         ShaderCursor cursor(pass->bindPipeline(pipeline->render));
+        app->applyBuiltins(cursor, viewport[2], viewport[3]);
         if (lua_getfield(L, 3, "params") != LUA_TNIL)
         {
             setParams(L, -1, cursor);
@@ -1701,9 +2525,19 @@ public:
         lua_pop(L, 1);
 
         RenderState renderState = {};
-        renderState.viewports[0] = Viewport::fromSize(float(app->m_frame.width), float(app->m_frame.height));
+        Viewport& vp = renderState.viewports[0];
+        vp.originX = viewport[0];
+        vp.originY = viewport[1];
+        vp.extentX = viewport[2];
+        vp.extentY = viewport[3];
+        vp.minZ = 0.0f;
+        vp.maxZ = 1.0f;
         renderState.viewportCount = 1;
-        renderState.scissorRects[0] = ScissorRect::fromSize(app->m_frame.width, app->m_frame.height);
+        ScissorRect& scissor = renderState.scissorRects[0];
+        scissor.minX = uint32_t(std::max(0.0f, viewport[0]));
+        scissor.minY = uint32_t(std::max(0.0f, viewport[1]));
+        scissor.maxX = uint32_t(std::max(0.0f, viewport[0] + viewport[2]));
+        scissor.maxY = uint32_t(std::max(0.0f, viewport[1] + viewport[3]));
         renderState.scissorRectCount = 1;
         if (vertices)
         {
@@ -1755,6 +2589,14 @@ public:
         lua_pop(L, 1);
     }
 
+    static void setNewIndex(lua_State* L, const char* type, lua_CFunction newIndex)
+    {
+        luaL_getmetatable(L, type);
+        lua_pushcfunction(L, newIndex);
+        lua_setfield(L, -2, "__newindex");
+        lua_pop(L, 1);
+    }
+
     static void registerApi(lua_State* L)
     {
         static const luaL_Reg kRhi[] = {
@@ -1767,6 +2609,11 @@ public:
             {"device", apiDevice},
             {"time", apiTime},
             {"set_title", apiSetTitle},
+            {"include", apiInclude},
+            {"params", apiParams},
+            {"graph", apiGraph},
+            {"set_graph", apiSetGraph},
+            {"window_srgb", apiWindowSrgb},
             {nullptr, nullptr},
         };
         lua_newtable(L);
@@ -1901,6 +2748,31 @@ public:
             {nullptr, nullptr},
         };
         newType(L, kFrameType, frameIndex, kFrameMethods, nullptr);
+
+        static const luaL_Reg kParamsMethods[] = {
+            {"set", paramsSet},
+            {nullptr, nullptr},
+        };
+        newType(L, kParamsType, paramsIndex, kParamsMethods, collectHandle<ParamBlock>);
+        setNewIndex(L, kParamsType, paramsNewIndex);
+
+        static const luaL_Reg kGraphMethods[] = {
+            {"render_pass", graphRenderPass},
+            {"dispatch", graphDispatch},
+            {nullptr, nullptr},
+        };
+        newType(L, kGraphType, paramsIndex, kGraphMethods, collectHandle<Graph>);
+
+        static const luaL_Reg kNodeMethods[] = {
+            {"draw", nodeDraw},
+            {"rerun", nodeRerun},
+            {nullptr, nullptr},
+        };
+        newType(L, kNodeType, nodeIndex, kNodeMethods, collectHandle<GraphNode>);
+        setNewIndex(L, kNodeType, nodeNewIndex);
+
+        newType(L, kDrawType, drawIndex, nullptr, collectHandle<GraphDraw>);
+        setNewIndex(L, kDrawType, drawNewIndex);
     }
 
 public:
@@ -1917,6 +2789,10 @@ public:
     static constexpr Format kDepthFormat = Format::D32Float;
 
     std::map<std::string, std::shared_ptr<Pipeline>> m_pipelines;
+    // The render graph run every frame, if the script set one (rhi.set_graph).
+    std::shared_ptr<Graph> m_graph;
+    // Lua files loaded with rhi.include(); saving one reloads the script.
+    std::set<std::string> m_includedScripts;
     std::vector<std::weak_ptr<Texture>> m_renderTargets;
 
     // The frame being recorded; only valid during the script's draw().
@@ -1927,8 +2803,8 @@ public:
         uint32_t width = 0;
         uint32_t height = 0;
         bool active = false;
-        // The depth buffer holds this frame's depth (cleared since the frame began).
-        bool depthValid = false;
+        // Depth buffers cleared since the frame began; later passes load them.
+        std::set<ITexture*> validDepth;
     };
     Frame m_frame;
     uint32_t m_frameIndex = 0;
