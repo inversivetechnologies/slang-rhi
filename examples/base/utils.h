@@ -85,7 +85,8 @@ inline Result createDevice(
     DeviceType deviceType,
     std::vector<Feature> requiredFeatures,
     std::vector<std::pair<std::string, std::string>> preprocessorMacros,
-    IDevice** outDevice
+    IDevice** outDevice,
+    std::vector<std::string> slangSearchPaths = {EXAMPLE_DIR}
 )
 {
     DeviceDesc deviceDesc = {};
@@ -97,9 +98,13 @@ inline Result createDevice(
     deviceDesc.enableValidation = true;
     deviceDesc.debugCallback = DebugPrinter::getInstance();
 #endif
-    const char* searchPaths[] = {EXAMPLE_DIR};
-    deviceDesc.slang.searchPaths = searchPaths;
-    deviceDesc.slang.searchPathCount = SLANG_COUNT_OF(searchPaths);
+    std::vector<const char*> searchPaths;
+    for (const std::string& path : slangSearchPaths)
+    {
+        searchPaths.push_back(path.c_str());
+    }
+    deviceDesc.slang.searchPaths = searchPaths.data();
+    deviceDesc.slang.searchPathCount = searchPaths.size();
 
     std::vector<slang::PreprocessorMacroDesc> preprocessorMacrosDescs;
     for (const auto& macro : preprocessorMacros)

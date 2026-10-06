@@ -1,6 +1,6 @@
 #include "shader-toy.slang"
-#include "prims.slang"
-#include "coloring.slang"
+#include "common/sdfs.slang"
+#include "common/coloring.slang"
 
 
 void mainImage(out float4 fragColor, in int2 fragCoord)
@@ -39,9 +39,9 @@ float3 Render (float2 p)
     float2 posSquare = float2(-3.5, 0);
     float2 posPolygon = float2(0, 0);
     float2 posCircle = float2(3.5, 0);
-    float d0 = SDFSquare(p - posSquare);
-    float d1 = SDFPolygon(k,p - posPolygon);
-    float d2 = SDFCircle(p - posCircle);
+    float d0 = SDF(Square(), p - posSquare);
+    float d1 = SDF(Polygon(k), p - posPolygon);
+    float d2 = SDF(Circle(), p - posCircle);
     float d = min(d0,min(d1, d2));
 
     // Coloring

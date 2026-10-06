@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <functional>
 
 namespace rhi {
 
@@ -743,13 +744,10 @@ static void updateCursorModes()
     }
 }
 
-template<typename Example>
-static int main(int argc, const char** argv)
+// The device types examples run on by default: every one that works with the examples.
+static std::vector<DeviceType> getDefaultDeviceTypes()
 {
-    glfwInit();
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-
-    std::vector<DeviceType> deviceTypes = {
+    return {
         DeviceType::D3D11,
         DeviceType::D3D12,
         DeviceType::Vulkan,
@@ -759,6 +757,18 @@ static int main(int argc, const char** argv)
         // Exclude for now as WGPU backend is not fully functional
         // DeviceType::WGPU,
     };
+}
+
+// Runs one example instance per supported device type in `deviceTypes` until a window is
+// closed. `createExample` is called once per device type; an instance whose init() fails
+// for a device type (e.g. because it only supports some backends) is dropped.
+static int runExamples(
+    const std::function<ExampleBase*()>& createExample,
+    const std::vector<DeviceType>& deviceTypes = getDefaultDeviceTypes()
+)
+{
+    glfwInit();
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 
     std::vector<ExampleBase*>& examples = getExamples();
 
@@ -767,7 +777,7 @@ static int main(int argc, const char** argv)
     {
         if (rhi::getRHI()->isDeviceTypeSupported(deviceType))
         {
-            Example* example = new Example();
+            ExampleBase* example = createExample();
             ExampleBase* prevMainExample = mainExample;
             if (!mainExample)
             {
@@ -784,6 +794,9 @@ static int main(int argc, const char** argv)
     }
 
     layoutWindows();
+
+    // Nothing could start: the caller decides what to tell the user.
+    int result = examples.empty() ? 1 : 0;
 
     getSteamKeyboardGuard().install();
     getStartMenuGuard().install();
@@ -836,7 +849,13 @@ static int main(int argc, const char** argv)
     getCursorMotionGuard().uninstall();
     glfwTerminate();
 
-    return 0;
+    return result;
+}
+
+template<typename Example>
+static int main(int argc, const char** argv)
+{
+    return runExamples([]() -> ExampleBase* { return new Example(); });
 }
 
 } // namespace detail

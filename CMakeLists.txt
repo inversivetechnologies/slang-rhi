@@ -1210,9 +1210,32 @@ if(SLANG_RHI_BUILD_EXAMPLES)
             endif()
         endfunction()
 
-        add_example(example-shader-toy examples/shader-toy/example-shader-toy.cpp)
-        add_example(example-surface examples/surface/example-surface.cpp)
-        add_example(example-triangle examples/triangle/example-triangle.cpp)
+        # Lua, for the scriptable example host. The release tarball has no CMake build of
+        # its own, so build the library sources (everything but the lua/luac programs).
+        FetchContent_Declare(lua URL https://www.lua.org/ftp/lua-5.4.7.tar.gz)
+        FetchContent_MakeAvailable(lua)
+        file(GLOB SLANG_RHI_LUA_SOURCES ${lua_SOURCE_DIR}/src/*.c)
+        list(REMOVE_ITEM SLANG_RHI_LUA_SOURCES ${lua_SOURCE_DIR}/src/lua.c ${lua_SOURCE_DIR}/src/luac.c)
+        # Built as C++ so that Lua errors are C++ exceptions: an error raised from inside a
+        # binding then unwinds the host's ComPtrs and open pass encoders instead of
+        # longjmp-ing over them. The host includes lua.h directly (not lua.hpp) to match.
+        set_source_files_properties(${SLANG_RHI_LUA_SOURCES} PROPERTIES LANGUAGE CXX)
+        add_library(slang-rhi-lua STATIC ${SLANG_RHI_LUA_SOURCES})
+        target_include_directories(slang-rhi-lua PUBLIC ${lua_SOURCE_DIR}/src)
+        if(UNIX)
+            target_compile_definitions(slang-rhi-lua PRIVATE LUA_USE_POSIX)
+            target_link_libraries(slang-rhi-lua PUBLIC m)
+        endif()
+
+        # One host runs every example: each one is a Lua script next to its shaders,
+        # picked on the command line (e.g. `example-lua triangle`).
+        add_example(example-lua examples/lua/example-lua.cpp)
+        target_compile_definitions(example-lua PRIVATE EXAMPLES_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/examples")
+        target_link_libraries(example-lua PRIVATE slang-rhi-lua)
+        if(SLANG_RHI_MASTER_PROJECT AND CMAKE_GENERATOR MATCHES "Visual Studio")
+            set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT example-lua)
+            set_property(TARGET example-lua PROPERTY VS_DEBUGGER_COMMAND_ARGUMENTS "showcase")
+        endif()
     else()
         add_executable(wasm-test examples/wasm/wasm-test.cpp)
         target_compile_features(wasm-test PRIVATE cxx_std_17)
