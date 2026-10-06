@@ -128,14 +128,15 @@ return function(setTitle)
     end
 
     -- ---------------------------------------------------------------------------------
-    -- Graph state, filled in by init()
+    -- Graph state
     -- ---------------------------------------------------------------------------------
 
-    local graph
-    local blocks = {}       -- parameter blocks the input handlers update
-    local generateNode      -- the sphere's generator dispatch
-    local sphereDraws = {}  -- every draw of the sphere mesh, to update its vertex count
-    local insetPasses = {}  -- the second camera's passes, for Tab
+    local resources          -- pipelines, meshes and objects, made once by createResources()
+    local blocks = {}        -- parameter blocks the input handlers update
+    local generateNodes = {} -- the sphere's generator dispatch, in every graph built
+    local sphereDraws = {}   -- every draw of the sphere mesh, to update its vertex count
+    local graph              -- the scene's own graph, made by init()
+    local insetPasses = {}   -- the second camera's passes, for Tab
 
     local function sphereTransform()
         return { position = { -1.2, FLOOR_Y + sphere.radius, 0.3 }, yaw = 0, spin = 0.3, scale = { 1, 1, 1 }, followLight = 0 }
@@ -147,17 +148,18 @@ return function(setTitle)
         return { position = { 0, 0, 0 }, yaw = 0, spin = 0, scale = { s, s, s }, followLight = 1 }
     end
 
-    local function mainCameraParams()
-        local cp, sp = math.cos(camera.pitch), math.sin(camera.pitch)
-        local t = camera.target
+    -- Camera parameters (the shaders' Camera struct) of an orbit around `orbit.target`.
+    function scene.orbitCamera(orbit)
+        local cp, sp = math.cos(orbit.pitch), math.sin(orbit.pitch)
+        local t = orbit.target
         return {
             eye = {
-                t[1] + camera.distance * cp * math.sin(camera.yaw),
-                t[2] + camera.distance * sp,
-                t[3] - camera.distance * cp * math.cos(camera.yaw),
+                t[1] + orbit.distance * cp * math.sin(orbit.yaw),
+                t[2] + orbit.distance * sp,
+                t[3] - orbit.distance * cp * math.cos(orbit.yaw),
             },
             target = t,
-            fovY = camera.fovY,
+            fovY = orbit.fovY,
         }
     end
 
@@ -168,34 +170,33 @@ return function(setTitle)
     end
 
     -- ---------------------------------------------------------------------------------
-    -- Building the graph
+    -- Building graphs
+    --
+    -- The scene is built from pieces other graphs can use too (the fusion example draws
+    -- it next to Gaussian splats): createResources() makes what every graph shares,
+    -- addShadowPasses() and addCameraPass() add passes to a graph.
     -- ---------------------------------------------------------------------------------
 
-    function scene.init()
-        local srgb = rhi.window_srgb()
-
-        local generate = rhi.compute_pipeline("mesh/spherified-cube.slang", "generateMain")
-        local shadow = rhi.render_pipeline { shader = "scene/shadow.slang", format = "r32f", depth = true }
-        local litWindow = rhi.render_pipeline { shader = "scene/lit.slang", depth = true }
-        -- The same shader again, for the second camera's texture: a pipeline is built for
-        -- one target format.
-        local litTexture = rhi.render_pipeline { shader = "scene/lit.slang", format = "rgba16f", depth = true }
-        local composite = rhi.render_pipeline { shader = "post/composite.slang" }
+    function scene.createResources()
+        if resources then return resources end
 
         local sphereMesh = { buffer = rhi.buffer(sphereVertexCount(MAX_SUBDIVISION) * VERTEX_SIZE) }
         local cube = cubeMesh()
         local floor = floorMesh()
 
-        local shadowAtlas = rhi.texture { width = 3 * SHADOW_FACE_SIZE, height = 2 * SHADOW_FACE_SIZE, format = "r32f" }
-        -- Linear (rgba16f): the composite pass does the gamma encoding when it is needed.
-        local secondView = rhi.render_target("rgba16f", INSET[3])
+        resources = {
+            generate = rhi.compute_pipeline("mesh/spherified-cube.slang", "generateMain"),
+            shadow = rhi.render_pipeline { shader = "scene/shadow.slang", format = "r32f", depth = true },
+            -- The lit shader twice: a pipeline is built for one target format.
+            litWindow = rhi.render_pipeline { shader = "scene/lit.slang", depth = true },
+            litTexture = rhi.render_pipeline { shader = "scene/lit.slang", format = "rgba16f", depth = true },
+            shadowAtlas = rhi.texture { width = 3 * SHADOW_FACE_SIZE, height = 2 * SHADOW_FACE_SIZE, format = "r32f" },
+        }
 
         -- Parameter blocks. Each object has one with its mesh, transform and material;
         -- the light, the shadow atlas and each camera have one shared by every draw.
         blocks.light = rhi.params { light = light }
-        blocks.shadowMap = rhi.params { shadowMap = shadowAtlas, shadowFaceSize = SHADOW_FACE_SIZE }
-        blocks.mainCamera = rhi.params { camera = mainCameraParams(), encodeGamma = srgb and 0 or 1 }
-        blocks.secondCamera = rhi.params { camera = secondCamera, encodeGamma = 0 }
+        blocks.shadowMap = rhi.params { shadowMap = resources.shadowAtlas, shadowFaceSize = SHADOW_FACE_SIZE }
         blocks.generate = rhi.params {
             subdivision = sphere.subdivision,
             radius = sphere.radius,
@@ -212,7 +213,7 @@ return function(setTitle)
             material = { albedo = light.color, pattern = 0, emissive = 1 },
         }
 
-        local objects = {
+        resources.objects = {
             {
                 count = floor.count,
                 castsShadow = true,
@@ -235,50 +236,85 @@ return function(setTitle)
             -- The light sits inside its marker, so the marker must not cast shadows.
             { count = sphereVertexCount(sphere.subdivision), castsShadow = false, isSphere = true, params = blocks.marker },
         }
+        return resources
+    end
 
-        graph = rhi.graph()
-        sphereDraws = {}
+    local function addDraw(pass, object, pipeline, extraBlocks)
+        local params = { object.params }
+        for _, block in ipairs(extraBlocks) do params[#params + 1] = block end
+        local draw = pass:draw { pipeline = pipeline, count = object.count, params = params }
+        if object.isSphere then sphereDraws[#sphereDraws + 1] = draw end
+    end
 
-        local function addDraw(pass, object, pipeline, extraBlocks)
-            local params = { object.params }
-            for _, block in ipairs(extraBlocks) do params[#params + 1] = block end
-            local draw = pass:draw { pipeline = pipeline, count = object.count, params = params }
-            if object.isSphere then sphereDraws[#sphereDraws + 1] = draw end
-        end
-
-        generateNode = graph:dispatch {
+    -- Adds what every view of the scene needs first: the sphere's generator, and the six
+    -- shadow passes that render the shadow atlas.
+    function scene.addShadowPasses(g)
+        local r = scene.createResources()
+        generateNodes[#generateNodes + 1] = g:dispatch {
             name = "generate sphere",
-            pipeline = generate,
+            pipeline = r.generate,
             params = blocks.generate,
             threads = { sphere.subdivision, sphere.subdivision, 6 }, -- one thread per quad, per face
             once = true,
         }
-
         for face = 0, 5 do
-            local pass = graph:render_pass {
+            local pass = g:render_pass {
                 name = "shadow face " .. face,
-                target = shadowAtlas,
+                target = r.shadowAtlas,
                 viewport = { (face % 3) * SHADOW_FACE_SIZE, (face // 3) * SHADOW_FACE_SIZE, SHADOW_FACE_SIZE, SHADOW_FACE_SIZE },
                 -- The first face clears the whole atlas to "nothing in the way".
                 clear = face == 0 and { 1e9, 0, 0, 1 } or nil,
             }
             local faceBlock = rhi.params { face = face }
-            for _, object in ipairs(objects) do
+            for _, object in ipairs(r.objects) do
                 if object.castsShadow then
-                    addDraw(pass, object, shadow, { blocks.light, faceBlock })
+                    addDraw(pass, object, r.shadow, { blocks.light, faceBlock })
                 end
             end
         end
+    end
 
-        local mainPass = graph:render_pass { name = "main camera", clear = { 0.015, 0.018, 0.025, 1 } }
-        for _, object in ipairs(objects) do
-            addDraw(mainPass, object, litWindow, { blocks.light, blocks.shadowMap, blocks.mainCamera })
+    -- Adds a pass that draws the lit scene from a camera. `options`:
+    --   name, clear
+    --   view         a parameter block with `camera` and `encodeGamma`
+    --   target       an rgba16f texture to draw into; nil for the window
+    --   depthTarget  a depth target to use (and so keep) as the pass's depth buffer
+    function scene.addCameraPass(g, options)
+        local r = scene.createResources()
+        local pass = g:render_pass {
+            name = options.name,
+            target = options.target,
+            depth_target = options.depthTarget,
+            clear = options.clear,
+        }
+        local pipeline = options.target and r.litTexture or r.litWindow
+        for _, object in ipairs(r.objects) do
+            addDraw(pass, object, pipeline, { blocks.light, blocks.shadowMap, options.view })
         end
+        return pass
+    end
 
-        local secondPass = graph:render_pass { name = "second camera", target = secondView, clear = { 0.03, 0.035, 0.05, 1 } }
-        for _, object in ipairs(objects) do
-            addDraw(secondPass, object, litTexture, { blocks.light, blocks.shadowMap, blocks.secondCamera })
-        end
+    -- The scene's own graph: its main camera into the window, and a second camera
+    -- composited into the corner.
+    function scene.init()
+        local srgb = rhi.window_srgb()
+        scene.createResources()
+
+        local composite = rhi.render_pipeline { shader = "post/composite.slang" }
+        -- Linear (rgba16f): the composite pass does the gamma encoding when it is needed.
+        local secondView = rhi.render_target("rgba16f", INSET[3])
+        blocks.mainCamera = rhi.params { camera = scene.orbitCamera(camera), encodeGamma = srgb and 0 or 1 }
+        local secondCameraBlock = rhi.params { camera = secondCamera, encodeGamma = 0 }
+
+        graph = rhi.graph()
+        scene.addShadowPasses(graph)
+        scene.addCameraPass(graph, { name = "main camera", view = blocks.mainCamera, clear = { 0.015, 0.018, 0.025, 1 } })
+        local secondPass = scene.addCameraPass(graph, {
+            name = "second camera",
+            view = secondCameraBlock,
+            target = secondView,
+            clear = { 0.03, 0.035, 0.05, 1 },
+        })
 
         local compositePass = graph:render_pass { name = "composite", viewport_fraction = INSET }
         compositePass:draw {
@@ -289,6 +325,7 @@ return function(setTitle)
                 borderColor = { 0.85, 0.85, 0.9, 1 },
                 borderWidth = 2,
                 encodeGamma = srgb and 0 or 1,
+                decodeGamma = 0,
             },
         }
         insetPasses = { secondPass, compositePass }
@@ -311,8 +348,10 @@ return function(setTitle)
     local function setSubdivision(n)
         sphere.subdivision = math.max(1, math.min(MAX_SUBDIVISION, math.floor(n)))
         blocks.generate.subdivision = sphere.subdivision
-        generateNode.threads = { sphere.subdivision, sphere.subdivision, 6 }
-        generateNode:rerun()
+        for _, node in ipairs(generateNodes) do
+            node.threads = { sphere.subdivision, sphere.subdivision, 6 }
+            node:rerun()
+        end
         for _, draw in ipairs(sphereDraws) do
             draw.count = sphereVertexCount(sphere.subdivision)
         end
@@ -322,7 +361,7 @@ return function(setTitle)
     local function setRadius(r)
         sphere.radius = math.max(MIN_RADIUS, math.min(MAX_RADIUS, r))
         blocks.generate.radius = sphere.radius
-        generateNode:rerun()
+        for _, node in ipairs(generateNodes) do node:rerun() end
         blocks.sphere.transform = sphereTransform() -- keep it resting on the floor
         blocks.marker.transform = markerTransform()
         updateTitle()
@@ -372,12 +411,12 @@ return function(setTitle)
         camera.yaw = camera.yaw - (x - drag[1]) * 0.008
         camera.pitch = math.max(0.05, math.min(1.45, camera.pitch + (y - drag[2]) * 0.008))
         drag = { x, y }
-        blocks.mainCamera.camera = mainCameraParams()
+        blocks.mainCamera.camera = scene.orbitCamera(camera)
     end
 
     function scene.on_scroll(x, y)
         camera.distance = math.max(3, math.min(15, camera.distance - y * 0.5))
-        blocks.mainCamera.camera = mainCameraParams()
+        blocks.mainCamera.camera = scene.orbitCamera(camera)
     end
 
     return scene

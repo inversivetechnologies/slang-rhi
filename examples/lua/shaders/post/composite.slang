@@ -1,5 +1,6 @@
 // Composite pass: copies a texture into the viewport it is drawn with, framed by a border.
-// The scene uses it to put the second camera's image in a corner of the window.
+// The scene uses it to put the second camera's image in a corner of the window; the
+// splatting example to put its image on the whole window.
 //
 // A single triangle covers the viewport; no vertex buffer needed.
 
@@ -7,7 +8,9 @@ Texture2D<float4> source;
 uniform float4 borderColor;
 uniform float borderWidth;   // pixels
 uniform float2 viewportSize; // provided by the host
-uniform uint encodeGamma;    // 1 if the window doesn't do the sRGB encoding itself
+uniform uint encodeGamma;    // 1: gamma-encode linear color (the window doesn't do it itself)
+uniform uint decodeGamma;    // 1: the source holds display-space color; linearize it for a
+                             // window that encodes sRGB itself
 
 struct VertexOutput
 {
@@ -43,6 +46,10 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     if (encodeGamma != 0)
     {
         color = pow(max(color, 0.0), 1.0 / 2.2);
+    }
+    if (decodeGamma != 0)
+    {
+        color = pow(max(color, 0.0), 2.2);
     }
     return float4(color, 1.0);
 }

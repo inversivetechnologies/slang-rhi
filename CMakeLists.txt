@@ -1234,6 +1234,7 @@ if(SLANG_RHI_BUILD_EXAMPLES)
         target_compile_definitions(example-lua PRIVATE
             LUA_SCRIPTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples/lua/scripts"
             LUA_SHADERS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples/lua/shaders"
+            LUA_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples/lua/assets"
         )
         target_link_libraries(example-lua PRIVATE slang-rhi-lua)
         if(SLANG_RHI_MASTER_PROJECT AND CMAKE_GENERATOR MATCHES "Visual Studio")

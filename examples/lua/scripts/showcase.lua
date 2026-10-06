@@ -1,19 +1,21 @@
--- The examples in one script: the lit scene and the ShaderToy shaders, one after another
--- in the same window.
+-- The examples in one script: the lit scene, the ShaderToy shaders, Gaussian splatting,
+-- and the scene and the splats combined by depth, one after another in the same window.
 --
 --   Left / Right arrows     previous / next mode
---   1 .. 5                  jump to a mode
+--   1 .. 7                  jump to a mode
 --   Steam Controller LB/RB  previous / next mode
---   Left mouse button       moves iMouse in the ShaderToy modes, orbits the scene's camera
+--   Left mouse button       moves iMouse in the ShaderToy modes, orbits the camera in the
+--                           scene, the splats and the depth composite
 --
--- The scene has more controls of its own; see lib/scene-mode.lua.
+-- The scene, the splats and the depth composite have more controls of their own; see
+-- lib/scene-mode.lua, lib/splat-mode.lua and lib/fusion-mode.lua.
 --
 -- Edit this script or any of the shaders while it runs; they reload when saved.
 
 config = {
     title = "Showcase",
     device = "vulkan",              -- the graphics API; `--api d3d12` etc. overrides it
-    features = { "rasterization" }, -- the scene mode rasterizes
+    features = { "rasterization" }, -- the scene, splat and depth composite modes rasterize
 }
 
 -- -------------------------------------------------------------------------------------
@@ -40,7 +42,7 @@ local controller
 -- shown, so nothing is compiled before it is needed -- and `draw(frame)`. It can also
 -- have `on_enter()` and `on_leave()`, called each time it is shown and hidden, and
 -- `update` and input callbacks, which are forwarded to the current mode. A mode that sets
--- up a render graph (the scene) needs no `draw`: the host runs the graph.
+-- up a render graph (the scene, the splats) needs no `draw`: the host runs the graph.
 -- -------------------------------------------------------------------------------------
 
 local current = 1
@@ -50,15 +52,23 @@ local function modeTitle(index)
     return string.format("Showcase: %s (%d/%d)", modes[index].name, index, #modes)
 end
 
--- The lit scene with point light shadows, shared with scene.lua. rhi.include() runs it
--- (and reloads the showcase when it is saved); the scene's parameters go in the title
--- after the mode's.
-local function sceneMode()
-    local createScene = rhi.include("lib/scene-mode.lua")
-    return createScene(function(details)
-        rhi.set_title(modeTitle(current) .. " | " .. details)
-    end)
+-- Modes made by the lib/ modules show their details in the title after the mode's.
+local function modeDetails(details)
+    rhi.set_title(modeTitle(current) .. " | " .. details)
 end
+
+-- The lit scene with point light shadows, shared with scene.lua. rhi.include() runs it
+-- (and reloads the showcase when it is saved).
+local scene = rhi.include("lib/scene-mode.lua")(modeDetails)
+
+-- Gaussian splatting of assets/skull.ply, shared with splat.lua. Loading the file and
+-- building its graph happen the first time the mode is shown.
+local splat = rhi.include("lib/splat-mode.lua")(modeDetails)
+
+-- The scene and the splats in one picture, combined by their depth buffers. It uses the
+-- two instances above, so their resources (and the 454 MB file) are shared with their
+-- own modes; only the graphs differ.
+local fusion = rhi.include("lib/fusion-mode.lua")(scene, splat, modeDetails)
 
 -- A ShaderToy-style shader: a compute shader runs mainImage() (see
 -- shaders/shader-toy/shader-toy.slang) for every pixel of `target`.
@@ -93,11 +103,13 @@ local function shaderToyMode(name, file)
 end
 
 modes = {
-    sceneMode(),
+    scene,
     shaderToyMode("Circle", "circle.slang"),
     shaderToyMode("Ocean", "ocean.slang"),
     shaderToyMode("2D SDFs", "sdfs2d.slang"),
     shaderToyMode("Controller", "controller.slang"),
+    splat,
+    fusion,
 }
 
 -- Shows mode `index`, wrapping around at either end.

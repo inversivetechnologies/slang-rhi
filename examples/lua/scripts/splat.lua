@@ -1,0 +1,18 @@
+-- Gaussian splatting with compute shaders: see lib/splat-mode.lua, which holds it so the
+-- showcase can run it too. Shows assets/skull.ply.
+--
+-- Like the scene, it is a render graph the host runs every frame: Lua builds it in init()
+-- and afterwards only reacts to input.
+
+config = { title = "Gaussian Splats", features = { "rasterization" } }
+
+local splat = rhi.include("lib/splat-mode.lua")()
+
+function init()
+    splat.init()
+    splat.on_enter()
+end
+function on_key(key, action, mods) splat.on_key(key, action, mods) end
+function on_mouse_button(button, action, mods) splat.on_mouse_button(button, action, mods) end
+function on_mouse_move(x, y) splat.on_mouse_move(x, y) end
+function on_scroll(x, y) splat.on_scroll(x, y) end

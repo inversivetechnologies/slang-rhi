@@ -14,6 +14,8 @@ All examples are scripts, in `scripts/`:
 | `surface.lua` | clearing the window |
 | `scene.lua` | a lit 3D scene: a GPU-generated spherified cube, a cube and a floor, with a point light, realtime shadow mapping and a second camera composited into the corner -- built as a render graph the host runs without Lua |
 | `shader-toy.lua` | ShaderToy-style compute shaders blitted to the window |
+| `splat.lua` | Gaussian splatting with compute shaders: loads `assets/skull.ply` (1.9 million splats), projects, sorts and draws them every frame |
+| `fusion.lua` | the scene and the splats in one picture: each rendered with its own depth buffer, combined per pixel by depth |
 
 ## Layout
 
@@ -27,8 +29,11 @@ examples/lua/
     common/            Slang libraries: math, quaternions, transforms, SDFs, splines, ...
     mesh/              the vertex format, and mesh generators (spherified-cube)
     scene/             the scene's lighting and shadows (scene-common, shadow, lit)
-    post/              full-screen passes (composite)
+    splat/             Gaussian splatting (splat-common, preprocess, render)
+    sort/              GPU sorting (bitonic)
+    post/              full-screen passes (composite, depth-composite)
     shader-toy/        the ShaderToy framework (shader-toy.slang) and the toys
+  assets/              data files the scripts load (skull.ply)
 ```
 
 **How paths resolve:**
@@ -40,6 +45,7 @@ examples/lua/
   relative to `shaders/`. Shaders in any folder can therefore use the libraries, e.g.
   `#include "common/sdfs.slang"`.
 - **Lua modules:** `rhi.include` paths are relative to the script.
+- **Assets:** `rhi.load_ply` paths are looked up next to the script, then in `assets/`.
 
 ## Running
 
@@ -72,14 +78,45 @@ and exits. It doesn't fall back to another API.
 | Input | Action |
 | --- | --- |
 | Left / Right arrow | previous / next mode |
-| `1` .. `5` | jump to a mode |
+| `1` .. `7` | jump to a mode |
 | Steam Controller LB / RB | previous / next mode |
-| Left mouse button | moves `iMouse` in the ShaderToy modes |
+| Left mouse button | moves `iMouse` in the ShaderToy modes; orbits the camera in the scene and the splats |
 | Escape | gives the mouse pointer back (click the window to hide it again) |
 | F11 | toggles fullscreen |
 
-The modes are Scene and the ShaderToy shaders Circle, Ocean, 2D SDFs and Controller. The current mode is shown in the window title. A ShaderToy mode whose shader
-doesn't compile shows dark red until it does.
+The modes are Scene, the ShaderToy shaders Circle, Ocean, 2D SDFs and Controller,
+Gaussian Splats, and Depth Composite. The current mode is shown in the window title. A
+ShaderToy mode whose shader doesn't compile shows dark red until it does. The splats load
+(about a second for the 454 MB file) the first time a mode showing them is shown. The
+Gaussian Splats and Depth Composite modes share the loaded file.
+
+### The depth composite
+
+`example-lua fusion`, or mode 7 of the showcase.
+
+| Input | Action |
+| --- | --- |
+| Drag with the left mouse button | orbit the camera |
+| Mouse wheel | zoom |
+| V | show: combined / mesh only / splats only / both depth buffers |
+| `[` / `]` | splat size |
+| the scene's keys | change the scene as in its own mode (subdivision, radius, light) |
+
+How it works is described in [Example: combining passes by
+depth](#example-combining-passes-by-depth).
+
+### The splats
+
+`example-lua splat`, or mode 6 of the showcase.
+
+| Input | Action |
+| --- | --- |
+| Drag with the left mouse button | orbit the camera |
+| Mouse wheel | zoom |
+| `[` / `]` | splat size ÷1.1 / ×1.1 |
+| F | flip the scene upside down (for captures that aren't y-down) |
+
+How it renders is described in [Example: Gaussian splatting](#example-gaussian-splatting).
 
 ### The scene
 
@@ -183,6 +220,7 @@ local draw = rhi.render_pipeline {
     topology = "triangles",         -- triangles | triangle-strip | lines | line-strip | points
     depth = false,                  -- test and write the target's depth buffer
     format = nil,                   -- color target format; default: the window's
+    blend = "none",                 -- none | alpha | premultiplied | additive
 }
 ```
 
@@ -191,13 +229,24 @@ local draw = rhi.render_pipeline {
 - **`layout`**: describes one interleaved vertex stream. Each attribute's offset follows the
   one before it, and the stride is the sum of all of them. Leave `layout` out for shaders
   that generate their vertices from `SV_VertexID`.
+- **`blend`**: how the pipeline's output combines with what the target holds:
+
+  | Value | Result |
+  | --- | --- |
+  | `none` | replaces it |
+  | `alpha` | `color * a + target * (1 - a)` |
+  | `premultiplied` | `color + target * (1 - a)`, for shaders that output color already multiplied by alpha |
+  | `additive` | `color + target` |
 - **`format`**: the color format the pipeline writes. Leave it out to draw into the
   window. Set it to a texture's format to draw into that texture (see [Drawing into a
   texture](#drawing-into-a-texture)).
 - **`depth = true`**: the pipeline tests and writes a depth buffer (32-bit float, closer is
-  smaller, compare less). The host keeps one depth buffer per destination: one for the
-  window and one for each texture drawn into, each the size of its destination. Without
-  `depth`, depth testing is off.
+  smaller, compare less). By default the host keeps one depth buffer per destination: one
+  for the window and one for each texture drawn into, each the size of its destination.
+  A render graph pass can use a depth target of the script's own instead (see
+  [Depth targets](#depth-targets)). Without `depth`, depth testing is off.
+- **`format = "none"`**: no color output at all, for depth-only passes; implies
+  `depth = true`. The fragment shader returns nothing (`void`), and may `discard`.
 - **Caching**: the host caches pipelines. Asking for the same one again returns the
   existing pipeline, including after a script reload, so it isn't recompiled.
 - **Fields**:
@@ -214,6 +263,7 @@ local draw = rhi.render_pipeline {
 ```lua
 local target = rhi.render_target("rgba32f")       -- always the size of the window
 local small = rhi.render_target("rgba16f", 0.3)   -- always 0.3 times the window's size
+local depth = rhi.depth_target()                  -- a depth buffer the size of the window
 local tex = rhi.texture { width = 256, height = 256, format = "rgba32f" }
 local vb = rhi.vertex_buffer { 0, 0, 0,  1, 0, 0,  ... }  -- floats
 local buf = rhi.buffer(1024)                      -- 1024 bytes, zeroed
@@ -228,6 +278,20 @@ local buf2 = rhi.buffer { 1, 2, 3, 4 }            -- floats
 - **`rhi.buffer`** creates a read/write structured or byte-address buffer.
   `rhi.vertex_buffer` is only for vertex input.
 
+#### Depth targets
+
+`rhi.depth_target([scale = 1])` creates a 32-bit float depth buffer that follows the window
+size (times `scale`), like a render target.
+
+- **Writing:** a render graph pass draws depth into it when given `depth_target = it`.
+- **Reading:** any shader can read it, as a `Texture2D<float>` of depth values in [0, 1]
+  (`z / w` of the clip position).
+- **Clearing:** it is cleared by the first pass that uses it each frame, or by a pass's
+  `clear`, as the host's own depth buffers are.
+
+A depth buffer the script owns can therefore be read after it is drawn: by a later
+pass's shader, to combine images by depth, or for any screen-space effect.
+
 ### Other
 
 | Call | |
@@ -237,6 +301,21 @@ local buf2 = rhi.buffer { 1, 2, 3, 4 }            -- floats
 | `rhi.set_title(text)` | sets the window title; the backend and GPU are appended |
 | `rhi.include(path)` | runs a Lua file (relative to the script) and returns its result; saving that file reloads the script |
 | `rhi.window_srgb()` | `true` if the window's format encodes sRGB itself (as `frame.srgb`, but usable in `init`) |
+| `rhi.load_ply(path)` | loads a PLY file's vertices into a buffer; see below |
+
+`rhi.load_ply(path)` reads the vertex element of a binary little-endian PLY file whose
+vertex properties are all floats, which is the format Gaussian splatting scenes come in. It
+uploads them unchanged, one record per vertex, and returns:
+
+| Field | |
+| --- | --- |
+| `buffer` | the floats, for a `StructuredBuffer<float>`: vertex `i`'s property at offset `o` is element `i * stride + o` |
+| `count` | the number of vertices |
+| `stride` | floats per vertex |
+| `properties` | the offset of each property by name, e.g. `properties.x`, `properties.opacity` |
+| `center`, `radius` | the mean of `x`, `y`, `z`, and the square root of their summed variances, for framing a camera (when the file has `x`, `y` and `z`) |
+
+Shaders then read whatever properties they need, at offsets the script passes in.
 | `rhi.params{...}`, `rhi.graph()`, `rhi.set_graph(graph)` | see [Render graphs](#render-graphs) |
 
 `rhi.include` is for sharing Lua code between scripts in different folders. The showcase
@@ -374,14 +453,20 @@ end
 | Call | |
 | --- | --- |
 | `rhi.graph()` | a new, empty graph |
-| `graph:render_pass{ name, target, clear, viewport \| viewport_fraction }` | adds a render pass, run in the order added |
+| `graph:render_pass{ name, target, depth_target, color, clear, viewport \| viewport_fraction }` | adds a render pass, run in the order added |
 | `pass:draw{ pipeline, count, vertices, params }` | adds a draw to a render pass, run in the order added |
 | `graph:dispatch{ name, pipeline, params, threads = {x, y, z}, once }` | adds a compute dispatch |
 | `rhi.set_graph(graph)` | makes the host run `graph` every frame, before `draw`; `nil` stops it |
 
 - **`render_pass` options:**
   - `target`: a texture to draw into. Leave it out to draw into the window.
-  - `clear`: clears the target first (and its depth buffer).
+  - `depth_target`: a [depth target](#depth-targets) to use as the pass's depth buffer,
+    instead of the host's buffer for the target. The pass then leaves its depth there for
+    later passes to read.
+  - `color = false`: a depth-only pass. It has no color target, only its
+    `depth_target`, and its draws use pipelines with `format = "none"`.
+  - `clear`: clears the target first (and its depth buffer). For a depth-only pass, any
+    `clear` table clears the depth buffer.
   - `viewport` is in pixels. `viewport_fraction` is in fractions of the target's size, so
     it follows window resizes.
 - **Depth:** a pass uses its target's depth buffer when any of its draws' pipelines has
@@ -516,6 +601,140 @@ as `rhi.time()`.
 - **The light's marker** is the sphere mesh scaled down. It follows the light
   (`followLight`), is drawn unlit, and is left out of the shadow passes, because the light
   sits inside it.
+
+## Example: Gaussian splatting
+
+`scripts/splat.lua` (and mode 6 of the showcase) renders a 3D Gaussian splatting scene.
+The method is Kerbl et al., "3D Gaussian Splatting for Real-Time Radiance Field Rendering"
+(2023). The scene is `assets/skull.ply`: 1.9 million Gaussians, each with a position,
+rotation, scale, opacity, and degree-3 spherical harmonics for view-dependent color.
+
+| File | Role |
+| --- | --- |
+| `scripts/splat.lua` | runs it on its own |
+| `scripts/lib/splat-mode.lua` | loads the file, builds the render graph, handles input |
+| `shaders/splat/preprocess.slang` | compute: projects each splat, evaluates its color, writes a sort key |
+| `shaders/sort/bitonic.slang` | compute: sorts the keys |
+| `shaders/splat/render.slang` | draws the sorted splats as blended quads |
+| `shaders/post/composite.slang` | puts the result on the window |
+
+**Loading.** `rhi.load_ply` uploads the file's floats unchanged (454 MB). The script reads
+the property offsets from `properties` and passes them to the preprocess shader as a
+`PlyLayout` struct. The shader then reads each splat's fields wherever the file put
+them.
+
+**Every frame**, as a render graph built once in `init()`:
+
+1. **Preprocess** (one thread per splat):
+   - **Covariance:** builds the splat's 3D covariance, `R S Sᵀ Rᵀ` from its rotation and
+     scale.
+   - **Projection:** projects the covariance to a 2D ellipse on screen through the
+     Jacobian of the perspective projection (EWA splatting). It adds 0.3 pixels² so every
+     splat covers about a pixel.
+   - **Color:** evaluates the spherical harmonics in the direction from the camera.
+   - **Culling:** splats behind the camera, off screen, or nearly transparent are skipped.
+   - **Outputs:** each visible splat writes its ellipse (center and two half axes at 3σ,
+     from the eigenvectors of the 2D covariance) and its color. It also writes a sort key,
+     the negated view depth.
+2. **Sort** the keys with their splat indices, on the GPU, with a bitonic sort.
+   - **Padding:** the 1,924,114 splats are padded to 2²¹ with keys that sort last.
+   - **Dispatches:** sorting them takes 78 dispatches. One sorts each block of 1024 in
+     group shared memory. Then, for every longer sequence length, there is one dispatch
+     per long-range step, plus one block dispatch for the remaining short-range steps.
+   - **Built in Lua:** Lua creates these dispatches as graph nodes in `init()`, each with a
+     parameter block holding its step.
+3. **Draw** all splats in one draw of six vertices each, in sorted order, so back to front.
+   - **Quads:** the vertex shader places a quad over the splat's ellipse.
+   - **Falloff:** the fragment shader applies the Gaussian falloff.
+   - **Blending:** the pipeline blends with `premultiplied` alpha.
+   - **Culled splats:** they sort to the end and become zero-area quads.
+4. **Composite** the result onto the window.
+
+**Color.** Splats are trained against photos, so their colors are display-space values,
+and the reference renderer blends them as such. They are blended here the same way, in an
+`rgba16f` texture rather than in the window. If the window encodes sRGB itself, the
+composite pass converts to linear first (`decodeGamma`), so the window's encoding gives
+back the original values.
+
+**Input** only changes the view block: camera, splat size, and the y/z flip. The flip is
+needed because COLMAP-based captures are y-down.
+
+**Performance.** On an RTX 3050 Laptop GPU, at the default window size, a frame takes
+about 31 ms (≈ 32 fps), in both Debug and Release builds. The frame time is GPU-bound,
+spent on projecting, sorting and blending all 1.9 million splats every frame. The usual
+next steps, not done here:
+
+- a radix sort in place of the bitonic one
+- sorting and drawing only the splats that survive culling (with indirect dispatch and
+  draw)
+- tile-based compute rasterization, as in the paper, in place of blended quads
+
+## Example: combining passes by depth
+
+`scripts/fusion.lua` (and mode 7 of the showcase) draws the mesh scene and the Gaussian
+splats into one picture. They are rendered completely separately, each into its own color
+texture and its own depth buffer. A last pass then combines the two images per pixel, by
+which one is nearer the camera:
+
+| Pass | Writes | Reads |
+| --- | --- | --- |
+| scene: generate sphere, shadow faces | the shadow atlas | |
+| mesh | `meshColor` (rgba16f), `meshDepth` | the shadow atlas |
+| splats: preprocess, sort | the projected and sorted splats | the PLY data |
+| splats: color | `splatColor` (rgba16f, transparent background) | the sorted splats |
+| splats: depth (`color = false`) | `splatDepth` | the sorted splats |
+| depth composite | the window | all four |
+
+**Two depth buffers.**
+
+- **The mesh's** is an ordinary depth buffer: the `mesh` pass's `depth_target`.
+- **The splats'** needs a pass of its own. Blended splats have no single depth per pixel,
+  and a depth test in the color pass would cut away the far splats that blending needs.
+  So the splats are drawn a second time, by `depthFragmentMain` in
+  `shaders/splat/render.slang`, with depth testing and no color. Wherever a splat is at
+  least 30% opaque at a pixel, it writes its depth, and depth testing keeps the nearest.
+  The result is a depth buffer of the splats' visible surface.
+
+**Same space.** Both sides look through one parameter block with the `camera`, so they
+render the same view. Both write depth over the same near and far planes (0.1 and 100):
+`scene/lit.slang`'s projection, and `depthFromViewZ` in `splat/splat-common.slang`. The same
+block carries the splats' `model` transform, which places the skull in the scene: scaled,
+turned to face the starting camera, and sunk a little into the floor.
+
+**The composite** (`shaders/post/depth-composite.slang`) turns both depth values back into
+view distances and compares them per pixel:
+
+- **Splats nearer:** the splats go over the mesh by their alpha. Their display-space
+  premultiplied color is linearized first.
+- **Mesh nearer:** the mesh hides the splats behind it.
+
+So the horns pass in front of the sphere, the floor cuts off the jaw, and orbiting the
+camera moves each in front of or behind the other. V shows the inputs: the mesh or the
+splats alone, or both depth buffers, with the mesh's in blue, the splats' in orange, and
+nearer shown brighter.
+
+**Limits of this approach.**
+
+- **Hard edges:** the splats' depth is per pixel and per splat (each splat's center depth,
+  for all of it), and the comparison is either/or. Where a mesh crosses a splat surface,
+  the edge is hard.
+- **Splats inside a surface:** faint splats in front of a nearer mesh surface are dropped
+  with the rest.
+- **No shadows from the splats:** they don't cast shadows on the meshes; only the mesh
+  objects are in the shadow passes.
+- **Cost:** about 36 ms per frame on an RTX 3050 Laptop GPU (Release, default window
+  size), against 31 ms for the splats alone. Most of the difference is the splats' second,
+  depth-only draw.
+
+**Shared resources.** The fusion module builds its graph from pieces of the scene and
+splat modules:
+
+- **The scene's** `addShadowPasses` and `addCameraPass`.
+- **The splats'** `addPasses`, with a `depthTarget` for the depth pass.
+
+Those modules make their pipelines, meshes and the loaded file once, in `createResources()`.
+The showcase therefore shares them between the Scene, Gaussian Splats and Depth Composite
+modes, and only the graphs differ.
 
 ## Shader parameters
 

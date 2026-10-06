@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -173,7 +174,114 @@ struct ShaderSource
 // edited include would never be seen again. Splicing them in here means every build reads
 // every file afresh, and also tells us which files a pipeline depends on. #line
 // directives keep diagnostics pointing at the real files.
-bool readShaderSource(const fs::path& path, const std::vector<fs::path>& searchDirs, ShaderSource& out, int depth = 0)
+bool readShaderSource(const fs::path& path, const std::vector<fs::path>& searchDirs, ShaderSource& out, int depth = 0);
+
+// ---------------------------------------------------------------------------------------
+// PLY files
+// ---------------------------------------------------------------------------------------
+
+struct PlyData
+{
+    uint32_t count = 0;
+    std::vector<std::string> properties; // of the vertex element, in file order
+    std::vector<float> data;             // count records of properties.size() floats
+};
+
+// Reads the vertex element of a binary little-endian PLY file whose vertex properties are
+// all floats -- the format Gaussian splatting scenes are stored in.
+bool readPly(const fs::path& path, PlyData& out, std::string& error)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+    {
+        error = "could not open the file";
+        return false;
+    }
+    std::string line;
+    std::getline(file, line);
+    if (line.rfind("ply", 0) != 0)
+    {
+        error = "not a PLY file";
+        return false;
+    }
+    bool inVertex = false;
+    bool sawVertex = false;
+    while (std::getline(file, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        std::istringstream words(line);
+        std::string keyword;
+        words >> keyword;
+        if (keyword == "format")
+        {
+            std::string format;
+            words >> format;
+            if (format != "binary_little_endian")
+            {
+                error = "only binary_little_endian PLY files are supported, not " + format;
+                return false;
+            }
+        }
+        else if (keyword == "element")
+        {
+            std::string name;
+            words >> name;
+            if (name == "vertex")
+            {
+                if (sawVertex)
+                {
+                    error = "more than one vertex element";
+                    return false;
+                }
+                words >> out.count;
+                inVertex = sawVertex = true;
+            }
+            else
+            {
+                if (!sawVertex)
+                {
+                    // Its data would come first, and we don't read other elements' types.
+                    error = "elements before the vertex element are not supported";
+                    return false;
+                }
+                inVertex = false;
+            }
+        }
+        else if (keyword == "property" && inVertex)
+        {
+            std::string type, name;
+            words >> type >> name;
+            if (type != "float" && type != "float32")
+            {
+                error = "only float vertex properties are supported ('" + type + " " + name + "')";
+                return false;
+            }
+            out.properties.push_back(name);
+        }
+        else if (keyword == "end_header")
+        {
+            break;
+        }
+    }
+    if (!sawVertex || out.properties.empty())
+    {
+        error = "no vertex element";
+        return false;
+    }
+    out.data.resize(size_t(out.count) * out.properties.size());
+    file.read(reinterpret_cast<char*>(out.data.data()), std::streamsize(out.data.size() * sizeof(float)));
+    if (size_t(file.gcount()) != out.data.size() * sizeof(float))
+    {
+        error = "the file is shorter than its header says";
+        return false;
+    }
+    return true;
+}
+
+bool readShaderSource(const fs::path& path, const std::vector<fs::path>& searchDirs, ShaderSource& out, int depth)
 {
     std::string key = pathKey(path);
     out.files.push_back(key);
@@ -358,6 +466,16 @@ struct Pipeline
     bool depth = false;
     // Color target format; Undefined means the window's.
     Format colorFormat = Format::Undefined;
+    enum class Blend
+    {
+        None,
+        Alpha,         // color * a + target * (1 - a)
+        Premultiplied, // color + target * (1 - a): the shader has multiplied color by a
+        Additive,      // color + target
+    };
+    Blend blend = Blend::None;
+    // No color target at all (format = "none"): for depth-only passes.
+    bool depthOnly = false;
 
     // The latest build that compiled; kept when an edit doesn't.
     ComPtr<IComputePipeline> compute;
@@ -381,6 +499,9 @@ struct Texture
     float scale = 1.0f;
     // Depth buffer for depth-tested draws into this texture, created on first use.
     ComPtr<ITexture> depth;
+    // A depth buffer itself (rhi.depth_target): drawn into as a pass's depth_target, and
+    // readable by shaders as a Texture2D<float> of depth values in [0, 1].
+    bool isDepth = false;
 };
 
 struct Buffer
@@ -459,7 +580,9 @@ struct GraphNode
     bool reported = false;
 
     // Render pass.
-    std::shared_ptr<Texture> target; // null: the window
+    std::shared_ptr<Texture> target;      // null: the window
+    std::shared_ptr<Texture> depthTarget; // null: the host's depth buffer for the target
+    bool depthOnly = false;               // no color attachment; needs depthTarget
     bool clear = false;
     float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     enum class ViewportMode
@@ -1020,12 +1143,20 @@ public:
 
         ColorTargetDesc colorTarget = {};
         colorTarget.format = resolveColorFormat(pipeline);
+        if (pipeline.blend != Pipeline::Blend::None)
+        {
+            colorTarget.enableBlend = true;
+            BlendFactor src = pipeline.blend == Pipeline::Blend::Alpha ? BlendFactor::SrcAlpha : BlendFactor::One;
+            BlendFactor dst = pipeline.blend == Pipeline::Blend::Additive ? BlendFactor::One : BlendFactor::InvSrcAlpha;
+            colorTarget.color = {src, dst, BlendOp::Add};
+            colorTarget.alpha = {BlendFactor::One, dst, BlendOp::Add};
+        }
         RenderPipelineDesc desc = {};
         desc.program = compiled.program;
         desc.inputLayout = inputLayout;
         desc.primitiveTopology = pipeline.topology;
-        desc.targets = &colorTarget;
-        desc.targetCount = 1;
+        desc.targets = pipeline.depthOnly ? nullptr : &colorTarget;
+        desc.targetCount = pipeline.depthOnly ? 0 : 1;
         if (pipeline.depth)
         {
             desc.depthStencil.format = kDepthFormat;
@@ -1061,6 +1192,8 @@ public:
         key += "|" + std::to_string(int(desc->topology));
         key += desc->depth ? "|depth" : "";
         key += "|" + std::to_string(int(desc->colorFormat));
+        key += "|blend" + std::to_string(int(desc->blend));
+        key += desc->depthOnly ? "|depthonly" : "";
 
         auto it = m_pipelines.find(key);
         if (it != m_pipelines.end())
@@ -1087,6 +1220,17 @@ public:
         desc.size.width = std::max<uint32_t>(width, 1);
         desc.size.height = std::max<uint32_t>(height, 1);
         desc.format = texture.format;
+        if (texture.isDepth)
+        {
+            // Cleared by the first pass that uses it each frame, like the host's own.
+            desc.usage = TextureUsage::DepthStencil | TextureUsage::ShaderResource;
+            desc.defaultState = ResourceState::DepthWrite;
+            desc.label = "Depth Target";
+            ComPtr<ITexture> created;
+            SLANG_RETURN_ON_FAIL(m_device->createTexture(desc, nullptr, created.writeRef()));
+            texture.texture = created;
+            return SLANG_OK;
+        }
         desc.usage = TextureUsage::UnorderedAccess | TextureUsage::ShaderResource | TextureUsage::RenderTarget |
                      TextureUsage::CopySource | TextureUsage::CopyDestination;
         ComPtr<ITexture> created;
@@ -1142,12 +1286,14 @@ public:
     // What a render pass draws into: the window image, or a texture.
     struct Destination
     {
-        ITexture* color = nullptr;
+        ITexture* color = nullptr; // null: depth only
         Format format = Format::Undefined;
         uint32_t width = 0;
         uint32_t height = 0;
         // Where the destination's depth buffer lives.
         ComPtr<ITexture>* depth = nullptr;
+        // The depth buffer is the script's (a depth_target): used as it is, never replaced.
+        bool scriptDepth = false;
     };
 
     Destination windowDestination()
@@ -1186,22 +1332,28 @@ public:
     IRenderPassEncoder* beginRenderPass(const Destination& destination, const float* clearColor, bool depth = false)
     {
         RenderPassColorAttachment colorAttachment = {};
-        colorAttachment.view = destination.color->getDefaultView();
-        colorAttachment.loadOp = clearColor ? LoadOp::Clear : LoadOp::Load;
-        if (clearColor)
-        {
-            std::copy_n(clearColor, 4, colorAttachment.clearValue);
-            if (*destination.depth)
-            {
-                m_frame.validDepth.erase(destination.depth->get());
-            }
-        }
         RenderPassDesc renderPass = {};
-        renderPass.colorAttachments = &colorAttachment;
-        renderPass.colorAttachmentCount = 1;
+        if (destination.color)
+        {
+            colorAttachment.view = destination.color->getDefaultView();
+            colorAttachment.loadOp = clearColor ? LoadOp::Clear : LoadOp::Load;
+            if (clearColor)
+            {
+                std::copy_n(clearColor, 4, colorAttachment.clearValue);
+            }
+            renderPass.colorAttachments = &colorAttachment;
+            renderPass.colorAttachmentCount = 1;
+        }
+        if (clearColor && *destination.depth)
+        {
+            m_frame.validDepth.erase(destination.depth->get());
+        }
 
         RenderPassDepthStencilAttachment depthAttachment = {};
-        if (depth && SLANG_SUCCEEDED(ensureDepthTexture(*destination.depth, destination.width, destination.height)))
+        bool haveDepth = destination.scriptDepth
+                             ? bool(*destination.depth)
+                             : SLANG_SUCCEEDED(ensureDepthTexture(*destination.depth, destination.width, destination.height));
+        if (depth && haveDepth)
         {
             ITexture* depthTexture = destination.depth->get();
             depthAttachment.view = depthTexture->getDefaultView();
@@ -1574,6 +1726,19 @@ public:
     void runRenderPass(GraphNode& node)
     {
         Destination destination = node.target ? textureDestination(*node.target) : windowDestination();
+        if (node.depthTarget)
+        {
+            destination.depth = std::addressof(node.depthTarget->texture);
+            destination.scriptDepth = true;
+        }
+        if (node.depthOnly)
+        {
+            const TextureDesc& desc = node.depthTarget->texture->getDesc();
+            destination.color = nullptr;
+            destination.format = Format::Undefined;
+            destination.width = desc.size.width;
+            destination.height = desc.size.height;
+        }
         float viewport[4] = {0.0f, 0.0f, float(destination.width), float(destination.height)};
         if (node.viewportMode == GraphNode::ViewportMode::Pixels)
         {
@@ -1602,7 +1767,8 @@ public:
             {
                 continue;
             }
-            if (resolveColorFormat(*pipeline) != destination.format)
+            if (pipeline->depthOnly != node.depthOnly ||
+                (!pipeline->depthOnly && resolveColorFormat(*pipeline) != destination.format))
             {
                 report(draw->reported, node.name, "a draw's pipeline format doesn't match the pass's target");
                 continue;
@@ -1649,6 +1815,19 @@ public:
 
     // A shader path from a script: relative to the script if there is such a file there,
     // else relative to the shared shaders folder.
+    // An asset path from a script: relative to the script if there is such a file there,
+    // else relative to the shared assets folder.
+    fs::path resolveAssetPath(const std::string& name) const
+    {
+        std::error_code ec;
+        fs::path local = m_scriptDir / name;
+        if (fs::path(name).is_absolute() || fs::is_regular_file(local, ec))
+        {
+            return local;
+        }
+        return fs::path(LUA_ASSETS_DIR) / name;
+    }
+
     fs::path resolveShaderPath(const std::string& name) const
     {
         std::error_code ec;
@@ -1751,8 +1930,37 @@ public:
 
         if (lua_getfield(L, 1, "format") != LUA_TNIL)
         {
-            desc->colorFormat = checkFormat(L, luaL_checkstring(L, -1))->format;
+            const char* format = luaL_checkstring(L, -1);
+            if (strcmp(format, "none") == 0)
+            {
+                desc->depthOnly = true;
+                desc->depth = true;
+            }
+            else
+            {
+                desc->colorFormat = checkFormat(L, format)->format;
+            }
         }
+        lua_pop(L, 1);
+
+        static const std::pair<const char*, Pipeline::Blend> kBlends[] = {
+            {"none", Pipeline::Blend::None},
+            {"alpha", Pipeline::Blend::Alpha},
+            {"premultiplied", Pipeline::Blend::Premultiplied},
+            {"additive", Pipeline::Blend::Additive},
+        };
+        lua_getfield(L, 1, "blend");
+        const char* blend = luaL_optstring(L, -1, "none");
+        auto foundBlend = std::find_if(
+            std::begin(kBlends),
+            std::end(kBlends),
+            [&](const auto& entry) { return strcmp(entry.first, blend) == 0; }
+        );
+        if (foundBlend == std::end(kBlends))
+        {
+            luaL_error(L, "unknown blend '%s'", blend);
+        }
+        desc->blend = foundBlend->second;
         lua_pop(L, 1);
 
         pushHandle(L, app->getPipeline(desc), kPipelineType);
@@ -1778,6 +1986,32 @@ public:
         if (SLANG_FAILED(app->allocateTexture(*texture, width, height)))
         {
             luaL_error(L, "could not create render target");
+        }
+        app->m_renderTargets.push_back(texture);
+        pushHandle(L, texture, kTextureType);
+        return 1;
+    }
+
+    // rhi.depth_target([scale = 1]): a depth buffer that follows the window size (times
+    // `scale`), for a render pass's depth_target; shaders read it as Texture2D<float>.
+    static int apiDepthTarget(lua_State* L)
+    {
+        LuaApp* app = requireDevice(L);
+        auto texture = std::make_shared<Texture>();
+        texture->format = kDepthFormat;
+        texture->isDepth = true;
+        texture->followsSurface = true;
+        texture->scale = float(luaL_optnumber(L, 1, 1.0));
+        if (texture->scale <= 0.0f)
+        {
+            luaL_error(L, "depth_target scale must be positive");
+        }
+        const SurfaceConfig* config = app->m_surface->getConfig();
+        uint32_t width = scaledSize(config ? config->width : 1, texture->scale);
+        uint32_t height = scaledSize(config ? config->height : 1, texture->scale);
+        if (SLANG_FAILED(app->allocateTexture(*texture, width, height)))
+        {
+            luaL_error(L, "could not create depth target");
         }
         app->m_renderTargets.push_back(texture);
         pushHandle(L, texture, kTextureType);
@@ -2030,8 +2264,17 @@ public:
         }
     }
 
-    // graph:render_pass{ name, target = texture, clear = {r,g,b,a},
-    //                    viewport = {x,y,w,h} | viewport_fraction = {x,y,w,h} }
+    // A texture to draw color into: any texture but a depth target.
+    static std::shared_ptr<Texture> checkColorTexture(lua_State* L, int index)
+    {
+        auto texture = checkShared<Texture>(L, index, kTextureType);
+        if (texture->isDepth)
+            luaL_error(L, "a depth target can't be drawn into as a color target (use depth_target)");
+        return texture;
+    }
+
+    // graph:render_pass{ name, target = texture, depth_target = depthTexture, color = true,
+    //                    clear = {r,g,b,a}, viewport = {x,y,w,h} | viewport_fraction = {x,y,w,h} }
     static int graphRenderPass(lua_State* L)
     {
         auto graph = checkShared<Graph>(L, 1, kGraphType);
@@ -2049,8 +2292,21 @@ public:
         lua_pop(L, 1);
         lua_getfield(L, 2, "target");
         if (!lua_isnil(L, -1))
-            node->target = checkShared<Texture>(L, -1, kTextureType);
+            node->target = checkColorTexture(L, -1);
         lua_pop(L, 1);
+        lua_getfield(L, 2, "depth_target");
+        if (!lua_isnil(L, -1))
+        {
+            node->depthTarget = checkShared<Texture>(L, -1, kTextureType);
+            if (!node->depthTarget->isDepth)
+                luaL_error(L, "depth_target needs a texture made by rhi.depth_target()");
+        }
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "color");
+        node->depthOnly = lua_isboolean(L, -1) && !lua_toboolean(L, -1);
+        lua_pop(L, 1);
+        if (node->depthOnly && (!node->depthTarget || node->target))
+            luaL_error(L, "a pass with color = false draws only into its depth_target, and has no target");
         if (lua_getfield(L, 2, "clear") == LUA_TTABLE)
         {
             node->clear = true;
@@ -2221,6 +2477,86 @@ public:
         else
             luaL_error(L, "can't set '%s' on a graph draw", key);
         return 0;
+    }
+
+    // rhi.load_ply(path): loads the vertex element of a binary PLY file into a buffer of
+    // floats, one record of `stride` floats per vertex, in the file's property order.
+    // Returns { buffer, count, stride, properties = { name = offset, ... },
+    //           center = {x, y, z}, radius } -- center and radius summarize the x/y/z
+    // properties (mean, and the root of the summed variances), for framing a camera.
+    static int apiLoadPly(lua_State* L)
+    {
+        LuaApp* app = requireDevice(L);
+        fs::path path = app->resolveAssetPath(luaL_checkstring(L, 1));
+        PlyData ply;
+        std::string error;
+        if (!readPly(path, ply, error))
+        {
+            luaL_error(L, "%s: %s", path.generic_string().c_str(), error.c_str());
+        }
+        uint32_t stride = uint32_t(ply.properties.size());
+
+        auto buffer = std::make_shared<Buffer>();
+        BufferDesc desc = {};
+        desc.size = std::max<size_t>(ply.data.size(), 1) * sizeof(float);
+        desc.usage = BufferUsage::ShaderResource | BufferUsage::CopyDestination;
+        desc.defaultState = ResourceState::ShaderResource;
+        desc.label = "PLY data";
+        if (SLANG_FAILED(app->m_device->createBuffer(desc, ply.data.data(), buffer->buffer.writeRef())))
+        {
+            luaL_error(L, "could not create a buffer for '%s'", path.generic_string().c_str());
+        }
+        buffer->size = desc.size;
+
+        lua_newtable(L);
+        pushHandle(L, buffer, kBufferType);
+        lua_setfield(L, -2, "buffer");
+        lua_pushinteger(L, ply.count);
+        lua_setfield(L, -2, "count");
+        lua_pushinteger(L, stride);
+        lua_setfield(L, -2, "stride");
+        lua_newtable(L);
+        for (uint32_t i = 0; i < stride; ++i)
+        {
+            lua_pushinteger(L, i);
+            lua_setfield(L, -2, ply.properties[i].c_str());
+        }
+        lua_setfield(L, -2, "properties");
+
+        // Where the points are, for framing them.
+        auto find = [&](const char* name) -> int
+        {
+            auto it = std::find(ply.properties.begin(), ply.properties.end(), name);
+            return it == ply.properties.end() ? -1 : int(it - ply.properties.begin());
+        };
+        int axes[3] = {find("x"), find("y"), find("z")};
+        if (axes[0] >= 0 && axes[1] >= 0 && axes[2] >= 0 && ply.count > 0)
+        {
+            double sum[3] = {0, 0, 0};
+            double sumSquares[3] = {0, 0, 0};
+            for (uint32_t v = 0; v < ply.count; ++v)
+            {
+                for (int a = 0; a < 3; ++a)
+                {
+                    double value = ply.data[size_t(v) * stride + axes[a]];
+                    sum[a] += value;
+                    sumSquares[a] += value * value;
+                }
+            }
+            double variance = 0.0;
+            lua_createtable(L, 3, 0);
+            for (int a = 0; a < 3; ++a)
+            {
+                double mean = sum[a] / ply.count;
+                variance += std::max(0.0, sumSquares[a] / ply.count - mean * mean);
+                lua_pushnumber(L, mean);
+                lua_rawseti(L, -2, a + 1);
+            }
+            lua_setfield(L, -2, "center");
+            lua_pushnumber(L, std::sqrt(variance));
+            lua_setfield(L, -2, "radius");
+        }
+        return 1;
     }
 
     // rhi.window_srgb(): true if the window's format encodes sRGB itself.
@@ -2414,7 +2750,7 @@ public:
         {
             return app->windowDestination();
         }
-        return textureDestination(*checkHandle<Texture>(L, index, kTextureType));
+        return textureDestination(*checkColorTexture(L, index));
     }
 
     // frame:clear(r, g, b [, a = 1 [, target = window]])
@@ -2618,6 +2954,7 @@ public:
             {"compute_pipeline", apiComputePipeline},
             {"render_pipeline", apiRenderPipeline},
             {"render_target", apiRenderTarget},
+            {"depth_target", apiDepthTarget},
             {"texture", apiTexture},
             {"vertex_buffer", apiVertexBuffer},
             {"buffer", apiBuffer},
@@ -2629,6 +2966,7 @@ public:
             {"graph", apiGraph},
             {"set_graph", apiSetGraph},
             {"window_srgb", apiWindowSrgb},
+            {"load_ply", apiLoadPly},
             {nullptr, nullptr},
         };
         lua_newtable(L);
