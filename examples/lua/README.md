@@ -6,27 +6,53 @@ window, the device, the swapchain and the frame loop; a script decides what gets
 created and drawn, and reacts to input. Scripts and shaders reload while the program runs,
 so most iteration happens without a rebuild.
 
-All examples are scripts:
+All examples are scripts, in `scripts/`:
 
 | Script | What it shows |
 | --- | --- |
-| `examples/lua/showcase.lua` | every mode below in one window, switchable at runtime |
-| `examples/surface/surface.lua` | clearing the window |
-| `examples/scene/scene.lua` | a lit 3D scene: a GPU-generated spherified cube, a cube and a floor, with a point light, realtime shadow mapping and a second camera composited into the corner -- built as a render graph the host runs without Lua |
-| `examples/shader-toy/shader-toy.lua` | ShaderToy-style compute shaders blitted to the window |
+| `showcase.lua` | the scene and the ShaderToy shaders in one window, switchable at runtime |
+| `surface.lua` | clearing the window |
+| `scene.lua` | a lit 3D scene: a GPU-generated spherified cube, a cube and a floor, with a point light, realtime shadow mapping and a second camera composited into the corner -- built as a render graph the host runs without Lua |
+| `shader-toy.lua` | ShaderToy-style compute shaders blitted to the window |
+
+## Layout
+
+```
+examples/lua/
+  example-lua.cpp      the host
+  README.md
+  scripts/             runnable scripts, one per example
+    lib/               Lua modules used by scripts (rhi.include), not run on their own
+  shaders/             every shader, shared by all scripts
+    common/            Slang libraries: math, quaternions, transforms, SDFs, splines, ...
+    mesh/              the vertex format, and mesh generators (spherified-cube)
+    scene/             the scene's lighting and shadows (scene-common, shadow, lit)
+    post/              full-screen passes (composite)
+    shader-toy/        the ShaderToy framework (shader-toy.slang) and the toys
+```
+
+**How paths resolve:**
+
+- **Shaders:** scripts name shaders relative to `shaders/`, e.g. `"scene/lit.slang"`. A path
+  is looked up next to the script first, so a script can also keep private shaders
+  beside it.
+- **Includes:** `#include "..."` is resolved relative to the including file, then
+  relative to `shaders/`. Shaders in any folder can therefore use the libraries, e.g.
+  `#include "common/sdfs.slang"`.
+- **Lua modules:** `rhi.include` paths are relative to the script.
 
 ## Running
 
 ```
 example-lua                        # the showcase, on Vulkan
-example-lua scene                  # examples/scene/scene.lua
-example-lua showcase               # examples/lua/showcase.lua
+example-lua scene                  # scripts/scene.lua
+example-lua showcase               # scripts/showcase.lua
 example-lua path/to/my.lua         # any script
 example-lua --api d3d12 scene      # pick the graphics API
 example-lua --help                 # usage, APIs and the list of examples
 ```
 
-A name is looked up as `examples/<name>/<name>.lua`, then as `examples/lua/<name>.lua`.
+A name is looked up as `scripts/<name>.lua`.
 In Visual Studio, `example-lua` is the startup project and runs the showcase.
 
 ### Graphics API
@@ -46,19 +72,18 @@ and exits. It doesn't fall back to another API.
 | Input | Action |
 | --- | --- |
 | Left / Right arrow | previous / next mode |
-| `1` .. `6` | jump to a mode |
+| `1` .. `5` | jump to a mode |
 | Steam Controller LB / RB | previous / next mode |
 | Left mouse button | moves `iMouse` in the ShaderToy modes |
 | Escape | gives the mouse pointer back (click the window to hide it again) |
 | F11 | toggles fullscreen |
 
-The modes are Surface, Scene, and the ShaderToy shaders Circle, Ocean, 2D SDFs and
-Controller. The current mode is shown in the window title. A ShaderToy mode whose shader
+The modes are Scene and the ShaderToy shaders Circle, Ocean, 2D SDFs and Controller. The current mode is shown in the window title. A ShaderToy mode whose shader
 doesn't compile shows dark red until it does.
 
 ### The scene
 
-`example-lua scene`, or mode 2 of the showcase.
+`example-lua scene`, or mode 1 of the showcase.
 
 | Input | Action |
 | --- | --- |
@@ -161,7 +186,8 @@ local draw = rhi.render_pipeline {
 }
 ```
 
-- **Paths**: shader paths are relative to the script.
+- **Paths**: shader paths are relative to `shaders/` (or to the script, if the file is
+  there); see [Layout](#layout).
 - **`layout`**: describes one interleaved vertex stream. Each attribute's offset follows the
   one before it, and the stride is the sum of all of them. Leave `layout` out for shaders
   that generate their vertices from `SV_VertexID`.
@@ -214,8 +240,8 @@ local buf2 = rhi.buffer { 1, 2, 3, 4 }            -- floats
 | `rhi.params{...}`, `rhi.graph()`, `rhi.set_graph(graph)` | see [Render graphs](#render-graphs) |
 
 `rhi.include` is for sharing Lua code between scripts in different folders. The showcase
-uses it to run `examples/scene/scene-mode.lua`. Within one folder, `require` works too,
-but a file loaded with `require` isn't watched for edits.
+uses it to run `scripts/lib/scene-mode.lua`, the scene that `scene.lua` runs on its own.
+`require` works too, but a file loaded with `require` isn't watched for edits.
 
 ## Drawing: the `frame`
 
@@ -281,11 +307,11 @@ frame:blit(target)
 A compute shader can write a mesh into a buffer that a render pipeline then draws. Write
 the mesh as a plain triangle list into a `RWStructuredBuffer`. The vertex shader reads the
 same buffer as a `StructuredBuffer`, indexed by `SV_VertexID`. The render pipeline then
-needs no `layout` and no index buffer. `examples/scene` does this for its spherified cube:
+needs no `layout` and no index buffer. The scene does this for its spherified cube:
 
 ```lua
 -- init(): allocate once, for the largest mesh
-generate = rhi.compute_pipeline("spherified-cube.slang", "generateMain")
+generate = rhi.compute_pipeline("mesh/spherified-cube.slang", "generateMain")
 mesh = rhi.render_pipeline { shader = "my-mesh.slang", depth = true }
 vertices = rhi.buffer(maxVertexCount * 32)
 
@@ -403,20 +429,20 @@ graph, in the same frame.
 
 ## Example: a scene as a render graph
 
-`examples/scene` renders a small scene lit by an orbiting point light with realtime
+`scripts/scene.lua` renders a small scene lit by an orbiting point light with realtime
 shadows. A second camera's view is composited into the lower right corner. All of it is
 one render graph, built in `init()`:
 
 | File | Role |
 | --- | --- |
-| `scene.lua` | runs the scene on its own |
-| `scene-mode.lua` | the scene itself: builds the graph, and handles input |
-| `mesh-vertex.slang` | the vertex format shared by all meshes |
-| `spherified-cube.slang` | compute shader that generates the sphere |
-| `scene-common.slang` | the light, object transforms (both animated by `time`), and the shadow atlas layout |
-| `shadow.slang` | shadow pass: writes distances from the light |
-| `lit.slang` | lit pass: shading, attenuation and the shadow lookup |
-| `composite.slang` | copies a texture into a viewport, with a border |
+| `scripts/scene.lua` | runs the scene on its own |
+| `scripts/lib/scene-mode.lua` | the scene itself: builds the graph, and handles input |
+| `shaders/mesh/mesh-vertex.slang` | the vertex format shared by all meshes |
+| `shaders/mesh/spherified-cube.slang` | compute shader that generates the sphere |
+| `shaders/scene/scene-common.slang` | the light, object transforms (both animated by `time`), and the shadow atlas layout |
+| `shaders/scene/shadow.slang` | shadow pass: writes distances from the light |
+| `shaders/scene/lit.slang` | lit pass: shading, attenuation and the shadow lookup |
+| `shaders/post/composite.slang` | copies a texture into a viewport, with a border |
 
 The graph's passes, in order:
 
@@ -523,7 +549,7 @@ to the type the shader declares:
 - **Matrices** are written tightly packed. That is exact for `float4x4`; smaller matrices in
   constant buffers may be padded differently.
 
-The ShaderToy uniforms in `examples/shader-toy/shader-toy.slang` are a complete example:
+The ShaderToy uniforms in `shaders/shader-toy/shader-toy.slang` are a complete example:
 
 ```lua
 frame:dispatch(pipeline, {
@@ -611,11 +637,12 @@ messages appear in the same log. Release builds on Windows have no console.
 
 ## Writing an example
 
-1. Create `examples/<name>/<name>.lua` next to the example's shaders. It then runs with
-   `example-lua <name>`.
-2. Start from `config` plus `init` and `draw`. The smallest complete example is
-   `surface.lua`. `scene/scene-mode.lua` shows a complete 3D setup as a render graph.
-3. For several modes in one script, follow `showcase.lua`:
+1. Create `scripts/<name>.lua`. It then runs with `example-lua <name>`.
+2. Put its shaders in a folder of their own under `shaders/` (e.g. `shaders/<name>/`). Put
+   anything other examples could use in `common/`, `mesh/` or `post/`.
+3. Start from `config` plus `init` and `draw`. The smallest complete example is
+   `surface.lua`. `lib/scene-mode.lua` shows a complete 3D setup as a render graph.
+4. For several modes in one script, follow `showcase.lua`:
    - **Modes**: each mode is a table with `name`, a lazy `init()` and `draw(frame)`.
    - **Shared state**: lives in locals.
    - **Switching**: `switchTo(index)` initializes a mode on first use and updates the
@@ -624,8 +651,8 @@ messages appear in the same log. Release builds on Windows have no console.
      mode.
    - **Graphs**: a mode with a render graph sets it in `on_enter()` and clears it in
      `on_leave()`.
-4. Shared Lua code can go in a module loaded with `rhi.include` (watched for edits). Code
-   next to the script can also be loaded with `require` (not watched).
+5. Shared Lua code goes in `scripts/lib/` and is loaded with `rhi.include("lib/...")`,
+   which watches it for edits. `require` works too, but isn't watched.
 
 ## Implementation
 

@@ -1,8 +1,9 @@
 -- Runs "ShaderToy"-style shaders: a compute shader renders mainImage() (see
--- shader-toy.slang) into a texture that is blitted to the window.
+-- shaders/shader-toy/shader-toy.slang) into a texture that is blitted to the window.
 --
--- Left/right arrows cycle through the shaders. Add one by dropping a .slang file in this
--- folder and listing it below -- saving this script picks it up without a restart.
+-- Left/right arrows cycle through the shaders. Add one by dropping a .slang file in
+-- shaders/shader-toy and listing it below -- saving this script picks it up without a
+-- restart.
 
 config = { title = "ShaderToy" }
 
@@ -20,7 +21,7 @@ local mouse = { x = 0, y = 0, down = false, clicked = false }
 -- Shaders compile when first shown, then stay cached (and hot-reload) in the host.
 local function pipeline()
     local name = shaders[current]
-    pipelines[name] = pipelines[name] or rhi.compute_pipeline(name, "mainCompute")
+    pipelines[name] = pipelines[name] or rhi.compute_pipeline("shader-toy/" .. name, "mainCompute")
     return pipelines[name]
 end
 

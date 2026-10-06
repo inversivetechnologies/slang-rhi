@@ -5,12 +5,14 @@
 -- The frame is a render graph: built here once, in init(), and run by the host every frame
 -- without calling into Lua. Its passes, in order:
 --
---   generate sphere   compute (spherified-cube.slang), only when its parameters change
+--   generate sphere   compute (mesh/spherified-cube.slang), only when its parameters change
 --   shadow face 0..5  the scene from the light, one cube face per cell of the shadow atlas;
---                     each texel stores the distance to the nearest surface (shadow.slang)
---   main camera       the scene lit and shadowed, into the window (lit.slang)
---   second camera     the same objects from another camera, into a texture (lit.slang)
---   composite         that texture into the window's lower right corner (composite.slang)
+--                     each texel stores the distance to the nearest surface
+--                     (scene/shadow.slang)
+--   main camera       the scene lit and shadowed, into the window (scene/lit.slang)
+--   second camera     the same objects from another camera, into a texture (scene/lit.slang)
+--   composite         that texture into the window's lower right corner
+--                     (post/composite.slang)
 --
 -- Both camera passes read the shadow atlas, and the composite reads the second camera's
 -- texture: the passes are composed through the textures they share.
@@ -22,20 +24,20 @@
 -- nothing per frame at all: it only responds to input.
 --
 -- The sphere is generated on the GPU; the cube and the floor are built here in Lua. All
--- three use the same vertex format (mesh-vertex.slang) and are drawn without a vertex
+-- three use the same vertex format (mesh/mesh-vertex.slang) and are drawn without a vertex
 -- layout: the shaders fetch vertices by SV_VertexID.
 --
 -- This file returns a constructor, so the scene can run on its own (scene.lua) or as a
--- mode of the showcase. `dir` is the path from the running script to this folder, since
--- shader paths are relative to the running script. `setTitle(details)`, if given, shows
--- the scene's parameters; by default they go in the window title after "Scene".
+-- mode of the showcase. `setTitle(details)`, if given, shows the scene's parameters; by
+-- default they go in the window title after "Scene". Shader paths are relative to
+-- examples/lua/shaders.
 --
 --   Mouse drag      orbit the camera        Mouse wheel           zoom
 --   Up / Down       subdivision +/- 1       Page Up / Page Down   subdivision x2 / /2
 --   + / -           sphere radius           Space                 pause the light
 --   Tab             show / hide the second camera
 
-return function(dir, setTitle)
+return function(setTitle)
     local scene = { name = "Scene" }
     setTitle = setTitle or function(details)
         rhi.set_title("Scene | " .. details)
@@ -172,13 +174,13 @@ return function(dir, setTitle)
     function scene.init()
         local srgb = rhi.window_srgb()
 
-        local generate = rhi.compute_pipeline(dir .. "spherified-cube.slang", "generateMain")
-        local shadow = rhi.render_pipeline { shader = dir .. "shadow.slang", format = "r32f", depth = true }
-        local litWindow = rhi.render_pipeline { shader = dir .. "lit.slang", depth = true }
+        local generate = rhi.compute_pipeline("mesh/spherified-cube.slang", "generateMain")
+        local shadow = rhi.render_pipeline { shader = "scene/shadow.slang", format = "r32f", depth = true }
+        local litWindow = rhi.render_pipeline { shader = "scene/lit.slang", depth = true }
         -- The same shader again, for the second camera's texture: a pipeline is built for
         -- one target format.
-        local litTexture = rhi.render_pipeline { shader = dir .. "lit.slang", format = "rgba16f", depth = true }
-        local composite = rhi.render_pipeline { shader = dir .. "composite.slang" }
+        local litTexture = rhi.render_pipeline { shader = "scene/lit.slang", format = "rgba16f", depth = true }
+        local composite = rhi.render_pipeline { shader = "post/composite.slang" }
 
         local sphereMesh = { buffer = rhi.buffer(sphereVertexCount(MAX_SUBDIVISION) * VERTEX_SIZE) }
         local cube = cubeMesh()

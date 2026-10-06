@@ -1,8 +1,8 @@
 // Scriptable example host: every example is a Lua script that drives slang-rhi.
 //
-// A script lives next to its shaders (examples/<name>/<name>.lua) and is picked on the
-// command line: `example-lua scene`, or a path to any .lua file. The script and every
-// shader it uses -- includes too -- reload when saved.
+// Scripts live in examples/lua/scripts and shaders in examples/lua/shaders. A script is
+// picked on the command line: `example-lua scene` (scripts/scene.lua), or a path to any
+// .lua file. The script and every shader it uses -- includes too -- reload when saved.
 //
 // See examples/lua/README.md for the script API.
 
@@ -593,7 +593,9 @@ public:
         std::vector<Feature> features = {Feature::Surface};
         readConfig(title, width, height, features);
 
-        SLANG_RETURN_ON_FAIL(createDevice(deviceType, features, {}, m_device.writeRef(), {m_scriptDir.string()}));
+        SLANG_RETURN_ON_FAIL(
+            createDevice(deviceType, features, {}, m_device.writeRef(), {m_scriptDir.string(), LUA_SHADERS_DIR})
+        );
         SLANG_RETURN_ON_FAIL(createWindow(m_device, title.c_str(), width, height));
         SLANG_RETURN_ON_FAIL(createSurface(m_device, Format::Undefined, m_surface.writeRef()));
         SLANG_RETURN_ON_FAIL(m_device->getQueue(QueueType::Graphics, m_queue.writeRef()));
@@ -965,7 +967,7 @@ public:
     Result buildPipeline(Pipeline& pipeline)
     {
         ShaderSource source;
-        bool read = readShaderSource(pipeline.path, {m_scriptDir}, source);
+        bool read = readShaderSource(pipeline.path, {m_scriptDir, fs::path(LUA_SHADERS_DIR)}, source);
         pipeline.files = source.files;
         for (const std::string& file : source.files)
         {
@@ -1645,6 +1647,19 @@ public:
     // API: rhi.*
     // -----------------------------------------------------------------------------------
 
+    // A shader path from a script: relative to the script if there is such a file there,
+    // else relative to the shared shaders folder.
+    fs::path resolveShaderPath(const std::string& name) const
+    {
+        std::error_code ec;
+        fs::path local = m_scriptDir / name;
+        if (fs::path(name).is_absolute() || fs::is_regular_file(local, ec))
+        {
+            return local;
+        }
+        return fs::path(LUA_SHADERS_DIR) / name;
+    }
+
     static LuaApp* requireDevice(lua_State* L)
     {
         LuaApp* app = get(L);
@@ -1670,7 +1685,7 @@ public:
     {
         LuaApp* app = requireDevice(L);
         auto desc = std::make_shared<Pipeline>();
-        desc->path = app->m_scriptDir / luaL_checkstring(L, 1);
+        desc->path = app->resolveShaderPath(luaL_checkstring(L, 1));
         desc->entryPoints = {luaL_optstring(L, 2, "mainCompute")};
         desc->isCompute = true;
         pushHandle(L, app->getPipeline(desc), kPipelineType);
@@ -1687,7 +1702,7 @@ public:
         desc->isCompute = false;
 
         lua_getfield(L, 1, "shader");
-        desc->path = app->m_scriptDir / luaL_checkstring(L, -1);
+        desc->path = app->resolveShaderPath(luaL_checkstring(L, -1));
         lua_getfield(L, 1, "vertex");
         lua_getfield(L, 1, "fragment");
         desc->entryPoints = {luaL_optstring(L, -2, "vertexMain"), luaL_optstring(L, -1, "fragmentMain")};
@@ -2823,8 +2838,8 @@ public:
 // Entry point
 // ---------------------------------------------------------------------------------------
 
-// Resolves the script argument: a path to a .lua file, or the name of an example
-// (examples/<name>/<name>.lua, or a script in examples/lua/).
+// Resolves the script argument: a path to a .lua file, or the name of a script in
+// examples/lua/scripts.
 static fs::path findScript(const std::string& arg)
 {
     std::error_code ec;
@@ -2832,15 +2847,10 @@ static fs::path findScript(const std::string& arg)
     {
         return fs::absolute(arg);
     }
-    for (const fs::path& named : {
-             fs::path(EXAMPLES_ROOT) / arg / (arg + ".lua"),
-             fs::path(EXAMPLES_ROOT) / "lua" / (arg + ".lua"),
-         })
+    fs::path named = fs::path(LUA_SCRIPTS_DIR) / (arg + ".lua");
+    if (fs::is_regular_file(named, ec))
     {
-        if (fs::is_regular_file(named, ec))
-        {
-            return named;
-        }
+        return named;
     }
     return {};
 }
@@ -2849,17 +2859,9 @@ static void listExamples()
 {
     printf("examples:\n");
     std::error_code ec;
-    for (const fs::directory_entry& entry : fs::directory_iterator(EXAMPLES_ROOT, ec))
+    for (const fs::directory_entry& entry : fs::directory_iterator(LUA_SCRIPTS_DIR, ec))
     {
-        std::string name = entry.path().filename().string();
-        if (fs::is_regular_file(entry.path() / (name + ".lua"), ec))
-        {
-            printf("  %s\n", name.c_str());
-        }
-    }
-    for (const fs::directory_entry& entry : fs::directory_iterator(fs::path(EXAMPLES_ROOT) / "lua", ec))
-    {
-        if (entry.path().extension() == ".lua")
+        if (entry.is_regular_file(ec) && entry.path().extension() == ".lua")
         {
             printf("  %s\n", entry.path().stem().string().c_str());
         }

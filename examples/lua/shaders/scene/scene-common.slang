@@ -5,7 +5,7 @@
 // the objects' spin. Lua only changes these parameters when something else changes them
 // (a key press, the camera being dragged).
 
-#include "mesh-vertex.slang"
+#include "mesh/mesh-vertex.slang"
 
 // Seconds since start; provided by the host to every draw that declares it.
 uniform float time;

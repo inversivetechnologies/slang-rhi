@@ -1,27 +1,24 @@
--- Every example in one script: the surface clear, the lit scene and the ShaderToy
--- shaders, one after another in the same window.
+-- The examples in one script: the lit scene and the ShaderToy shaders, one after another
+-- in the same window.
 --
 --   Left / Right arrows     previous / next mode
---   1 .. 6                  jump to a mode
+--   1 .. 5                  jump to a mode
 --   Steam Controller LB/RB  previous / next mode
 --   Left mouse button       moves iMouse in the ShaderToy modes, orbits the scene's camera
 --
--- The scene has more controls of its own; see ../scene/scene-mode.lua.
+-- The scene has more controls of its own; see lib/scene-mode.lua.
 --
 -- Edit this script or any of the shaders while it runs; they reload when saved.
 
 config = {
     title = "Showcase",
     device = "vulkan",              -- the graphics API; `--api d3d12` etc. overrides it
-    features = { "rasterization" }, -- the surface and scene modes rasterize
+    features = { "rasterization" }, -- the scene mode rasterizes
 }
 
 -- -------------------------------------------------------------------------------------
 -- State shared by the modes
 -- -------------------------------------------------------------------------------------
-
--- The surface mode clears to a grey that ramps up and wraps around.
-local grey = 0.5
 
 local clock = { time = 0, dt = 0, frameRate = 0 }
 
@@ -46,16 +43,6 @@ local controller
 -- up a render graph (the scene) needs no `draw`: the host runs the graph.
 -- -------------------------------------------------------------------------------------
 
--- Clears the window: the smallest thing a frame can do.
-local function surfaceMode()
-    return {
-        name = "Surface",
-        draw = function(frame)
-            frame:clear(grey, grey, grey)
-        end,
-    }
-end
-
 local current = 1
 local modes
 
@@ -63,24 +50,24 @@ local function modeTitle(index)
     return string.format("Showcase: %s (%d/%d)", modes[index].name, index, #modes)
 end
 
--- The lit scene with point light shadows, shared with ../scene/scene.lua. rhi.include()
--- runs it from there (and reloads the showcase when it is saved); the scene's parameters
--- go in the title after the mode's.
+-- The lit scene with point light shadows, shared with scene.lua. rhi.include() runs it
+-- (and reloads the showcase when it is saved); the scene's parameters go in the title
+-- after the mode's.
 local function sceneMode()
-    local createScene = rhi.include("../scene/scene-mode.lua")
-    return createScene("../scene/", function(details)
+    local createScene = rhi.include("lib/scene-mode.lua")
+    return createScene(function(details)
         rhi.set_title(modeTitle(current) .. " | " .. details)
     end)
 end
 
 -- A ShaderToy-style shader: a compute shader runs mainImage() (see
--- ../shader-toy/shader-toy.slang) for every pixel of `target`.
+-- shaders/shader-toy/shader-toy.slang) for every pixel of `target`.
 local function shaderToyMode(name, file)
     local mode = { name = "ShaderToy: " .. name }
     local pipeline
 
     function mode.init()
-        pipeline = rhi.compute_pipeline("../shader-toy/" .. file, "mainCompute")
+        pipeline = rhi.compute_pipeline("shader-toy/" .. file, "mainCompute")
     end
 
     function mode.draw(frame)
@@ -106,7 +93,6 @@ local function shaderToyMode(name, file)
 end
 
 modes = {
-    surfaceMode(),
     sceneMode(),
     shaderToyMode("Circle", "circle.slang"),
     shaderToyMode("Ocean", "ocean.slang"),
@@ -148,8 +134,6 @@ function update(time, dt)
     clock.time, clock.dt = time, dt
     clock.frameRate = 0.9 * clock.frameRate + 0.1 * (dt > 0 and 1 / dt or 0)
 
-    grey = grey + 1 / 60
-    if grey > 1 then grey = 0 end
 
     local left = input.mouse_down(input.MOUSE_LEFT)
     if left then mouse.x, mouse.y = input.mouse() end
