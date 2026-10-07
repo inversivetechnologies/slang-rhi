@@ -1,6 +1,6 @@
 // Looking up how much of the point light reaches a point, from the shadow maps -- shared by
 // everything that receives shadows: the meshes (lit.slang) and the Gaussian splats
-// (splat/receive-shadows.slang), so both are shadowed by exactly the same rules.
+// (splat/lighting.slang), so both are shadowed by exactly the same rules.
 //
 // Three maps, all in the atlas layout of scene-common.slang (six cube faces, 3 x 2 cells):
 //

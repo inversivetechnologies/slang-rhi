@@ -60,7 +60,7 @@ void lightSplatsMain(uint3 tid: SV_DispatchThreadID)
     float3 albedo = pow(max(captured, 0.0), 2.2);
     float3 lit = albedo * float3(0.05, 0.06, 0.08) + albedo * diffuse * light.color * attenuation * visibility;
     lit = lit / (1.0 + lit);
-    float3 relit = pow(lit, 1.0 / 2.2);
+    float3 relit = pow(max(lit, 0.0), 1.0 / 2.2); // max: fxc can't tell lit >= 0
 
     splat.color.rgb = lerp(shadowed, relit, relight);
     projected[i] = splat;

@@ -31,7 +31,7 @@ examples/lua/
     scene/             the scene's lighting and shadows (scene-common, shadow, lit,
                        shadow-lookup)
     splat/             Gaussian splatting (ply, splat-common, preprocess, render,
-                       shadow-casters, shadow, receive-shadows)
+                       shadow-casters, shadow, lighting)
     sort/              GPU sorting (bitonic)
     post/              full-screen passes (composite, depth-composite)
     shader-toy/        the ShaderToy framework (shader-toy.slang) and the toys
@@ -101,6 +101,7 @@ Gaussian Splats and Depth Composite modes share the loaded file.
 | Drag with the left mouse button | orbit the camera |
 | Mouse wheel | zoom |
 | V | show: combined / mesh only / splats only / both depth buffers |
+| L | splats lit by the point light / as captured (only shadowed) |
 | `[` / `]` | splat size |
 | the scene's keys | change the scene as in its own mode (subdivision, radius, light) |
 
@@ -687,7 +688,7 @@ which one is nearer the camera:
 | splats: shadow faces | the splat shadow atlas: optical depth and nearest distance | the casters |
 | splats: shadow layers faces | the splats' deep opacity map | the casters, the splat shadow atlas |
 | mesh | `meshColor` (rgba16f), `meshDepth` | the shadow atlas |
-| splats: preprocess, receive shadows, sort | the projected (and now shadowed) splats, sorted | the PLY data, all shadow maps |
+| splats: preprocess, lighting, sort | the projected splats, lit and shadowed, sorted | the PLY data, the light, all shadow maps |
 | splats: color | `splatColor` (rgba16f, transparent background) | the sorted splats |
 | splats: depth (`color = false`) | `splatDepth` | the sorted splats |
 | depth composite | the window | all four |
@@ -729,12 +730,11 @@ nearer shown brighter.
   the edge is hard.
 - **Splats inside a surface:** faint splats in front of a nearer mesh surface are dropped
   with the rest.
-- **Shadows only take light away from the splats:** their colors have the lighting of
-  their capture baked in, so shadows darken them, but the point light doesn't light
-  them.
-- **Cost:** about 40 ms per frame on an RTX 3050 Laptop GPU (Release, default window
+- **Splat lighting is approximate:** the splats have no normals and their colors have
+  the capture's lighting baked in; see [Lighting the splats](#lighting-the-splats).
+- **Cost:** about 41 ms per frame on an RTX 3050 Laptop GPU (Release, default window
   size), against 31 ms for the splats alone. The rest is the splats' second, depth-only
-  draw and their shadows, both ways.
+  draw, their shadows both ways, and their lighting.
 
 ### Splat shadows
 
@@ -750,7 +750,7 @@ other:
 
 Every receiver looks the light up through the same function, `shadowVisibility` in
 `shaders/scene/shadow-lookup.slang`: the lit pass for the meshes, and
-`shaders/splat/receive-shadows.slang` for the splats.
+`shaders/splat/lighting.slang` for the splats.
 
 #### The splats as a translucent medium
 
@@ -792,20 +792,37 @@ The light that reaches a point is then the light not blocked by a mesh, times
    - **Entry points:** `fragmentMain` fills the first map. `layersFragmentMain` fills the
      second, reading the first.
 
-#### Shadows on the splats
+#### Lighting the splats
 
-`shaders/splat/receive-shadows.slang` runs between preprocessing and sorting, one thread
-per visible splat:
+The point light lights the splats as it lights the meshes: `shaders/splat/lighting.slang`
+runs between preprocessing and sorting, one thread per visible splat, and changes the color
+preprocess wrote.
 
-- **Lookup:** it looks up the light at the splat's center with `shadowVisibility`.
-- **Darkening:** it scales the splat's color down to `1 - shadowStrength` (0.75) where no
-  light gets through.
-- **Bias:** each splat counts as 0.08 units nearer to the light than its center, so that
+- **Shadows:** it looks up the light at the splat's center with `shadowVisibility`, as the
+  meshes do. Each splat counts as 0.08 units nearer to the light than its center, so that
   the few splats making up a surface don't shadow each other ("shadow acne").
+- **A normal:** splats have none, but the Gaussians of a surface lie flat along it, so a
+  splat's shortest axis stands in for its normal (`splatWorldNormal` in
+  `shaders/splat/ply.slang`), turned to face the camera.
+  - **Trust:** how far it is trusted depends on how flat the splat is, from 0 for a round
+    splat to 1 for a flat one. For a round splat, whose shortest axis means nothing, the
+    diffuse term fades toward a neutral 0.5.
+- **Material:** the captured color stands in for the albedo. It is converted to linear
+  color and lit with the meshes' formula from `scene/lit.slang`: ambient, inverse-square
+  falloff faded to zero at the light's range, diffuse, and shadows. It is then tone mapped
+  the same way and converted back to display space.
 
-Because the splats' colors have their capture's lighting baked in, shadows only take light
-away. A splat facing away from the light isn't darkened for that, only for what stands
-between it and the light, including the rest of the skull.
+The captured colors have the lighting of the capture baked in, so lighting them again is
+an approximation, and a white skull reads greyer than captured. `relight` blends between the
+two looks, and L in the depth composite switches it:
+
+| `relight` | Result |
+| --- | --- |
+| 1 (default) | lit by the point light, as above |
+| 0 | the colors as captured, only darkened where something shadows them, down to `1 - shadowStrength` (0.75 darker) |
+
+The values live in the splat module's lighting block. `splat.setRelight(amount)` changes
+`relight`, and `shadowStrength` and `shadowBias` sit next to it in `lib/splat-mode.lua`.
 
 #### Wiring
 
@@ -815,8 +832,8 @@ between it and the light, including the rest of the skull.
     they are never read, even after the Depth Composite mode has drawn into them.
   - **For other receivers:** `scene.shadowBlock()` hands all shadow maps to them.
 - **The fusion module** sets `splatShadows = 1` in its view block. It adds the shadow
-  passes with `splat.addShadowPasses()`, and the receiving pass through
-  `splat.addPasses{ receiveShadows = { scene.lightBlock(), scene.shadowBlock() } }`.
+  passes with `splat.addShadowPasses()`, and the lighting pass through
+  `splat.addPasses{ lighting = { scene.lightBlock(), scene.shadowBlock() } }`.
 
 #### Limits
 
@@ -825,8 +842,10 @@ between it and the light, including the rest of the skull.
 - **Fixed layers:** the four layers are spaced for an object about the skull's size. Much
   larger or smaller splat scenes would want them rescaled (`kSplatLayerBounds` in
   `shadow-lookup.slang`).
-- **One value per splat:** a splat is shadowed by the light at its center only, so a large
+- **One value per splat:** a splat is lit and shadowed at its center only, so a large
   splat straddling a shadow edge is shaded all one way.
+- **Approximate normals:** the shortest-axis normal is noisy where splats are round or
+  overlap at odd angles, which shows as grain in the lit result. There is no specular term.
 
 ## Shader parameters
 
