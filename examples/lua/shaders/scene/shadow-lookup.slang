@@ -14,14 +14,25 @@
 // The layers say how much of the splats lies in front of a point, not only how much there
 // is in that direction -- what a splat needs to be shadowed by the splats in front of it
 // (self-shadowing), and what a mesh between splats needs, too.
+//
+// The SDF composition (sdf/sdf-dag.slang) isn't in a map: its shadows are soft, so each
+// point marches toward the light through the distance field itself (sdfSoftShadow).
+
+#pragma once
 
 #include "scene-common.slang"
+#include "sdf/sdf-dag.slang"
+#include "sdf/sdf-world.slang"
 
 Texture2D<float> shadowMap;
 uniform uint shadowFaceSize;
 Texture2D<float4> splatShadowMap;
 Texture2D<float4> splatShadowLayers;
 uniform uint splatShadows; // 1: read the splat maps (the fusion example draws them)
+uniform uint sdfShadows;   // 1: march the SDF composition for its soft shadows
+// How sharp the SDF shadows' edges are: penumbrae are about distance / sharpness wide, so
+// larger is harder (it stands for a smaller light).
+uniform float sdfShadowSharpness;
 
 // The distances past the nearest splat where the layers end. Close together near it, where
 // a surface's own splats are, and farther apart behind.
@@ -59,10 +70,42 @@ float splatOpticalDepth(float4 nearest, float4 layers, float distance)
     return lerp(depth0, depth1, (behind - bound0) / (bound1 - bound0));
 }
 
+// Soft shadow of the SDF composition: how much of the light reaches `origin` past it, from
+// a march toward the light ("soft shadows" in Inigo Quilez's SDF articles). At each step,
+// d / t is how near the ray passes the surface -- d the distance to it, t the distance
+// travelled -- as an angle, seen from the point. A ray that just grazes the shape leaves
+// the point in partial shadow, and the penumbra widens with distance from the caster, as
+// a real light's does. Rays that miss the composition's bounding sphere don't march.
+float sdfSoftShadow(float3 origin, float3 toLight, float distanceToLight)
+{
+    float2 bounds = sdfBoundsInterval(origin, toLight);
+    float t = max(bounds.x, 0.02);
+    float end = min(bounds.y, distanceToLight);
+    if (t >= end)
+    {
+        return 1.0;
+    }
+    float lit = 1.0;
+    [loop]
+    for (int i = 0; i < 64 && t < end; ++i)
+    {
+        float d = evaluateSdf(toSdfSpace(origin + toLight * t)).distance;
+        if (d < 0.0005)
+        {
+            return 0.0;
+        }
+        lit = min(lit, sdfShadowSharpness * d / t);
+        t += clamp(d, 0.005, 0.25);
+    }
+    lit = saturate(lit);
+    return lit * lit * (3.0 - 2.0 * lit); // smooth the penumbra's falloff
+}
+
 // Fraction of the light reaching a point (0: in shadow, 1: lit), averaged over a 3x3 texel
-// neighborhood for soft edges: blocked by the meshes, and dimmed by the splats in front of
-// it. `d` is the point minus the light's position; `bias` how far the point counts as
-// nearer to the light than it is, so that a surface doesn't shadow itself.
+// neighborhood for soft edges: blocked by the meshes, dimmed by the splats in front of it,
+// and shaded softly by the SDF composition. `d` is the point minus the light's position;
+// `bias` how far the point counts as nearer to the light than it is, so that a surface
+// doesn't shadow itself.
 float shadowVisibility(float3 d, float bias)
 {
     float current = length(d) - bias;
@@ -89,5 +132,11 @@ float shadowVisibility(float3 d, float bias)
             }
         }
     }
-    return lit / 9.0;
+    float visibility = lit / 9.0;
+    if (sdfShadows != 0 && visibility > 0)
+    {
+        float distanceToLight = length(d);
+        visibility *= sdfSoftShadow(lightPosition() + d, -d / distanceToLight, distanceToLight - bias);
+    }
+    return visibility;
 }

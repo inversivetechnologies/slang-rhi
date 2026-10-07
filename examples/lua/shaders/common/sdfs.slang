@@ -186,15 +186,16 @@ struct Prism {
     float height = 1;
 }
 
+// A solid is the intersection of its sides' half-spaces, so the distances combine with
+// max, and the caps sit at +-height/2 with unit normals.
 float SDF (Prism obj, float3 p)
 {
     float3 up = float3(0, 1, 0);
-    float3 down = float3(0, -1, 0);
-    float top = SDF(Plane3D(up, up), p);
-    float bottom = SDF(Plane3D(down, down), p);
+    float top = SDF(Plane3D(up * 0.5 * obj.height, up), p);
+    float bottom = SDF(Plane3D(-up * 0.5 * obj.height, -up), p);
     Polygon pg = Polygon(obj.n);
     float sect = SDF(pg, p.xz);
-    return min(top, min(bottom, sect));
+    return max(sect, max(top, bottom));
 }
 
 struct Cylinder {
@@ -202,14 +203,14 @@ struct Cylinder {
     float h;
 }
 
+// Intersection of the round side and the two caps: max, with unit cap normals.
 float SDF(Cylinder obj, float3 p)
 {
-    float3 up = float3(0, 0.5 * obj.h, 0);
-    float3 down = float3(0, -.5 * obj.h, 0);
-    float top = SDF(Plane3D(up, up), p);
-    float bottom = SDF(Plane3D(down, down), p);
+    float3 up = float3(0, 1, 0);
+    float top = SDF(Plane3D(up * 0.5 * obj.h, up), p);
+    float bottom = SDF(Plane3D(-up * 0.5 * obj.h, -up), p);
     float sect = SDF(Circle(obj.r), p.xz);
-    return min(top, min(bottom, sect));
+    return max(sect, max(top, bottom));
 }
 
 // Simplicies
@@ -262,13 +263,27 @@ struct Tetrah : IPrim3D {
     float3 d;
 }
 
+// One face's plane, its normal turned away from the opposite vertex, so it points out of
+// the solid whatever order the vertices come in.
+float TetrahFace(float3 a, float3 b, float3 c, float3 opposite, float3 p)
+{
+    float3 normal = normalize(cross(b - a, c - a));
+    if (dot(opposite - a, normal) > 0)
+    {
+        normal = -normal;
+    }
+    return SDF(Plane3D(a, normal), p);
+}
+
+// Intersection of the four faces' half-spaces: max. Exact inside and on the faces; a lower
+// bound near the edges and corners, which is still safe to sphere-trace.
 float SDF (Tetrah obj, float3 p)
 {
-    float dABD = SDF(Tri3D(obj.a, obj.b, obj.d), p);
-    float dBCD = SDF(Tri3D(obj.b, obj.c, obj.d), p);
-    float dCAD = SDF(Tri3D(obj.c, obj.a, obj.d), p);
-    float dABC = SDF(Tri3D(obj.a, obj.b, obj.c), p);
-    return min(dABD, min (dBCD, min (dCAD, dABC)));
+    float dABD = TetrahFace(obj.a, obj.b, obj.d, obj.c, p);
+    float dBCD = TetrahFace(obj.b, obj.c, obj.d, obj.a, p);
+    float dCAD = TetrahFace(obj.c, obj.a, obj.d, obj.b, p);
+    float dABC = TetrahFace(obj.a, obj.b, obj.c, obj.d, p);
+    return max(dABD, max(dBCD, max(dCAD, dABC)));
 }
 
 

@@ -1,23 +1,29 @@
-// Depth compositing: merges two separately rendered images -- each with its own color and
-// depth buffer -- into one, per pixel, by which is nearer the camera.
+// Depth compositing: merges separately rendered images -- each with its own color and depth
+// buffer -- into one, per pixel, by which is nearer the camera.
 //
-// The fusion example renders the mesh scene (opaque, lit) and the Gaussian splats
-// (blended, with premultiplied alpha) in passes of their own, then combines them here:
+// The fusion example renders three kinds of surface in passes of their own:
 //
-//   splats nearer:  splats over the mesh, by their alpha
-//   mesh nearer:    the mesh; splats behind it are hidden
+//   the mesh scene          opaque, rasterized (scene/lit.slang)
+//   the SDF composition     opaque, raymarched (sdf/raymarch.slang)
+//   the Gaussian splats     blended, with premultiplied alpha (splat/render.slang)
 //
-// Both depth buffers hold perspective depth (z/w) over the same near and far planes, so
-// both are turned back into view distances to compare them.
+// The two opaque ones first become one: whichever is nearer. Then the splats go over it
+// where they are nearer, by their alpha, and are hidden behind it where it is.
+//
+// All depth buffers hold perspective depth (z/w) over the same near and far planes, so
+// they are turned back into view distances to compare them.
 
 Texture2D<float4> meshColor;  // linear color
 Texture2D<float> meshDepth;
 Texture2D<float4> splatColor; // display-space color, premultiplied alpha; 0 where no splat
 Texture2D<float> splatDepth;
+Texture2D<float4> sdfColor;   // linear color; alpha 0 where nothing was hit
+Texture2D<float> sdfDepth;
 uniform float depthNear;
 uniform float depthFar;
 uniform uint encodeGamma; // 1 if the window doesn't do the sRGB encoding itself
-uniform uint showMode;    // 0: combined, 1: mesh only, 2: splats only, 3: the depth buffers
+uniform uint showMode;    // 0: combined, 1: mesh only, 2: splats only, 3: SDFs only,
+                          // 4: the depth buffers
 
 struct VertexOutput
 {
@@ -46,6 +52,13 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     float3 mesh = meshColor.Load(texel).rgb;
     float meshDistance = viewDistance(meshDepth.Load(texel));
     float splatDistance = viewDistance(splatDepth.Load(texel));
+    float4 sdf = sdfColor.Load(texel);
+    float sdfDistance = viewDistance(sdfDepth.Load(texel));
+
+    // The opaque surfaces: the mesh, or the SDFs where they are nearer.
+    bool sdfInFront = sdf.a > 0 && sdfDistance < meshDistance;
+    float3 opaque = sdfInFront ? sdf.rgb : mesh;
+    float opaqueDistance = sdfInFront ? sdfDistance : meshDistance;
 
     // The splats' color in linear space: undo the premultiplication to decode it.
     float4 splat = splatColor.Load(texel);
@@ -62,20 +75,27 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     }
     else if (showMode == 3)
     {
-        // Nearer is brighter; the mesh's depth in blue, the splats' in orange.
-        float meshShade = saturate(1.0 - meshDistance / 12.0);
-        float splatShade = saturate(1.0 - splatDistance / 12.0);
-        color = float3(0.25, 0.55, 1.0) * meshShade;
-        if (splatDistance < meshDistance)
+        color = sdf.rgb;
+    }
+    else if (showMode == 4)
+    {
+        // Nearer is brighter: the mesh's depth in blue, the SDFs' in green, the splats' in
+        // orange -- whichever is nearest.
+        color = float3(0.25, 0.55, 1.0) * saturate(1.0 - meshDistance / 12.0);
+        if (sdfInFront)
         {
-            color = float3(1.0, 0.55, 0.15) * splatShade;
+            color = float3(0.3, 1.0, 0.4) * saturate(1.0 - sdfDistance / 12.0);
+        }
+        if (splatDistance < opaqueDistance)
+        {
+            color = float3(1.0, 0.55, 0.15) * saturate(1.0 - splatDistance / 12.0);
         }
     }
     else
     {
         // Where no splat is opaque enough to be in the splats' depth buffer, its depth is
-        // the far plane; faint fringes there still go over whatever the mesh shows.
-        color = splatDistance <= meshDistance ? splatLinear + (1.0 - splat.a) * mesh : mesh;
+        // the far plane; faint fringes there still go over whatever is behind.
+        color = splatDistance <= opaqueDistance ? splatLinear + (1.0 - splat.a) * opaque : opaque;
     }
 
     if (encodeGamma != 0)

@@ -600,6 +600,8 @@ struct GraphNode
     std::shared_ptr<Pipeline> pipeline;
     std::vector<std::shared_ptr<ParamBlock>> params;
     uint32_t threads[3] = {1, 1, 1};
+    // Or one thread per window pixel, whatever the window's size (threads = "window").
+    bool threadsPerPixel = false;
     // Run once, then again only when asked (rerun()) or when the pipeline is rebuilt.
     bool once = false;
     bool pending = true;
@@ -1707,6 +1709,12 @@ public:
     void runDispatch(GraphNode& node)
     {
         Pipeline* pipeline = node.pipeline.get();
+        if (node.threadsPerPixel)
+        {
+            node.threads[0] = m_frame.width;
+            node.threads[1] = m_frame.height;
+            node.threads[2] = 1;
+        }
         if (!pipeline->compute || node.threads[0] == 0 || node.threads[1] == 0 || node.threads[2] == 0)
         {
             return;
@@ -2271,6 +2279,20 @@ public:
         }
     }
 
+    // A dispatch's `threads`: {x, y, z}, or "window" for one thread per window pixel.
+    static void readDispatchThreads(lua_State* L, int index, GraphNode& node)
+    {
+        if (lua_type(L, index) == LUA_TSTRING)
+        {
+            if (strcmp(lua_tostring(L, index), "window") != 0)
+                luaL_error(L, "threads must be {x, y, z} or \"window\"");
+            node.threadsPerPixel = true;
+            return;
+        }
+        node.threadsPerPixel = false;
+        readThreads(L, index, node.threads);
+    }
+
     // A texture to draw color into: any texture but a depth target.
     static std::shared_ptr<Texture> checkColorTexture(lua_State* L, int index)
     {
@@ -2359,7 +2381,7 @@ public:
         node->params = checkBlocks(L, -1);
         lua_pop(L, 1);
         if (lua_getfield(L, 2, "threads") != LUA_TNIL)
-            readThreads(L, lua_gettop(L), node->threads);
+            readDispatchThreads(L, lua_gettop(L), *node);
         lua_pop(L, 1);
         lua_getfield(L, 2, "once");
         node->once = lua_toboolean(L, -1);
@@ -2435,7 +2457,7 @@ public:
         if (strcmp(key, "enabled") == 0)
             node->enabled = lua_toboolean(L, 3);
         else if (strcmp(key, "threads") == 0)
-            readThreads(L, 3, node->threads);
+            readDispatchThreads(L, 3, *node);
         else if (strcmp(key, "clear") == 0)
         {
             node->clear = lua_istable(L, 3);

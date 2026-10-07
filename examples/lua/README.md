@@ -15,7 +15,7 @@ All examples are scripts, in `scripts/`:
 | `scene.lua` | a lit 3D scene: a GPU-generated spherified cube, a cube and a floor, with a point light, realtime shadow mapping and a second camera composited into the corner -- built as a render graph the host runs without Lua |
 | `shader-toy.lua` | ShaderToy-style compute shaders blitted to the window |
 | `splat.lua` | Gaussian splatting with compute shaders: loads `assets/skull.ply` (1.9 million splats), projects, sorts and draws them every frame |
-| `fusion.lua` | the scene and the splats in one picture: each rendered with its own depth buffer, combined per pixel by depth; the splats cast shadows on the meshes |
+| `fusion.lua` | the scene, the splats and a raymarched SDF composition in one picture: each rendered with its own depth buffer, combined per pixel by depth; shadows between all of them |
 
 ## Layout
 
@@ -33,6 +33,9 @@ examples/lua/
     splat/             Gaussian splatting (ply, splat-common, preprocess, render,
                        shadow-casters, shadow, lighting)
     sort/              GPU sorting (bitonic)
+    sdf/               SDF compositions: smooth booleans (smooth-ops), the DAG evaluator
+                       (sdf-dag), placement in the world (sdf-world), and the
+                       raymarching pass (raymarch)
     post/              full-screen passes (composite, depth-composite)
     shader-toy/        the ShaderToy framework (shader-toy.slang) and the toys
   assets/              data files the scripts load (skull.ply)
@@ -100,8 +103,9 @@ Gaussian Splats and Depth Composite modes share the loaded file.
 | --- | --- |
 | Drag with the left mouse button | orbit the camera |
 | Mouse wheel | zoom |
-| V | show: combined / mesh only / splats only / both depth buffers |
+| V | show: combined / mesh only / splats only / SDFs only / the depth buffers |
 | L | splats lit by the point light / as captured (only shadowed) |
+| J / K | every blend radius of the SDF composition ÷1.25 / ×1.25 (down to hard booleans) |
 | `[` / `]` | splat size |
 | the scene's keys | change the scene as in its own mode (subdivision, radius, light) |
 
@@ -459,7 +463,7 @@ end
 | `rhi.graph()` | a new, empty graph |
 | `graph:render_pass{ name, target, depth_target, color, clear, viewport \| viewport_fraction }` | adds a render pass, run in the order added |
 | `pass:draw{ pipeline, count, vertices, params }` | adds a draw to a render pass, run in the order added |
-| `graph:dispatch{ name, pipeline, params, threads = {x, y, z}, once }` | adds a compute dispatch |
+| `graph:dispatch{ name, pipeline, params, threads = {x, y, z} \| "window", once }` | adds a compute dispatch; `"window"` runs one thread per window pixel, following resizes |
 | `rhi.set_graph(graph)` | makes the host run `graph` every frame, before `draw`; `nil` stops it |
 
 - **`render_pass` options:**
@@ -676,10 +680,11 @@ next steps, not done here:
 
 ## Example: combining passes by depth
 
-`scripts/fusion.lua` (and mode 7 of the showcase) draws the mesh scene and the Gaussian
-splats into one picture. They are rendered completely separately, each into its own color
-texture and its own depth buffer. A last pass then combines the two images per pixel, by
-which one is nearer the camera:
+`scripts/fusion.lua` (and mode 7 of the showcase) draws three kinds of surface into one
+picture: the mesh scene, the Gaussian splats, and a raymarched composition of SDF shapes
+(see [SDF compositions](#sdf-compositions)). They are rendered completely separately,
+each into its own color texture and its own depth buffer. A last pass then combines the
+images per pixel, by which one is nearer the camera:
 
 | Pass | Writes | Reads |
 | --- | --- | --- |
@@ -688,10 +693,11 @@ which one is nearer the camera:
 | splats: shadow faces | the splat shadow atlas: optical depth and nearest distance | the casters |
 | splats: shadow layers faces | the splats' deep opacity map | the casters, the splat shadow atlas |
 | mesh | `meshColor` (rgba16f), `meshDepth` | the shadow atlas |
+| raymarch | `sdfColor` (rgba16f), `sdfDepth` (r32f) | the SDF node buffer, `meshDepth`, all shadow maps |
 | splats: preprocess, lighting, sort | the projected splats, lit and shadowed, sorted | the PLY data, the light, all shadow maps |
 | splats: color | `splatColor` (rgba16f, transparent background) | the sorted splats |
 | splats: depth (`color = false`) | `splatDepth` | the sorted splats |
-| depth composite | the window | all four |
+| depth composite | the window | all six |
 
 **Two depth buffers.**
 
@@ -709,19 +715,20 @@ render the same view. Both write depth over the same near and far planes (0.1 an
 block carries the splats' `model` transform, which places the skull in the scene: scaled,
 turned to face the starting camera, and sunk a little into the floor.
 
-**The composite** (`shaders/post/depth-composite.slang`) turns both depth values back into
-view distances and compares them per pixel:
+**The composite** (`shaders/post/depth-composite.slang`) turns every depth value back into a
+view distance and compares them per pixel:
 
-- **Splats nearer:** the splats go over the mesh by their alpha. Their display-space
+- **The opaque layer:** the mesh, or the SDFs where they are nearer.
+- **Splats nearer than it:** the splats go over it by their alpha. Their display-space
   premultiplied color is linearized first.
-- **Mesh nearer:** the mesh hides the splats behind it.
+- **Splats behind it:** hidden.
 
 So the horns pass in front of the sphere, the floor cuts off the jaw, and orbiting the
 camera moves each in front of or behind the other. Light and shadow go both ways: the
 skull shadows the floor, the cube and the sphere, and the meshes and the skull itself
-shadow the skull (see [Splat shadows](#splat-shadows)). V shows the inputs: the mesh or the
-splats alone, or both depth buffers, with the mesh's in blue, the splats' in orange, and
-nearer shown brighter.
+shadow the skull (see [Splat shadows](#splat-shadows)). V shows the inputs: the mesh, the
+splats or the SDFs alone, or the depth buffers, with the mesh's in blue, the SDFs' in green,
+the splats' in orange, and nearer shown brighter.
 
 **Limits of this approach.**
 
@@ -732,9 +739,12 @@ nearer shown brighter.
   with the rest.
 - **Splat lighting is approximate:** the splats have no normals and their colors have
   the capture's lighting baked in; see [Lighting the splats](#lighting-the-splats).
-- **Cost:** about 41 ms per frame on an RTX 3050 Laptop GPU (Release, default window
-  size), against 31 ms for the splats alone. The rest is the splats' second, depth-only
-  draw, their shadows both ways, and their lighting.
+- **Cost:** about 43–48 ms per frame on an RTX 3050 Laptop GPU (Release, default window
+  size; it varied between runs), against 31 ms for the splats alone.
+  - **Splats:** the splats' second, depth-only draw, their shadows both ways, and their
+    lighting.
+  - **SDFs:** the raymarching and the receivers' soft-shadow marches. Most of those rays
+    miss the composition's bounding sphere and don't march at all.
 
 ### Splat shadows
 
@@ -746,6 +756,7 @@ other:
 | meshes | meshes | the shadow map (scene/shadow.slang) |
 | splats | meshes | the splats' translucent shadow map and its deep opacity layers |
 | meshes | splats | the shadow map |
+| SDF shapes | meshes, splats, SDF shapes (soft) | a march through the distance field toward the light, per receiving point |
 | splats | splats (self-shadowing) | the deep opacity layers |
 
 Every receiver looks the light up through the same function, `shadowVisibility` in
@@ -846,6 +857,180 @@ The values live in the splat module's lighting block. `splat.setRelight(amount)`
   splat straddling a shadow edge is shaded all one way.
 - **Approximate normals:** the shortest-axis normal is noisy where splats are round or
   overlap at odd angles, which shows as grain in the lit result. There is no specular term.
+
+### SDF compositions
+
+The fusion example also raymarches a composition of signed distance fields (SDFs): shapes
+defined by the distance to their surface, combined with smooth booleans. The composition is
+built in Lua, compiled into a buffer of nodes, and evaluated by the raymarching shader.
+Nothing about it is hard-coded in a shader.
+
+| File | Role |
+| --- | --- |
+| `shaders/common/sdfs.slang` | the primitives (your SDF library) |
+| `shaders/sdf/smooth-ops.slang` | smooth union, intersection and subtraction, blending colors too |
+| `shaders/sdf/sdf-dag.slang` | the node format, and the evaluator that runs a node buffer at a point |
+| `shaders/sdf/sdf-world.slang` | where the composition sits and spins, and its bounding sphere |
+| `shaders/sdf/raymarch.slang` | the raymarching pass, from the camera |
+| `scripts/lib/sdf.lua` | building compositions in Lua, and compiling them into node buffers |
+
+#### Building a composition in Lua
+
+```lua
+local sdf = rhi.include("lib/sdf.lua")
+
+local body = sdf.smoothUnion(0.12,
+    sdf.sphere(0.34):color(0.95, 0.55, 0.15),
+    sdf.box(0.24, 0.24, 0.24):rotate("y", math.pi / 4):color(0.2, 0.55, 0.95))
+local rod = sdf.cylinder(0.09, 1.4)
+local cross = sdf.union(rod, rod:rotate("x", math.pi / 2), rod:rotate("z", math.pi / 2))
+local shape = sdf.smoothSubtract(0.03, body, cross)
+
+local program = sdf.compile(shape)   -- { floats, nodeCount, resultSlot, slotCount }
+local nodes = rhi.buffer(program.floats)
+```
+
+- **Primitives:** the 3D shapes of `common/sdfs.slang`:
+  - `sphere(r)`, `cube(halfSize)`, `box(x, y, z)`, `ellipsoid(x, y, z)`
+  - `capsule(r, a, b)`, `plane(point, normal)`
+  - `cylinder(r, height)`, `prism(sides, height)`, `tetrahedron(a, b, c, d)`
+- **Booleans:**
+  - `smoothUnion(k, ...)`, `smoothIntersect(k, ...)`, `smoothSubtract(k, a, b)`, with blend
+    radius `k` in world units.
+  - `union`, `intersect`, `subtract` are the hard versions (`k = 0`).
+- **Placement:** `:translate(x, y, z)`, `:rotate("x"|"y"|"z", angle)`, `:scale(s)` (uniform).
+- **Color:** `:color(r, g, b)` colors every primitive below it that has no nearer color of
+  its own.
+- **Shapes are values:** transforming one returns a new shape, so one shape can be placed
+  several times.
+
+#### Compiling: from a tree to a DAG in a buffer
+
+`sdf.compile(shape)` turns the Lua shape into nodes for `sdf-dag.slang`:
+
+1. **Placement down to the leaves:** every transform and color is pushed down to the
+   primitives. Each primitive node gets the world-to-local transform of its whole path,
+   and the factor that scales its local distances back into world units.
+2. **Sharing:** a shape (the same Lua value) used more than once with the same placement is
+   emitted once, and every operator that uses it reads the same result. That is what makes
+   the node list a DAG rather than a tree. In the example, the rod cross is used twice, to
+   drill the body and for the rods' ends, but evaluated once.
+3. **Order:** nodes are emitted after the nodes they read, so the shader evaluates them in
+   one pass from first to last.
+4. **Registers:** each node writes its result to a slot, one of 16 in the shader, and
+   operators read their operands from slots. A slot is reused once its last reader has
+   run, so a composition needs only as many slots as results are alive at once. The
+   example's 18 nodes need 3. `compile` raises an error if a composition needs more than
+   16.
+
+Each node is eight `float4`s: op code and slots, three parameter vectors, the 3×4
+world-to-local transform, and color plus distance scale. `sdf-dag.slang` documents the
+layout, and `sdf.lua` has the same op code table. The buffer is made once, with
+`rhi.buffer(program.floats)`. Changing the composition means compiling and uploading it
+again, which a script would do on a key press or a reload, not every frame.
+
+#### Smooth booleans
+
+`smooth-ops.slang` implements the polynomial smooth minimum (as popularized by Inigo
+Quilez). It rounds off the crease where two shapes meet over the blend radius `k`:
+
+| Operator | Hard version | Smooth version |
+| --- | --- | --- |
+| union | `min(a, b)` | `lerp(b, a, h) - k h (1 - h)`, with `h = saturate(0.5 + 0.5 (b - a) / k)` |
+| intersection | `max(a, b)` | `lerp(b, a, h) + k h (1 - h)`, with `h = saturate(0.5 - 0.5 (b - a) / k)` |
+| subtraction | `max(a, -b)` | the smooth intersection of `a` and `-b` |
+
+Every sample carries a color as well as a distance, blended with the same weight `h`. A
+rounded joint therefore fades from one shape's color to the other's, and a subtraction's cut
+faces take the color of the shape that was cut away. The shader multiplies every `k` by
+`smoothScale`, a parameter J and K change at run time without recompiling.
+
+#### The raymarching pass
+
+`shaders/sdf/raymarch.slang` runs one thread per window pixel (`threads = "window"`).
+
+- **Ray:** each pixel's ray comes from the same camera block as the meshes.
+- **Marching:** it sphere-traces the composition, stepping by the distance to the
+  nearest surface, for up to 128 steps.
+- **Stopping at the meshes:** a ray also stops at the mesh pass's depth, because beyond it a
+  mesh is in front anyway. That saves the steps a hidden ray would take.
+- **Placement:** the composition sits at `sdfOrigin` and turns at `sdfSpin` radians per
+  second, from the host's `time` (`sdf-world.slang`).
+- **Bounding sphere:** it lies within `sdfBoundsRadius` of its origin, so a ray that misses
+  that sphere misses it, and most pixels stop before marching a single step.
+
+On a hit:
+
+- **Normal:** from the distance field's gradient, four extra samples.
+- **Lighting:** lit with `scene/lit.slang`'s formula: ambient, falloff, diffuse, specular.
+- **Shadows:** shadowed through `scene/shadow-lookup.slang`, by the meshes and the splats.
+- **Depth:** written as the meshes write it (`z/w` over the same planes) into an `r32f`
+  texture, and the composite compares it with the others.
+
+#### Soft shadows from the SDFs
+
+The SDFs cast soft shadows, with penumbrae that widen with distance from the caster, as a
+real light's do. A shadow map can't give that: it holds only where a light ray first hits.
+So the SDFs aren't in a map at all. Each receiving point asks the distance field itself
+instead (the SDF soft-shadow technique from Inigo Quilez's articles):
+
+1. **March:** the point marches toward the light through the composition, for up to 64
+   steps.
+2. **Clearance:** at each step, `d / t` is how closely the ray passes the surface, seen from
+   the point: `d` is the distance to the surface, `t` the distance travelled. The
+   narrowest, scaled by `sdfShadowSharpness`, gives the light that gets past.
+   - **Graze:** a ray that just grazes the shape leaves the point half lit.
+   - **Hit:** a ray that hits leaves it in full shadow.
+3. **Smoothing:** the result is smoothed with smoothstep and multiplies the light from the
+   shadow maps.
+
+This lives in `sdfSoftShadow` in `scene/shadow-lookup.slang`, inside `shadowVisibility`, the
+function every receiver already calls. So the SDFs shadow the meshes, the splats (through
+their lighting pass), and themselves, with no change to those passes.
+
+**Cost.** Marching a distance field per point is expensive, so a point whose path to the
+light misses the composition's bounding sphere doesn't march. That covers most points:
+everything except what lies in or near the composition's shadow.
+
+**Wiring.**
+
+- **The scene:** binds harmless placeholders for the composition's inputs, with
+  `sdfShadows = 0`, so its own mode never marches.
+- **The fusion example:** its view block, which every one of its passes gets after the
+  scene's shadow block, carries the real node buffer and placement, with
+  `sdfShadows = 1`.
+
+`sdfShadowSharpness` (8) stands for the light's size: larger values give harder, narrower
+penumbrae, like a smaller light.
+
+#### The SDF library
+
+Three of the 3D primitives in `shaders/common/sdfs.slang` weren't valid as signed distance
+fields, and raymarching them would have failed:
+
+- **Cylinder and Prism:** they combined their caps with `min`, which is the union of the
+  half-spaces rather than their intersection, so the shape had no bounds.
+  - **Cylinder:** its cap normals also weren't unit length.
+  - **Prism:** it ignored its `height`.
+  - **Now:** both use `max`, with unit cap normals at ±height/2.
+- **Tetrahedron:** it used `min` too, and its face normals pointed in or out depending on
+  the vertex order. Each face now turns its normal away from the opposite vertex, and the
+  faces combine with `max`.
+
+The 2D primitives (`Square`, `Polygon`, `Circle`, used by the ShaderToy `sdfs2d.slang`)
+are unchanged.
+
+#### Limits
+
+- **Approximate penumbrae:** the soft shadows come from the closest approach along a
+  single ray, not from integrating over the light's area. They are plausible rather than
+  exact, and the meshes' and splats' shadows stay as hard or translucent as before.
+- **Bounding radius:** `sdfBoundsRadius` is set by hand in `lib/fusion-mode.lua`. A
+  composition that grows past it is cut off where it does, and so is its shadow.
+- **Box distances:** `Cube`, `Box3D` and the prism's sides return lower bounds outside the
+  shape (Chebyshev-style distances), so rays near their edges take more steps. They are
+  still safe to march.
+- **Fixed register count:** a composition can need at most 16 result slots at once.
 
 ## Shader parameters
 

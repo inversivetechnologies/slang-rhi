@@ -207,6 +207,18 @@ return function(setTitle)
             splatShadowMap = resources.splatShadowAtlas,
             splatShadowLayers = resources.splatShadowLayers,
             splatShadows = 0,
+            -- No SDF composition casts shadows here; a view that has one (the fusion
+            -- example) sets these again, with sdfShadows = 1. Until then they only give the
+            -- shadow lookup's SDF inputs something valid to be bound to.
+            sdfShadows = 0,
+            sdfShadowSharpness = 8,
+            sdfNodes = rhi.buffer(32 * 4),
+            sdfNodeCount = 0,
+            sdfResultSlot = 0,
+            smoothScale = 1,
+            sdfOrigin = { 0, 0, 0 },
+            sdfSpin = 0,
+            sdfBoundsRadius = 0,
         }
         blocks.generate = rhi.params {
             subdivision = sphere.subdivision,
