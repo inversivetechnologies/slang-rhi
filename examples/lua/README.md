@@ -10,7 +10,8 @@ All examples are scripts, in `scripts/`:
 
 | Script | What it shows |
 | --- | --- |
-| `showcase.lua` | the scene and the ShaderToy shaders in one window, switchable at runtime |
+| `showcase.lua` | the physics, the ShaderToy shaders, the splats and the depth composite in one window, switchable at runtime |
+| `physics.lua` | rigid body physics on Jolt: a ball, a ramp, dominoes, a box pyramid and a tower; throw balls, drop boxes -- the host simulates and draws, instanced |
 | `surface.lua` | clearing the window |
 | `scene.lua` | a lit 3D scene: a GPU-generated spherified cube, a cube and a floor, with a point light, realtime shadow mapping and a second camera composited into the corner -- built as a render graph the host runs without Lua |
 | `shader-toy.lua` | ShaderToy-style compute shaders blitted to the window |
@@ -22,6 +23,7 @@ All examples are scripts, in `scripts/`:
 ```
 examples/lua/
   example-lua.cpp      the host
+  physics.h/.cpp       rigid body physics for the host, on Jolt Physics
   README.md
   scripts/             runnable scripts, one per example
     lib/               Lua modules used by scripts (rhi.include), not run on their own
@@ -85,12 +87,13 @@ and exits. It doesn't fall back to another API.
 | Left / Right arrow | previous / next mode |
 | `1` .. `7` | jump to a mode |
 | Steam Controller LB / RB | previous / next mode |
-| Left mouse button | moves `iMouse` in the ShaderToy modes; orbits the camera in the scene and the splats |
+| Left mouse button | moves `iMouse` in the ShaderToy modes; orbits the camera in the physics, the splats and the depth composite |
 | Escape | gives the mouse pointer back (click the window to hide it again) |
 | F11 | toggles fullscreen |
 
-The modes are Scene, the ShaderToy shaders Circle, Ocean, 2D SDFs and Controller,
-Gaussian Splats, and Depth Composite. The current mode is shown in the window title. A
+The modes are Physics, the ShaderToy shaders Circle, Ocean, 2D SDFs and Controller,
+Gaussian Splats, and Depth Composite. The lit scene (`scene.lua`) has no mode of its own
+any more, but the Depth Composite builds on it. The current mode is shown in the window title. A
 ShaderToy mode whose shader doesn't compile shows dark red until it does. The splats load
 (about a second for the 454 MB file) the first time a mode showing them is shown. The
 Gaussian Splats and Depth Composite modes share the loaded file.
@@ -125,9 +128,26 @@ depth](#example-combining-passes-by-depth).
 
 How it renders is described in [Example: Gaussian splatting](#example-gaussian-splatting).
 
+### The physics
+
+`example-lua physics`, or mode 1 of the showcase.
+
+| Input | Action |
+| --- | --- |
+| Drag with the left mouse button | orbit the camera |
+| Mouse wheel | zoom |
+| E | throw a ball from the camera, toward the point it looks at |
+| Space | drop a burst of 24 boxes and balls from the sky |
+| R | reset: the dynamic bodies back where they started |
+| P | pause the simulation |
+| T | slow motion (a quarter of the speed) |
+
+How it works is described in [Example: rigid body physics](#example-rigid-body-physics).
+
 ### The scene
 
-`example-lua scene`, or mode 1 of the showcase.
+`example-lua scene`. It is no longer a showcase mode, but the depth composite (mode 7)
+builds on it.
 
 | Input | Action |
 | --- | --- |
@@ -462,7 +482,7 @@ end
 | --- | --- |
 | `rhi.graph()` | a new, empty graph |
 | `graph:render_pass{ name, target, depth_target, color, clear, viewport \| viewport_fraction }` | adds a render pass, run in the order added |
-| `pass:draw{ pipeline, count, vertices, params }` | adds a draw to a render pass, run in the order added |
+| `pass:draw{ pipeline, count, vertices, params, instances }` | adds a draw to a render pass, run in the order added; `instances` is a number, or a body group (as many as it has bodies, frame by frame) |
 | `graph:dispatch{ name, pipeline, params, threads = {x, y, z} \| "window", once }` | adds a compute dispatch; `"window"` runs one thread per window pixel, following resizes |
 | `rhi.set_graph(graph)` | makes the host run `graph` every frame, before `draw`; `nil` stops it |
 
@@ -491,7 +511,7 @@ return can be adjusted later, typically from an input handler:
 | --- | --- |
 | pass | `enabled`, `clear`, `viewport`, `viewport_fraction` |
 | dispatch | `enabled`, `threads`, and `:rerun()` |
-| draw | `count`, `enabled` |
+| draw | `count`, `enabled`, `instances` |
 | parameter block | any value: `block.name = value`, or `block:set{ ... }` |
 
 ### Parameter blocks
@@ -519,6 +539,86 @@ to events (input, reloads), never to frames.
 
 A script can still define `draw` alongside a graph, e.g. for overlays. It runs after the
 graph, in the same frame.
+
+## Physics
+
+The host has rigid body physics, on Jolt Physics (github.com/jrouwe/JoltPhysics, v5.6.0),
+which CMake clones and builds with the example host.
+
+- **The host simulates:** it steps the world every frame and writes each group's
+  transforms straight into a GPU buffer.
+- **Lua sets up:** a script builds the world and its bodies, then only reacts to input.
+- **No Lua per frame:** neither the physics nor the drawing calls into Lua.
+
+| Call | |
+| --- | --- |
+| `rhi.physics_world{ gravity = {0, -9.81, 0}, max_bodies = 4096 }` | a new world |
+| `world:group{ capacity = 256 }` | a group of bodies drawn together, with a GPU buffer for up to `capacity` |
+| `group:add{ ... }` | adds a body, see below; returns its index in the group, or `nil` when full |
+| `group:clear()` | removes every body of the group |
+| `group:set_velocity(i, {x, y, z})`, `group:impulse(i, {x, y, z})` | push body `i` |
+| `group:position(i)` | its current position, `x, y, z` |
+| `group.count`, `group.capacity`, `group.buffer` | bodies in the group; its size; its transforms |
+| `rhi.set_physics(world)` | makes the host step `world` every frame; `nil` stops it |
+| `world.paused`, `world.time_scale`, `world.gravity` | settable |
+
+`group:add` takes:
+
+| Field | Default | |
+| --- | --- | --- |
+| `shape` | `"box"` | `"box"` with `half_extents = {x, y, z}`, or `"sphere"` with `radius` |
+| `motion` | `"dynamic"` | `"dynamic"`, `"static"`, or `"kinematic"` (moved by its velocity, never pushed) |
+| `position`, `rotation` | origin, none | `rotation` is a quaternion `{x, y, z, w}` |
+| `velocity`, `angular_velocity` | 0 | initial |
+| `friction`, `restitution`, `density` | 0.5, 0, 1000 | density in kg/m³; with the shape's volume, it gives the mass |
+| `color`, `pattern` | grey, 0 | how it is drawn (`pattern` as `Material.pattern` in `scene/lit.slang`) |
+
+**Stepping.** The world steps at a fixed 1/60 s whatever the frame rate: steps accumulate
+over frames, at most four per frame. A long frame therefore slows the simulation down
+rather than stalling it.
+
+**Drawing bodies.**
+
+- **The buffer:** every frame, before the graph runs, the host writes each group's bodies
+  into its buffer. Each body takes four `float4`s: position, rotation, the scale that turns
+  the unit mesh into the body (its half extents, or its radius), and color with pattern.
+- **The draw:** draws with `instances = group` and a unit mesh (`lib/meshes.lua`: a cube from
+  −1 to 1, a sphere of radius 1). They draw instance `i` as body `i`, through the
+  `bodyVertexMain` entry points of `scene/lit.slang` and `scene/shadow.slang`.
+- **Lighting:** bodies are therefore lit and shadowed like the scene's meshes, by the same
+  code.
+
+## Example: rigid body physics
+
+`scripts/physics.lua` (and mode 1 of the showcase, in `scripts/lib/physics-mode.lua`) is a
+test scene for the physics:
+
+- **The chain reaction:** a ball at the top of a ramp rolls down into a row of 14
+  dominoes. They topple one after another, and the last falls into a seven-level box
+  pyramid.
+- **The tower:** beside them stands a tower of 12 layers of three boards, each layer turned
+  a quarter turn. E throws heavy balls at it from the camera.
+- **The bursts:** Space rains random boxes and spinning balls onto all of it.
+
+**Bodies.** Three groups, each drawn by one instanced draw per pass:
+
+| Group | Bodies | Mesh |
+| --- | --- | --- |
+| statics | the floor, the ramp and its rails (static) | cube |
+| boxes | dominoes, pyramid, tower, dropped boxes | cube |
+| balls | the rolling ball, thrown and dropped balls | sphere |
+
+**The graph:** six shadow passes into its own shadow atlas, then the lit pass into the
+window, as in the scene. The splat and SDF inputs of the shadow lookup are switched off,
+and bound to placeholders.
+
+**What Lua does after `init`:** adds bodies (E, Space), clears and re-adds them (R), and
+sets `world.paused` and `world.time_scale` (P, T). Every draw follows its group's body
+count by itself.
+
+**Cost:** about 8 ms per frame (≈120 fps) on an RTX 3050 Laptop GPU, Release, with about
+280 bodies. That covers the physics on the CPU (Jolt's job system uses all but one core)
+and the seven passes.
 
 ## Example: a scene as a render graph
 
@@ -1171,13 +1271,21 @@ messages appear in the same log. Release builds on Windows have no console.
 
 ## Implementation
 
-Everything is in `examples/lua/example-lua.cpp`.
+Everything is in `examples/lua/example-lua.cpp`, apart from the physics, which is in
+`examples/lua/physics.h` and `physics.cpp`.
 
 - **Base layer**: the window, input and Steam Controller handling are the shared example
   base (`examples/base/example-base.h`).
 - **Lua build**: Lua 5.4 is fetched by CMake and compiled as C++. A Lua error therefore
   unwinds through the host as an exception, which releases GPU objects and closes any open
   pass.
+- **Jolt build**: CMake clones Jolt Physics v5.6.0 from GitHub (`FetchContent`, its
+  `Build/` project) and builds only the library:
+  - **Runtime:** against the same dynamic MSVC runtime as everything else (Jolt's default
+    is the static one, which wouldn't link).
+  - **No link-time optimization:** it would slow every build of the examples.
+  - **Isolation:** `physics.h` keeps Jolt's headers out of the host. Jolt is compiled
+    without RTTI or exceptions (its defaults), while the host needs exceptions for Lua.
 - **Adding a function**:
   1. Write a `static int api...(lua_State*)` in `LuaApp`.
   2. Add it to the matching `luaL_Reg` table in `registerApi`.

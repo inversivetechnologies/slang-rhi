@@ -41,6 +41,35 @@ struct Transform
     uint followLight; // 1: placed at the light instead of `position` (the light's marker)
 };
 
+// ---------------------------------------------------------------------------------------
+// Physics bodies (examples/lua/physics.cpp): drawn instanced, one instance per body, from
+// a buffer the host fills every frame with kBodyStride float4s per body:
+//
+//   [0] position.xyz    [1] rotation quaternion xyzw    [2] scale.xyz (of the unit mesh)
+//   [3] color.rgb, w: material pattern (as Material.pattern in lit.slang)
+// ---------------------------------------------------------------------------------------
+
+static const uint kBodyStride = 4;
+StructuredBuffer<float4> bodies;
+
+float3 rotateByQuaternion(float4 q, float3 v)
+{
+    float3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+float3 bodyPoint(uint body, float3 p)
+{
+    uint base = body * kBodyStride;
+    return rotateByQuaternion(bodies[base + 1], p * bodies[base + 2].xyz) + bodies[base].xyz;
+}
+
+float3 bodyNormal(uint body, float3 n)
+{
+    uint base = body * kBodyStride;
+    return normalize(rotateByQuaternion(bodies[base + 1], n / bodies[base + 2].xyz));
+}
+
 float3 rotateYaw(float3 p, float yaw)
 {
     float c = cos(yaw), s = sin(yaw);

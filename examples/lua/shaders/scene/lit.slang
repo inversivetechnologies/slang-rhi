@@ -30,14 +30,11 @@ struct VertexOutput
     float3 world : WORLD;
     float3 normal : NORMAL;
     nointerpolation float checker : CHECKER;
+    nointerpolation float4 bodyMaterial : MATERIAL; // bodyVertexMain: albedo, pattern
 };
 
-[shader("vertex")]
-VertexOutput vertexMain(uint vertexId: SV_VertexID)
+float4 clipPosition(float3 world)
 {
-    MeshVertex vertex = vertices[vertexId];
-    float3 world = transformPoint(transform, vertex.position.xyz);
-
     float3 forward = normalize(camera.target - camera.eye);
     float3 right = normalize(cross(float3(0, 1, 0), forward));
     float3 up = cross(forward, right);
@@ -46,13 +43,36 @@ VertexOutput vertexMain(uint vertexId: SV_VertexID)
     float focal = 1.0 / tan(camera.fovY * 0.5);
     const float zNear = 0.1;
     const float zFar = 100.0;
+    return float4(view.x * focal * viewportSize.y / viewportSize.x, view.y * focal, (view.z - zNear) * zFar / (zFar - zNear), view.z);
+}
 
+[shader("vertex")]
+VertexOutput vertexMain(uint vertexId: SV_VertexID)
+{
+    MeshVertex vertex = vertices[vertexId];
+    float3 world = transformPoint(transform, vertex.position.xyz);
     VertexOutput output;
-    output.position =
-        float4(view.x * focal * viewportSize.y / viewportSize.x, view.y * focal, (view.z - zNear) * zFar / (zFar - zNear), view.z);
+    output.position = clipPosition(world);
     output.world = world;
     output.normal = transformNormal(transform, vertex.normal.xyz);
     output.checker = vertex.position.w;
+    output.bodyMaterial = float4(0, 0, 0, 0);
+    return output;
+}
+
+// Physics bodies, instanced: instance i is body i of the `bodies` buffer (scene-common.slang),
+// which also holds its color and pattern.
+[shader("vertex")]
+VertexOutput bodyVertexMain(uint vertexId: SV_VertexID, uint instance: SV_InstanceID)
+{
+    MeshVertex vertex = vertices[vertexId];
+    float3 world = bodyPoint(instance, vertex.position.xyz);
+    VertexOutput output;
+    output.position = clipPosition(world);
+    output.world = world;
+    output.normal = bodyNormal(instance, vertex.normal.xyz);
+    output.checker = vertex.position.w;
+    output.bodyMaterial = bodies[instance * kBodyStride + 3];
     return output;
 }
 
@@ -66,22 +86,22 @@ float shadowFactor(float3 world, float3 normal, float3 toLight, float3 lightPos)
     return shadowVisibility(d, 0.02);
 }
 
-[shader("fragment")]
-float4 fragmentMain(VertexOutput input) : SV_Target
+// The lit color of a surface point with material m, as written to the target.
+float4 shade(VertexOutput input, Material m)
 {
     float3 color;
-    if (material.emissive > 0.5)
+    if (m.emissive > 0.5)
     {
         color = light.color * 1.5;
     }
     else
     {
-        float3 albedo = material.albedo;
-        if (material.pattern == 1)
+        float3 albedo = m.albedo;
+        if (m.pattern == 1)
         {
             albedo *= input.checker > 0.5 ? 0.8 : 1.0;
         }
-        else if (material.pattern == 2)
+        else if (m.pattern == 2)
         {
             int2 cell = int2(floor(input.world.xz * 2.0));
             albedo *= ((cell.x + cell.y) & 1) != 0 ? 0.55 : 1.0;
@@ -112,4 +132,20 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         color = pow(max(color, 0.0), 1.0 / 2.2);
     }
     return float4(color, 1.0);
+}
+
+[shader("fragment")]
+float4 fragmentMain(VertexOutput input) : SV_Target
+{
+    return shade(input, material);
+}
+
+[shader("fragment")]
+float4 bodyFragmentMain(VertexOutput input) : SV_Target
+{
+    Material m;
+    m.albedo = input.bodyMaterial.rgb;
+    m.pattern = uint(input.bodyMaterial.w);
+    m.emissive = 0;
+    return shade(input, m);
 }

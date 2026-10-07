@@ -1237,6 +1237,30 @@ if(SLANG_RHI_BUILD_EXAMPLES)
             LUA_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples/lua/assets"
         )
         target_link_libraries(example-lua PRIVATE slang-rhi-lua)
+
+        # Jolt Physics, for the example host's physics worlds (examples/lua/physics.cpp):
+        # cloned from GitHub at a release tag. Its CMake project lives in Build/. Only the
+        # library is built, against the same (dynamic) MSVC runtime as everything else, and
+        # without link-time optimization, which would slow every build of the examples.
+        set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
+        set(INTERPROCEDURAL_OPTIMIZATION OFF CACHE BOOL "" FORCE)
+        set(ENABLE_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
+        set(ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+        set(TARGET_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+        set(TARGET_HELLO_WORLD OFF CACHE BOOL "" FORCE)
+        set(TARGET_PERFORMANCE_TEST OFF CACHE BOOL "" FORCE)
+        set(TARGET_SAMPLES OFF CACHE BOOL "" FORCE)
+        set(TARGET_VIEWER OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            JoltPhysics
+            GIT_REPOSITORY https://github.com/jrouwe/JoltPhysics.git
+            GIT_TAG v5.6.0
+            GIT_SHALLOW TRUE
+            SOURCE_SUBDIR Build
+        )
+        FetchContent_MakeAvailable(JoltPhysics)
+        target_sources(example-lua PRIVATE examples/lua/physics.cpp)
+        target_link_libraries(example-lua PRIVATE Jolt)
         if(SLANG_RHI_MASTER_PROJECT AND CMAKE_GENERATOR MATCHES "Visual Studio")
             set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT example-lua)
             set_property(TARGET example-lua PROPERTY VS_DEBUGGER_COMMAND_ARGUMENTS "showcase")

@@ -7,6 +7,7 @@
 // See examples/lua/README.md for the script API.
 
 #include "example-base.h"
+#include "physics.h"
 
 // Lua is built as C++ (see CMakeLists.txt), so its headers are included without the
 // extern "C" wrapper that lua.hpp adds.
@@ -555,6 +556,38 @@ struct ParamBlock
 };
 
 // ---------------------------------------------------------------------------------------
+// Physics
+//
+// A physics world (physics.h, on Jolt) with groups of bodies. A group is a set of bodies
+// drawn together: the host steps the world every frame and writes each group's transforms
+// into the group's GPU buffer, kBodyFloats floats per body, as scene/scene-common.slang
+// reads them (`bodies`). A draw instanced over the group then draws every body.
+// ---------------------------------------------------------------------------------------
+
+static constexpr uint32_t kBodyFloats = 16;
+
+struct PhysicsWorld;
+
+struct BodyGroup
+{
+    std::weak_ptr<PhysicsWorld> world;
+    uint32_t capacity = 0;
+    std::vector<uint32_t> ids; // physics body ids, in instance order
+    // Per body: scale xyz, pattern, color rgb, unused -- what doesn't come from the physics.
+    std::vector<float> looks;
+    std::shared_ptr<Buffer> buffer;
+    std::vector<float> staging;
+};
+
+struct PhysicsWorld
+{
+    std::unique_ptr<physics::World> world;
+    std::vector<std::weak_ptr<BodyGroup>> groups;
+    bool paused = false;
+    float timeScale = 1.0f;
+};
+
+// ---------------------------------------------------------------------------------------
 // Render graph
 //
 // Built by the script (normally once, in init()) and run by the host every frame, without
@@ -567,6 +600,9 @@ struct GraphDraw
     std::shared_ptr<Pipeline> pipeline;
     std::shared_ptr<Buffer> vertices;
     uint32_t count = 3;
+    // Instances: a fixed number, or as many as a body group has bodies, frame by frame.
+    uint32_t instances = 1;
+    std::shared_ptr<BodyGroup> instanceGroup;
     std::vector<std::shared_ptr<ParamBlock>> params;
     bool enabled = true;
     // An error was printed for this draw; don't repeat it every frame.
@@ -622,6 +658,8 @@ const char* kParamsType = "rhi.Params";
 const char* kGraphType = "rhi.Graph";
 const char* kNodeType = "rhi.Pass";
 const char* kDrawType = "rhi.Draw";
+const char* kPhysicsType = "rhi.PhysicsWorld";
+const char* kBodyGroupType = "rhi.BodyGroup";
 
 // Script handles hold a shared_ptr to the host-side object.
 template<typename T>
@@ -745,6 +783,7 @@ public:
         callScript("shutdown");
         closeScript();
         m_graph.reset();
+        m_physics.reset();
         m_pipelines.clear();
         m_renderTargets.clear();
         m_blitter.reset();
@@ -769,8 +808,53 @@ public:
             pollFiles();
         }
 
+        if (m_physics && !m_physics->paused)
+        {
+            m_physics->world->step(m_timeDelta * m_physics->timeScale);
+        }
+
         callScript("update", m_time, m_timeDelta);
         return SLANG_OK;
+    }
+
+    // Writes every body group's transforms into its GPU buffer, ahead of the frame's passes.
+    void uploadBodies(ICommandEncoder* encoder)
+    {
+        if (!m_physics)
+        {
+            return;
+        }
+        auto& groups = m_physics->groups;
+        groups.erase(
+            std::remove_if(groups.begin(), groups.end(), [](const auto& g) { return g.expired(); }),
+            groups.end()
+        );
+        for (const std::weak_ptr<BodyGroup>& weak : groups)
+        {
+            std::shared_ptr<BodyGroup> group = weak.lock();
+            size_t count = group->ids.size();
+            if (count == 0)
+            {
+                continue;
+            }
+            group->staging.resize(count * kBodyFloats);
+            for (size_t i = 0; i < count; ++i)
+            {
+                float* body = &group->staging[i * kBodyFloats];
+                const float* looks = &group->looks[i * 8];
+                m_physics->world->getTransform(group->ids[i], body, body + 4);
+                body[3] = 0;
+                body[8] = looks[0];
+                body[9] = looks[1];
+                body[10] = looks[2];
+                body[11] = 0;
+                body[12] = looks[4];
+                body[13] = looks[5];
+                body[14] = looks[6];
+                body[15] = looks[3];
+            }
+            encoder->uploadBufferData(group->buffer->buffer, 0, count * kBodyFloats * sizeof(float), group->staging.data());
+        }
     }
 
     Result draw() override
@@ -800,6 +884,7 @@ public:
         m_frame.width = width;
         m_frame.height = height;
         m_frame.active = true;
+        uploadBodies(commandEncoder);
         if (m_graph)
         {
             runGraph(*m_graph);
@@ -908,6 +993,7 @@ public:
         callScript("shutdown");
         closeScript();
         m_graph.reset(); // the new script sets up its own
+        m_physics.reset();
         m_lua = L;
         m_scriptFailed = false;
         printf("[lua] reloaded '%s'\n", m_scriptPath.filename().string().c_str());
@@ -1777,7 +1863,8 @@ public:
         for (const std::shared_ptr<GraphDraw>& draw : node.draws)
         {
             Pipeline* pipeline = draw->pipeline.get();
-            if (!draw->enabled || !pipeline->render || draw->count == 0)
+            uint32_t instances = draw->instanceGroup ? uint32_t(draw->instanceGroup->ids.size()) : draw->instances;
+            if (!draw->enabled || !pipeline->render || draw->count == 0 || instances == 0)
             {
                 continue;
             }
@@ -1800,6 +1887,7 @@ public:
             pass->setRenderState(renderState);
             DrawArguments drawArgs = {};
             drawArgs.vertexCount = draw->count;
+            drawArgs.instanceCount = instances;
             pass->draw(drawArgs);
         }
     }
@@ -2419,6 +2507,9 @@ public:
         lua_getfield(L, 2, "params");
         draw->params = checkBlocks(L, -1);
         lua_pop(L, 1);
+        lua_getfield(L, 2, "instances");
+        setInstances(L, lua_gettop(L), *draw);
+        lua_pop(L, 1);
 
         node->draws.push_back(draw);
         pushHandle(L, draw, kDrawType);
@@ -2481,6 +2572,19 @@ public:
         return 0;
     }
 
+    // A draw's `instances`: a number, or a body group (as many as it has bodies).
+    static void setInstances(lua_State* L, int index, GraphDraw& draw)
+    {
+        draw.instanceGroup = nullptr;
+        draw.instances = 1;
+        if (lua_isnoneornil(L, index))
+            return;
+        if (auto group = testShared<BodyGroup>(L, index, kBodyGroupType))
+            draw.instanceGroup = group;
+        else
+            draw.instances = uint32_t(luaL_checkinteger(L, index));
+    }
+
     static int drawIndex(lua_State* L)
     {
         auto draw = checkShared<GraphDraw>(L, 1, kDrawType);
@@ -2503,9 +2607,282 @@ public:
             draw->count = uint32_t(luaL_checkinteger(L, 3));
         else if (strcmp(key, "enabled") == 0)
             draw->enabled = lua_toboolean(L, 3);
+        else if (strcmp(key, "instances") == 0)
+            setInstances(L, 3, *draw);
         else
             luaL_error(L, "can't set '%s' on a graph draw", key);
         return 0;
+    }
+
+    // -----------------------------------------------------------------------------------
+    // API: physics
+    // -----------------------------------------------------------------------------------
+
+    static void readFloats(lua_State* L, int table, const char* field, float* out, int count)
+    {
+        if (lua_getfield(L, table, field) == LUA_TTABLE)
+        {
+            for (int i = 0; i < count; ++i)
+            {
+                lua_rawgeti(L, -1, i + 1);
+                out[i] = float(luaL_optnumber(L, -1, out[i]));
+                lua_pop(L, 1);
+            }
+        }
+        lua_pop(L, 1);
+    }
+
+    static float readFloat(lua_State* L, int table, const char* field, float fallback)
+    {
+        lua_getfield(L, table, field);
+        float value = float(luaL_optnumber(L, -1, fallback));
+        lua_pop(L, 1);
+        return value;
+    }
+
+    // rhi.physics_world{ gravity = {0, -9.81, 0}, max_bodies = 4096 }
+    static int apiPhysicsWorld(lua_State* L)
+    {
+        float gravity[3] = {0.0f, -9.81f, 0.0f};
+        uint32_t maxBodies = 4096;
+        if (lua_istable(L, 1))
+        {
+            readFloats(L, 1, "gravity", gravity, 3);
+            maxBodies = uint32_t(readFloat(L, 1, "max_bodies", float(maxBodies)));
+        }
+        auto world = std::make_shared<PhysicsWorld>();
+        world->world = std::make_unique<physics::World>(gravity, maxBodies);
+        pushHandle(L, world, kPhysicsType);
+        return 1;
+    }
+
+    // rhi.set_physics(world or nil): the world the host steps every frame.
+    static int apiSetPhysics(lua_State* L)
+    {
+        get(L)->m_physics = lua_isnoneornil(L, 1) ? nullptr : checkShared<PhysicsWorld>(L, 1, kPhysicsType);
+        return 0;
+    }
+
+    // world:group{ capacity = 256 }
+    static int physicsGroup(lua_State* L)
+    {
+        LuaApp* app = requireDevice(L);
+        auto world = checkShared<PhysicsWorld>(L, 1, kPhysicsType);
+        uint32_t capacity = lua_istable(L, 2) ? uint32_t(readFloat(L, 2, "capacity", 256)) : 256;
+        auto group = std::make_shared<BodyGroup>();
+        group->world = world;
+        group->capacity = std::max<uint32_t>(capacity, 1);
+        group->buffer = std::make_shared<Buffer>();
+        BufferDesc desc = {};
+        desc.size = group->capacity * kBodyFloats * sizeof(float);
+        desc.usage = BufferUsage::ShaderResource | BufferUsage::CopyDestination;
+        desc.defaultState = ResourceState::ShaderResource;
+        desc.label = "Body transforms";
+        if (SLANG_FAILED(app->m_device->createBuffer(desc, nullptr, group->buffer->buffer.writeRef())))
+            luaL_error(L, "could not create a body group's buffer");
+        group->buffer->size = desc.size;
+        world->groups.push_back(group);
+        pushHandle(L, group, kBodyGroupType);
+        return 1;
+    }
+
+    static int physicsIndex(lua_State* L)
+    {
+        auto world = checkShared<PhysicsWorld>(L, 1, kPhysicsType);
+        const char* key = luaL_checkstring(L, 2);
+        if (strcmp(key, "paused") == 0)
+            lua_pushboolean(L, world->paused);
+        else if (strcmp(key, "time_scale") == 0)
+            lua_pushnumber(L, world->timeScale);
+        else
+        {
+            lua_pushvalue(L, lua_upvalueindex(1));
+            lua_getfield(L, -1, key);
+        }
+        return 1;
+    }
+
+    // world.paused = bool, world.time_scale = s, world.gravity = {x, y, z}
+    static int physicsNewIndex(lua_State* L)
+    {
+        auto world = checkShared<PhysicsWorld>(L, 1, kPhysicsType);
+        const char* key = luaL_checkstring(L, 2);
+        if (strcmp(key, "paused") == 0)
+            world->paused = lua_toboolean(L, 3);
+        else if (strcmp(key, "time_scale") == 0)
+            world->timeScale = float(luaL_checknumber(L, 3));
+        else if (strcmp(key, "gravity") == 0)
+        {
+            luaL_checktype(L, 3, LUA_TTABLE);
+            float gravity[3] = {0, 0, 0};
+            for (int i = 0; i < 3; ++i)
+            {
+                lua_rawgeti(L, 3, i + 1);
+                gravity[i] = float(luaL_checknumber(L, -1));
+                lua_pop(L, 1);
+            }
+            world->world->setGravity(gravity);
+        }
+        else
+            luaL_error(L, "can't set '%s' on a physics world", key);
+        return 0;
+    }
+
+    static std::shared_ptr<PhysicsWorld> groupWorld(lua_State* L, BodyGroup& group)
+    {
+        auto world = group.world.lock();
+        if (!world)
+            luaL_error(L, "the body group's physics world is gone");
+        return world;
+    }
+
+    // group:add{ shape = "box" | "sphere", half_extents = {x,y,z} | radius = r,
+    //            motion = "dynamic" | "static" | "kinematic", position, rotation = {x,y,z,w},
+    //            velocity, angular_velocity, friction, restitution, density,
+    //            color = {r,g,b}, pattern = 0 }
+    // Returns the body's index in the group (from 0), or nil if the group or world is full.
+    static int groupAdd(lua_State* L)
+    {
+        auto group = checkShared<BodyGroup>(L, 1, kBodyGroupType);
+        luaL_checktype(L, 2, LUA_TTABLE);
+        auto world = groupWorld(L, *group);
+        if (group->ids.size() >= group->capacity)
+        {
+            lua_pushnil(L);
+            return 1;
+        }
+
+        physics::BodyDesc desc;
+        lua_getfield(L, 2, "shape");
+        const char* shape = luaL_optstring(L, -1, "box");
+        if (strcmp(shape, "sphere") == 0)
+            desc.shape = physics::Shape::Sphere;
+        else if (strcmp(shape, "box") != 0)
+            luaL_error(L, "unknown body shape '%s' (box, sphere)", shape);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "motion");
+        const char* motion = luaL_optstring(L, -1, "dynamic");
+        if (strcmp(motion, "static") == 0)
+            desc.motion = physics::Motion::Static;
+        else if (strcmp(motion, "kinematic") == 0)
+            desc.motion = physics::Motion::Kinematic;
+        else if (strcmp(motion, "dynamic") != 0)
+            luaL_error(L, "unknown body motion '%s' (dynamic, static, kinematic)", motion);
+        lua_pop(L, 1);
+        readFloats(L, 2, "half_extents", desc.halfExtents, 3);
+        desc.radius = readFloat(L, 2, "radius", desc.radius);
+        readFloats(L, 2, "position", desc.position, 3);
+        readFloats(L, 2, "rotation", desc.rotation, 4);
+        readFloats(L, 2, "velocity", desc.linearVelocity, 3);
+        readFloats(L, 2, "angular_velocity", desc.angularVelocity, 3);
+        desc.friction = readFloat(L, 2, "friction", desc.friction);
+        desc.restitution = readFloat(L, 2, "restitution", desc.restitution);
+        desc.density = readFloat(L, 2, "density", desc.density);
+        float color[3] = {0.8f, 0.8f, 0.8f};
+        readFloats(L, 2, "color", color, 3);
+        float pattern = readFloat(L, 2, "pattern", 0);
+
+        uint32_t id = world->world->addBody(desc);
+        if (id == UINT32_MAX)
+        {
+            lua_pushnil(L);
+            return 1;
+        }
+        // The unit meshes are -1..1 cubes and radius 1 spheres; the scale makes them the body.
+        bool sphere = desc.shape == physics::Shape::Sphere;
+        group->looks.insert(group->looks.end(), {
+            sphere ? desc.radius : desc.halfExtents[0],
+            sphere ? desc.radius : desc.halfExtents[1],
+            sphere ? desc.radius : desc.halfExtents[2],
+            pattern, color[0], color[1], color[2], 0.0f,
+        });
+        group->ids.push_back(id);
+        lua_pushinteger(L, lua_Integer(group->ids.size() - 1));
+        return 1;
+    }
+
+    // group:clear(): removes every body of the group from the world.
+    static int groupClear(lua_State* L)
+    {
+        auto group = checkShared<BodyGroup>(L, 1, kBodyGroupType);
+        auto world = groupWorld(L, *group);
+        for (uint32_t id : group->ids)
+            world->world->removeBody(id);
+        group->ids.clear();
+        group->looks.clear();
+        return 0;
+    }
+
+    static uint32_t checkBodyId(lua_State* L, BodyGroup& group, int index)
+    {
+        lua_Integer i = luaL_checkinteger(L, index);
+        if (i < 0 || size_t(i) >= group.ids.size())
+            luaL_error(L, "no body %d in the group", int(i));
+        return group.ids[size_t(i)];
+    }
+
+    // group:set_velocity(i, {x, y, z}) and group:impulse(i, {x, y, z})
+    static int groupSetVelocity(lua_State* L)
+    {
+        auto group = checkShared<BodyGroup>(L, 1, kBodyGroupType);
+        uint32_t id = checkBodyId(L, *group, 2);
+        float v[3] = {0, 0, 0};
+        luaL_checktype(L, 3, LUA_TTABLE);
+        for (int i = 0; i < 3; ++i)
+        {
+            lua_rawgeti(L, 3, i + 1);
+            v[i] = float(luaL_checknumber(L, -1));
+            lua_pop(L, 1);
+        }
+        groupWorld(L, *group)->world->setLinearVelocity(id, v);
+        return 0;
+    }
+
+    static int groupImpulse(lua_State* L)
+    {
+        auto group = checkShared<BodyGroup>(L, 1, kBodyGroupType);
+        uint32_t id = checkBodyId(L, *group, 2);
+        float v[3] = {0, 0, 0};
+        luaL_checktype(L, 3, LUA_TTABLE);
+        for (int i = 0; i < 3; ++i)
+        {
+            lua_rawgeti(L, 3, i + 1);
+            v[i] = float(luaL_checknumber(L, -1));
+            lua_pop(L, 1);
+        }
+        groupWorld(L, *group)->world->addImpulse(id, v);
+        return 0;
+    }
+
+    // group:position(i) -> x, y, z (the body's current position)
+    static int groupPosition(lua_State* L)
+    {
+        auto group = checkShared<BodyGroup>(L, 1, kBodyGroupType);
+        uint32_t id = checkBodyId(L, *group, 2);
+        float position[3], rotation[4];
+        groupWorld(L, *group)->world->getTransform(id, position, rotation);
+        lua_pushnumber(L, position[0]);
+        lua_pushnumber(L, position[1]);
+        lua_pushnumber(L, position[2]);
+        return 3;
+    }
+
+    static int groupIndex(lua_State* L)
+    {
+        auto group = checkShared<BodyGroup>(L, 1, kBodyGroupType);
+        const char* key = luaL_checkstring(L, 2);
+        if (strcmp(key, "count") == 0)
+            lua_pushinteger(L, lua_Integer(group->ids.size()));
+        else if (strcmp(key, "capacity") == 0)
+            lua_pushinteger(L, group->capacity);
+        else if (strcmp(key, "buffer") == 0)
+            pushHandle(L, group->buffer, kBufferType);
+        else
+        {
+            lua_pushvalue(L, lua_upvalueindex(1));
+            lua_getfield(L, -1, key);
+        }
+        return 1;
     }
 
     // rhi.load_ply(path): loads the vertex element of a binary PLY file into a buffer of
@@ -2995,6 +3372,8 @@ public:
             {"graph", apiGraph},
             {"set_graph", apiSetGraph},
             {"window_srgb", apiWindowSrgb},
+            {"physics_world", apiPhysicsWorld},
+            {"set_physics", apiSetPhysics},
             {"load_ply", apiLoadPly},
             {nullptr, nullptr},
         };
@@ -3154,6 +3533,23 @@ public:
         setNewIndex(L, kNodeType, nodeNewIndex);
 
         newType(L, kDrawType, drawIndex, nullptr, collectHandle<GraphDraw>);
+
+        static const luaL_Reg kPhysicsMethods[] = {
+            {"group", physicsGroup},
+            {nullptr, nullptr},
+        };
+        newType(L, kPhysicsType, physicsIndex, kPhysicsMethods, collectHandle<PhysicsWorld>);
+        setNewIndex(L, kPhysicsType, physicsNewIndex);
+
+        static const luaL_Reg kGroupMethods[] = {
+            {"add", groupAdd},
+            {"clear", groupClear},
+            {"set_velocity", groupSetVelocity},
+            {"impulse", groupImpulse},
+            {"position", groupPosition},
+            {nullptr, nullptr},
+        };
+        newType(L, kBodyGroupType, groupIndex, kGroupMethods, collectHandle<BodyGroup>);
         setNewIndex(L, kDrawType, drawNewIndex);
     }
 
@@ -3173,6 +3569,8 @@ public:
     std::map<std::string, std::shared_ptr<Pipeline>> m_pipelines;
     // The render graph run every frame, if the script set one (rhi.set_graph).
     std::shared_ptr<Graph> m_graph;
+    // The physics world the host steps every frame, if the script set one (rhi.set_physics).
+    std::shared_ptr<PhysicsWorld> m_physics;
     // Lua files loaded with rhi.include(); saving one reloads the script.
     std::set<std::string> m_includedScripts;
     std::vector<std::weak_ptr<Texture>> m_renderTargets;

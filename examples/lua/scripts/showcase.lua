@@ -1,21 +1,22 @@
--- The examples in one script: the lit scene, the ShaderToy shaders, Gaussian splatting,
--- and the scene and the splats combined by depth, one after another in the same window.
+-- The examples in one script: rigid body physics, the ShaderToy shaders, Gaussian
+-- splatting, and a lit scene combined with the splats and SDF shapes by depth, one after
+-- another in the same window.
 --
 --   Left / Right arrows     previous / next mode
 --   1 .. 7                  jump to a mode
 --   Steam Controller LB/RB  previous / next mode
 --   Left mouse button       moves iMouse in the ShaderToy modes, orbits the camera in the
---                           scene, the splats and the depth composite
+--                           physics, the splats and the depth composite
 --
--- The scene, the splats and the depth composite have more controls of their own; see
--- lib/scene-mode.lua, lib/splat-mode.lua and lib/fusion-mode.lua.
+-- The physics, the splats and the depth composite have more controls of their own; see
+-- lib/physics-mode.lua, lib/splat-mode.lua and lib/fusion-mode.lua.
 --
 -- Edit this script or any of the shaders while it runs; they reload when saved.
 
 config = {
     title = "Showcase",
     device = "vulkan",              -- the graphics API; `--api d3d12` etc. overrides it
-    features = { "rasterization" }, -- the scene, splat and depth composite modes rasterize
+    features = { "rasterization" }, -- the physics, splat and depth composite modes rasterize
 }
 
 -- -------------------------------------------------------------------------------------
@@ -57,8 +58,9 @@ local function modeDetails(details)
     rhi.set_title(modeTitle(current) .. " | " .. details)
 end
 
--- The lit scene with point light shadows, shared with scene.lua. rhi.include() runs it
--- (and reloads the showcase when it is saved).
+-- The lit scene with point light shadows (scene.lua runs it on its own). It has no mode of
+-- its own here -- the physics took its place -- but the depth composite builds on it.
+-- rhi.include() runs it (and reloads the showcase when it is saved).
 local scene = rhi.include("lib/scene-mode.lua")(modeDetails)
 
 -- Gaussian splatting of assets/skull.ply, shared with splat.lua. Loading the file and
@@ -102,8 +104,11 @@ local function shaderToyMode(name, file)
     return mode
 end
 
+-- Rigid body physics on Jolt, shared with physics.lua.
+local physics = rhi.include("lib/physics-mode.lua")(modeDetails)
+
 modes = {
-    scene,
+    physics,
     shaderToyMode("Circle", "circle.slang"),
     shaderToyMode("Ocean", "ocean.slang"),
     shaderToyMode("2D SDFs", "sdfs2d.slang"),

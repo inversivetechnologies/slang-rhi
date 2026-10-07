@@ -24,6 +24,17 @@ VertexOutput vertexMain(uint vertexId: SV_VertexID)
     return output;
 }
 
+// Physics bodies, instanced: instance i is body i of the `bodies` buffer (scene-common.slang).
+[shader("vertex")]
+VertexOutput bodyVertexMain(uint vertexId: SV_VertexID, uint instance: SV_InstanceID)
+{
+    float3 world = bodyPoint(instance, vertices[vertexId].position.xyz);
+    VertexOutput output;
+    output.position = cubeFaceClip(face, world - lightPosition(), light.range);
+    output.world = world;
+    return output;
+}
+
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target
 {
