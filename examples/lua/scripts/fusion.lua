@@ -15,3 +15,4 @@ function on_key(key, action, mods) fusion.on_key(key, action, mods) end
 function on_mouse_button(button, action, mods) fusion.on_mouse_button(button, action, mods) end
 function on_mouse_move(x, y) fusion.on_mouse_move(x, y) end
 function on_scroll(x, y) fusion.on_scroll(x, y) end
+function on_resize(width, height) fusion.on_resize(width, height) end

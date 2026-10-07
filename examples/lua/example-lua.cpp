@@ -499,6 +499,8 @@ struct Texture
     // Render targets are resized with the window, to `scale` times its size.
     bool followsSurface = false;
     float scale = 1.0f;
+    // Square: both sides `scale` times the window's height (render_target(..., "square")).
+    bool square = false;
     // Depth buffer for depth-tested draws into this texture, created on first use.
     ComPtr<ITexture> depth;
     // A depth buffer itself (rhi.depth_target): drawn into as a pass's depth_target, and
@@ -638,6 +640,8 @@ struct GraphNode
     uint32_t threads[3] = {1, 1, 1};
     // Or one thread per window pixel, whatever the window's size (threads = "window").
     bool threadsPerPixel = false;
+    // Or one thread per texel of a texture, whatever its size (threads = texture).
+    std::shared_ptr<Texture> threadsTexture;
     // Run once, then again only when asked (rerun()) or when the pipeline is rebuilt.
     bool once = false;
     bool pending = true;
@@ -1357,7 +1361,7 @@ public:
         for (const std::weak_ptr<Texture>& weak : m_renderTargets)
         {
             std::shared_ptr<Texture> texture = weak.lock();
-            uint32_t scaledWidth = scaledSize(width, texture->scale);
+            uint32_t scaledWidth = scaledSize(texture->square ? height : width, texture->scale);
             uint32_t scaledHeight = scaledSize(height, texture->scale);
             const TextureDesc& desc = texture->texture->getDesc();
             if (desc.size.width != scaledWidth || desc.size.height != scaledHeight)
@@ -1795,10 +1799,18 @@ public:
     void runDispatch(GraphNode& node)
     {
         Pipeline* pipeline = node.pipeline.get();
-        if (node.threadsPerPixel)
+        // The size the dispatch covers: the window's, unless it covers a texture.
+        float coverage[2] = {float(m_frame.width), float(m_frame.height)};
+        if (node.threadsTexture)
         {
-            node.threads[0] = m_frame.width;
-            node.threads[1] = m_frame.height;
+            const TextureDesc& desc = node.threadsTexture->texture->getDesc();
+            coverage[0] = float(desc.size.width);
+            coverage[1] = float(desc.size.height);
+        }
+        if (node.threadsPerPixel || node.threadsTexture)
+        {
+            node.threads[0] = uint32_t(coverage[0]);
+            node.threads[1] = uint32_t(coverage[1]);
             node.threads[2] = 1;
         }
         if (!pipeline->compute || node.threads[0] == 0 || node.threads[1] == 0 || node.threads[2] == 0)
@@ -1812,7 +1824,7 @@ public:
         IComputePassEncoder* pass = m_frame.encoder->beginComputePass();
         PassScope<IComputePassEncoder> scope{pass};
         ShaderCursor root(pass->bindPipeline(pipeline->compute));
-        applyBuiltins(root, float(m_frame.width), float(m_frame.height));
+        applyBuiltins(root, coverage[0], coverage[1]);
         report(node.reported, node.name, applyBlocks(root, node.params));
         pass->dispatchCompute(
             divRoundUp(node.threads[0], pipeline->threadGroupSize[0]),
@@ -2070,8 +2082,28 @@ public:
         return 1;
     }
 
-    // rhi.render_target([format = "rgba32f" [, scale = 1]]): a texture that follows the
-    // window size (times `scale`).
+    // A window-following target's shape: "square" makes both sides scale x the window's
+    // height; nothing (or "window") keeps the window's aspect.
+    static bool checkSquare(lua_State* L, int index)
+    {
+        const char* shape = luaL_optstring(L, index, "window");
+        if (strcmp(shape, "square") != 0 && strcmp(shape, "window") != 0)
+            luaL_error(L, "shape must be \"window\" or \"square\"");
+        return strcmp(shape, "square") == 0;
+    }
+
+    void initialTargetSize(const Texture& texture, uint32_t& width, uint32_t& height)
+    {
+        const SurfaceConfig* config = m_surface->getConfig();
+        uint32_t windowWidth = config ? config->width : 1;
+        uint32_t windowHeight = config ? config->height : 1;
+        width = scaledSize(texture.square ? windowHeight : windowWidth, texture.scale);
+        height = scaledSize(windowHeight, texture.scale);
+    }
+
+    // rhi.render_target([format = "rgba32f" [, scale = 1 [, "square"]]]): a texture that
+    // follows the window size (times `scale`) -- or, "square", scale x the window's height
+    // on both sides.
     static int apiRenderTarget(lua_State* L)
     {
         LuaApp* app = requireDevice(L);
@@ -2079,13 +2111,13 @@ public:
         texture->format = checkFormat(L, luaL_optstring(L, 1, "rgba32f"))->format;
         texture->followsSurface = true;
         texture->scale = float(luaL_optnumber(L, 2, 1.0));
+        texture->square = checkSquare(L, 3);
         if (texture->scale <= 0.0f)
         {
             luaL_error(L, "render_target scale must be positive");
         }
-        const SurfaceConfig* config = app->m_surface->getConfig();
-        uint32_t width = scaledSize(config ? config->width : 1, texture->scale);
-        uint32_t height = scaledSize(config ? config->height : 1, texture->scale);
+        uint32_t width, height;
+        app->initialTargetSize(*texture, width, height);
         if (SLANG_FAILED(app->allocateTexture(*texture, width, height)))
         {
             luaL_error(L, "could not create render target");
@@ -2095,8 +2127,9 @@ public:
         return 1;
     }
 
-    // rhi.depth_target([scale = 1]): a depth buffer that follows the window size (times
-    // `scale`), for a render pass's depth_target; shaders read it as Texture2D<float>.
+    // rhi.depth_target([scale = 1 [, "square"]]): a depth buffer that follows the window
+    // size (times `scale`; "square" as for render_target), for a render pass's
+    // depth_target; shaders read it as Texture2D<float>.
     static int apiDepthTarget(lua_State* L)
     {
         LuaApp* app = requireDevice(L);
@@ -2105,13 +2138,13 @@ public:
         texture->isDepth = true;
         texture->followsSurface = true;
         texture->scale = float(luaL_optnumber(L, 1, 1.0));
+        texture->square = checkSquare(L, 2);
         if (texture->scale <= 0.0f)
         {
             luaL_error(L, "depth_target scale must be positive");
         }
-        const SurfaceConfig* config = app->m_surface->getConfig();
-        uint32_t width = scaledSize(config ? config->width : 1, texture->scale);
-        uint32_t height = scaledSize(config ? config->height : 1, texture->scale);
+        uint32_t width, height;
+        app->initialTargetSize(*texture, width, height);
         if (SLANG_FAILED(app->allocateTexture(*texture, width, height)))
         {
             luaL_error(L, "could not create depth target");
@@ -2368,16 +2401,24 @@ public:
     }
 
     // A dispatch's `threads`: {x, y, z}, or "window" for one thread per window pixel.
+    // A dispatch's `threads`: {x, y, z}; "window" for one thread per window pixel; or a
+    // texture, for one thread per texel (its size is then the dispatch's viewportSize).
     static void readDispatchThreads(lua_State* L, int index, GraphNode& node)
     {
+        node.threadsPerPixel = false;
+        node.threadsTexture = nullptr;
         if (lua_type(L, index) == LUA_TSTRING)
         {
             if (strcmp(lua_tostring(L, index), "window") != 0)
-                luaL_error(L, "threads must be {x, y, z} or \"window\"");
+                luaL_error(L, "threads must be {x, y, z}, \"window\" or a texture");
             node.threadsPerPixel = true;
             return;
         }
-        node.threadsPerPixel = false;
+        if (auto texture = testShared<Texture>(L, index, kTextureType))
+        {
+            node.threadsTexture = texture;
+            return;
+        }
         readThreads(L, index, node.threads);
     }
 
@@ -2973,6 +3014,16 @@ public:
         return 1;
     }
 
+    // rhi.window_size(): width, height of the window's image in pixels.
+    static int apiWindowSize(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        const SurfaceConfig* config = app->m_surface ? app->m_surface->getConfig() : nullptr;
+        lua_pushinteger(L, config ? config->width : 0);
+        lua_pushinteger(L, config ? config->height : 0);
+        return 2;
+    }
+
     // rhi.set_title(text): the device and adapter are appended, as for config.title.
     static int apiSetTitle(lua_State* L)
     {
@@ -3367,6 +3418,7 @@ public:
             {"device", apiDevice},
             {"time", apiTime},
             {"set_title", apiSetTitle},
+            {"window_size", apiWindowSize},
             {"include", apiInclude},
             {"params", apiParams},
             {"graph", apiGraph},

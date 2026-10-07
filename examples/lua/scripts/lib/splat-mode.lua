@@ -146,17 +146,32 @@ return function(setTitle, file)
     -- Adds preprocessing, sorting and drawing the splats to a graph. `options`:
     --   name          a prefix for the passes' names
     --   view          a parameter block applied after the splats' own (e.g. a `camera`
-    --                 and a `model` placing the splats), or nil
+    --                 and a `model` placing the splats), a list of blocks applied in
+    --                 order, or nil
     --   lighting      if given, a list of parameter blocks with a light and shadow maps
     --                 (the scene's lightBlock() and shadowBlock()): the splats are then lit
     --                 by that light, and shadowed by the meshes and by each other
     --   target        the rgba16f texture to draw the splats' color into
     --   clear         the color to clear it to first
     --   depthTarget   if given, the splats are also drawn into this depth target
+    -- Returns the dispatches and passes it added, in order (e.g. to switch them off).
     function splat.addPasses(g, options)
         local r = splat.createResources()
         local name = options.name or "splats"
-        local view = { blocks.view, options.view }
+        local nodes = {}
+        local function add(node)
+            nodes[#nodes + 1] = node
+            return node
+        end
+        -- The view: one block, or a list of them (a plain table with an array part).
+        local views = options.view
+        if views == nil then
+            views = {}
+        elseif type(views) ~= "table" or getmetatable(views) ~= nil or views[1] == nil then
+            views = { views }
+        end
+        local view = { blocks.view }
+        for _, block in ipairs(views) do view[#view + 1] = block end
 
         local preprocessParams = {
             {
@@ -170,16 +185,17 @@ return function(setTitle, file)
             },
         }
         for _, block in ipairs(view) do preprocessParams[#preprocessParams + 1] = block end
-        g:dispatch { name = name .. ": preprocess", pipeline = r.preprocess, params = preprocessParams, threads = { r.sortCount, 1, 1 } }
+        add(g:dispatch { name = name .. ": preprocess", pipeline = r.preprocess, params = preprocessParams, threads = { r.sortCount, 1, 1 } })
 
         -- Light and shadows on the splats, if asked for: changes the colors preprocess just
         -- wrote, before the sort reorders the keys (shaders/splat/lighting.slang).
         if options.lighting then
             local params = { preprocessParams[1], blocks.view }
             for _, block in ipairs(options.lighting) do params[#params + 1] = block end
-            params[#params + 1] = options.view -- after those: it can switch the splat maps on
+            -- The view after those: it can switch the splat maps on.
+            for _, block in ipairs(views) do params[#params + 1] = block end
             params[#params + 1] = blocks.lighting
-            g:dispatch { name = name .. ": lighting", pipeline = r.lighting, params = params, threads = { count, 1, 1 } }
+            add(g:dispatch { name = name .. ": lighting", pipeline = r.lighting, params = params, threads = { count, 1, 1 } })
         end
 
         -- The bitonic sort, as laid out in bitonic.slang: sort each block of 1024, then for
@@ -187,41 +203,42 @@ return function(setTitle, file)
         -- short-range ones in a single block dispatch.
         local sortBuffers = rhi.params { sortKeys = r.sortKeys, sortValues = r.sortValues }
         local pairThreads = { r.sortCount // 2, 1, 1 } -- one thread per compared pair
-        g:dispatch { name = name .. ": sort blocks", pipeline = r.sortBlocks, params = { sortBuffers, { sortStage = 0 } }, threads = pairThreads }
+        add(g:dispatch { name = name .. ": sort blocks", pipeline = r.sortBlocks, params = { sortBuffers, { sortStage = 0 } }, threads = pairThreads })
         local k = 2048
         while k <= r.sortCount do
             local j = k // 2
             while j >= 1024 do
-                g:dispatch {
+                add(g:dispatch {
                     name = string.format("%s: sort k=%d j=%d", name, k, j),
                     pipeline = r.sortStep,
                     params = { sortBuffers, { sortK = k, sortJ = j } },
                     threads = pairThreads,
-                }
+                })
                 j = j // 2
             end
-            g:dispatch {
+            add(g:dispatch {
                 name = string.format("%s: sort k=%d blocks", name, k),
                 pipeline = r.sortBlocks,
                 params = { sortBuffers, { sortStage = k } },
                 threads = pairThreads,
-            }
+            })
             k = k * 2
         end
 
         local drawParams = { projected = r.projected, sortKeys = r.sortKeys, sortValues = r.sortValues }
-        local colorPass = g:render_pass { name = name .. ": color", target = options.target, clear = options.clear }
+        local colorPass = add(g:render_pass { name = name .. ": color", target = options.target, clear = options.clear })
         colorPass:draw { pipeline = r.render, count = count * 6, params = drawParams }
 
         if options.depthTarget then
-            local depthPass = g:render_pass {
+            local depthPass = add(g:render_pass {
                 name = name .. ": depth",
                 depth_target = options.depthTarget,
                 color = false,
                 clear = { 0, 0, 0, 0 }, -- clears the depth buffer to the far plane
-            }
+            })
             depthPass:draw { pipeline = r.renderDepth, count = count * 6, params = drawParams }
         end
+        return nodes
     end
 
     -- Shadows, for graphs that draw the splats into a scene with a light (the fusion

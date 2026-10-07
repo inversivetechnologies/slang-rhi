@@ -85,22 +85,23 @@ and exits. It doesn't fall back to another API.
 | Input | Action |
 | --- | --- |
 | Left / Right arrow | previous / next mode |
-| `1` .. `7` | jump to a mode |
+| `1` .. `5` | jump to a mode |
 | Steam Controller LB / RB | previous / next mode |
 | Left mouse button | moves `iMouse` in the ShaderToy modes; orbits the camera in the physics, the splats and the depth composite |
 | Escape | gives the mouse pointer back (click the window to hide it again) |
 | F11 | toggles fullscreen |
 
-The modes are Physics, the ShaderToy shaders Circle, Ocean, 2D SDFs and Controller,
-Gaussian Splats, and Depth Composite. The lit scene (`scene.lua`) has no mode of its own
-any more, but the Depth Composite builds on it. The current mode is shown in the window title. A
+The modes are Physics, the ShaderToy shaders 2D SDFs and Controller, Gaussian Splats, and
+Depth Composite. The lit scene (`scene.lua`) has no mode of its own any more, but the Depth
+Composite builds on it. The other ShaderToy shaders (Circle, Ocean) are in
+`example-lua shader-toy`. The current mode is shown in the window title. A
 ShaderToy mode whose shader doesn't compile shows dark red until it does. The splats load
 (about a second for the 454 MB file) the first time a mode showing them is shown. The
 Gaussian Splats and Depth Composite modes share the loaded file.
 
 ### The depth composite
 
-`example-lua fusion`, or mode 7 of the showcase.
+`example-lua fusion`, or mode 5 of the showcase.
 
 | Input | Action |
 | --- | --- |
@@ -110,6 +111,7 @@ Gaussian Splats and Depth Composite modes share the loaded file.
 | L | splats lit by the point light / as captured (only shadowed) |
 | J / K | every blend radius of the SDF composition ÷1.25 / ×1.25 (down to hard booleans) |
 | `[` / `]` | splat size |
+| Tab | hide or show the second camera's square in the lower right corner (meshes, SDFs and splats, as in the main view) |
 | the scene's keys | change the scene as in its own mode (subdivision, radius, light) |
 
 How it works is described in [Example: combining passes by
@@ -117,7 +119,7 @@ depth](#example-combining-passes-by-depth).
 
 ### The splats
 
-`example-lua splat`, or mode 6 of the showcase.
+`example-lua splat`, or mode 4 of the showcase.
 
 | Input | Action |
 | --- | --- |
@@ -146,7 +148,7 @@ How it works is described in [Example: rigid body physics](#example-rigid-body-p
 
 ### The scene
 
-`example-lua scene`. It is no longer a showcase mode, but the depth composite (mode 7)
+`example-lua scene`. It is no longer a showcase mode, but the depth composite (mode 5)
 builds on it.
 
 | Input | Action |
@@ -291,6 +293,7 @@ local draw = rhi.render_pipeline {
 ```lua
 local target = rhi.render_target("rgba32f")       -- always the size of the window
 local small = rhi.render_target("rgba16f", 0.3)   -- always 0.3 times the window's size
+local square = rhi.render_target("rgba16f", 0.3, "square") -- 0.3 x the window's height, both sides
 local depth = rhi.depth_target()                  -- a depth buffer the size of the window
 local tex = rhi.texture { width = 256, height = 256, format = "rgba32f" }
 local vb = rhi.vertex_buffer { 0, 0, 0,  1, 0, 0,  ... }  -- floats
@@ -303,13 +306,17 @@ local buf2 = rhi.buffer { 1, 2, 3, 4 }            -- floats
 - **Textures** can be read and written by shaders, drawn into, and blitted. They start out
   zeroed. `texture.width` and `texture.height` give their size. A render target is
   reallocated when the window resizes, and its old contents are lost.
+- **Square targets:** `"square"` as the third argument of `rhi.render_target` (the second of
+  `rhi.depth_target`) makes both sides `scale` times the window's height, for an image
+  that keeps its aspect whatever the window's shape. The side is rounded to the nearest
+  pixel, as `math.floor(height * scale + 0.5)` (at least 1).
 - **`rhi.buffer`** creates a read/write structured or byte-address buffer.
   `rhi.vertex_buffer` is only for vertex input.
 
 #### Depth targets
 
-`rhi.depth_target([scale = 1])` creates a 32-bit float depth buffer that follows the window
-size (times `scale`), like a render target.
+`rhi.depth_target([scale = 1 [, "square"]])` creates a 32-bit float depth buffer that follows
+the window size (times `scale`), like a render target.
 
 - **Writing:** a render graph pass draws depth into it when given `depth_target = it`.
 - **Reading:** any shader can read it, as a `Texture2D<float>` of depth values in [0, 1]
@@ -329,6 +336,7 @@ pass's shader, to combine images by depth, or for any screen-space effect.
 | `rhi.set_title(text)` | sets the window title; the backend and GPU are appended |
 | `rhi.include(path)` | runs a Lua file (relative to the script) and returns its result; saving that file reloads the script |
 | `rhi.window_srgb()` | `true` if the window's format encodes sRGB itself (as `frame.srgb`, but usable in `init`) |
+| `rhi.window_size()` | the window's size in pixels, `width, height` (usable in `init`) |
 | `rhi.load_ply(path)` | loads a PLY file's vertices into a buffer; see below |
 
 `rhi.load_ply(path)` reads the vertex element of a binary little-endian PLY file whose
@@ -483,7 +491,7 @@ end
 | `rhi.graph()` | a new, empty graph |
 | `graph:render_pass{ name, target, depth_target, color, clear, viewport \| viewport_fraction }` | adds a render pass, run in the order added |
 | `pass:draw{ pipeline, count, vertices, params, instances }` | adds a draw to a render pass, run in the order added; `instances` is a number, or a body group (as many as it has bodies, frame by frame) |
-| `graph:dispatch{ name, pipeline, params, threads = {x, y, z} \| "window", once }` | adds a compute dispatch; `"window"` runs one thread per window pixel, following resizes |
+| `graph:dispatch{ name, pipeline, params, threads = {x, y, z} \| "window" \| texture, once }` | adds a compute dispatch; `"window"` runs one thread per window pixel, a texture one per texel, both following resizes |
 | `rhi.set_graph(graph)` | makes the host run `graph` every frame, before `draw`; `nil` stops it |
 
 - **`render_pass` options:**
@@ -499,6 +507,8 @@ end
     it follows window resizes.
 - **Depth:** a pass uses its target's depth buffer when any of its draws' pipelines has
   `depth = true`. All draws in one pass should agree on depth.
+- **`dispatch` threads:** with `"window"` or a texture, the dispatch's `viewportSize` is
+  that size too. Otherwise it is the window's, which a parameter block can override.
 - **`dispatch` with `once = true`:** the dispatch runs on the first frame, then again only
   after `node:rerun()` or when its pipeline is rebuilt by a hot reload.
 
@@ -712,7 +722,7 @@ as `rhi.time()`.
 
 ## Example: Gaussian splatting
 
-`scripts/splat.lua` (and mode 6 of the showcase) renders a 3D Gaussian splatting scene.
+`scripts/splat.lua` (and mode 4 of the showcase) renders a 3D Gaussian splatting scene.
 The method is Kerbl et al., "3D Gaussian Splatting for Real-Time Radiance Field Rendering"
 (2023). The scene is `assets/skull.ply`: 1.9 million Gaussians, each with a position,
 rotation, scale, opacity, and degree-3 spherical harmonics for view-dependent color.
@@ -780,7 +790,7 @@ next steps, not done here:
 
 ## Example: combining passes by depth
 
-`scripts/fusion.lua` (and mode 7 of the showcase) draws three kinds of surface into one
+`scripts/fusion.lua` (and mode 5 of the showcase) draws three kinds of surface into one
 picture: the mesh scene, the Gaussian splats, and a raymarched composition of SDF shapes
 (see [SDF compositions](#sdf-compositions)). They are rendered completely separately,
 each into its own color texture and its own depth buffer. A last pass then combines the
@@ -798,6 +808,30 @@ images per pixel, by which one is nearer the camera:
 | splats: color | `splatColor` (rgba16f, transparent background) | the sorted splats |
 | splats: depth (`color = false`) | `splatDepth` | the sorted splats |
 | depth composite | the window | all six |
+| second camera: mesh … depth composite | the same, from the second camera, into square targets | as above |
+| second camera inset | the window's lower right corner, with a border | the second camera's composite |
+
+**The second camera.** The scene's second camera sees all of it too: the meshes, the
+SDFs and the splats.
+
+- **The same passes:** `addView` in `lib/fusion-mode.lua` adds the mesh, raymarch, splat
+  and depth composite passes for one view. It is called twice: for the main camera into
+  the window, and for the second camera into a linear rgba16f texture.
+- **Square targets:** the second camera's six targets and its composite are square
+  (`rhi.render_target(format, 0.3125, "square")`): 0.3125 × the window's height on both
+  sides, whatever the window's shape. 0.3125 is exact in binary, so the Lua side
+  computes the same side as the host.
+- **Its view block:** the second camera's passes see the main view block and then one of
+  their own, with the second camera and `viewportSize` set to the square. The splats'
+  preprocess is a dispatch over the splats, whose `viewportSize` would be the window's.
+  The raymarch dispatch has `threads = sdfColor`, so it covers the square anyway.
+- **The inset:** the composite (`post/composite.slang`) frames that texture in a pixel
+  `viewport` in the lower right corner. `on_resize` (and entering the mode) moves the
+  viewport and updates the block's `viewportSize`.
+- **Shared work:** the shadow maps, the splats' shadow casters and the SDF node buffer
+  are shared. The splats are preprocessed, lit and sorted a second time, after the main
+  view has drawn them.
+- **Tab** switches all of the second camera's passes off and on.
 
 **Two depth buffers.**
 
@@ -839,8 +873,11 @@ the splats' in orange, and nearer shown brighter.
   with the rest.
 - **Splat lighting is approximate:** the splats have no normals and their colors have
   the capture's lighting baked in; see [Lighting the splats](#lighting-the-splats).
-- **Cost:** about 43–48 ms per frame on an RTX 3050 Laptop GPU (Release, default window
-  size; it varied between runs), against 31 ms for the splats alone.
+- **Cost:** about 73 ms per frame on an RTX 3050 Laptop GPU (Release, default window
+  size), against 31 ms for the splats alone.
+  - **The second camera:** about 29 ms of it; with Tab, 43–48 ms (it varied between
+    runs). Its pixels are few, but it repeats all the per-splat work: preprocess,
+    lighting and the 78 sort dispatches.
   - **Splats:** the splats' second, depth-only draw, their shadows both ways, and their
     lighting.
   - **SDFs:** the raymarching and the receivers' soft-shadow marches. Most of those rays
@@ -1047,7 +1084,8 @@ faces take the color of the shape that was cut away. The shader multiplies every
 
 #### The raymarching pass
 
-`shaders/sdf/raymarch.slang` runs one thread per window pixel (`threads = "window"`).
+`shaders/sdf/raymarch.slang` runs one thread per pixel of its target (`threads = sdfColor`):
+the window's size for the main view, the square for the second camera.
 
 - **Ray:** each pixel's ray comes from the same camera block as the meshes.
 - **Marching:** it sphere-traces the composition, stepping by the distance to the

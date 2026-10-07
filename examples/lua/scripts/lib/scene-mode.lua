@@ -324,7 +324,8 @@ return function(setTitle)
 
     -- Adds a pass that draws the lit scene from a camera. `options`:
     --   name, clear
-    --   view         a parameter block with `camera` and `encodeGamma`
+    --   view         a parameter block with `camera` and `encodeGamma` -- or a list of
+    --                blocks, applied in order
     --   target       an rgba16f texture to draw into; nil for the window
     --   depthTarget  a depth target to use (and so keep) as the pass's depth buffer
     function scene.addCameraPass(g, options)
@@ -336,35 +337,45 @@ return function(setTitle)
             clear = options.clear,
         }
         local pipeline = options.target and r.litTexture or r.litWindow
+        local extra = { blocks.light, blocks.shadowMap }
+        if type(options.view) == "table" then -- a list of blocks (a block itself is userdata)
+            for _, block in ipairs(options.view) do extra[#extra + 1] = block end
+        else
+            extra[#extra + 1] = options.view
+        end
         for _, object in ipairs(r.objects) do
-            addDraw(pass, object, pipeline, { blocks.light, blocks.shadowMap, options.view })
+            addDraw(pass, object, pipeline, extra)
         end
         return pass
     end
 
-    -- The scene's own graph: its main camera into the window, and a second camera
-    -- composited into the corner.
-    function scene.init()
-        local srgb = rhi.window_srgb()
-        scene.createResources()
+    -- Adds the second camera: the scene from another angle, into a texture, composited
+    -- with a border into the lower right corner of the window. Must come after whatever
+    -- else draws into the window, so the inset lands on top. `views` are parameter blocks
+    -- applied before the second camera's own (e.g. a view's shadow settings); its `camera`
+    -- and `encodeGamma` win. Tab shows and hides it.
+    -- The second camera (eye, target, fovY), for graphs that draw their own inset.
+    function scene.secondCamera()
+        return secondCamera
+    end
 
+    function scene.addInsetCamera(g, views)
+        scene.createResources()
+        local srgb = rhi.window_srgb()
         local composite = rhi.render_pipeline { shader = "post/composite.slang" }
         -- Linear (rgba16f): the composite pass does the gamma encoding when it is needed.
         local secondView = rhi.render_target("rgba16f", INSET[3])
-        blocks.mainCamera = rhi.params { camera = scene.orbitCamera(camera), encodeGamma = srgb and 0 or 1 }
-        local secondCameraBlock = rhi.params { camera = secondCamera, encodeGamma = 0 }
+        local list = {}
+        for _, block in ipairs(views or {}) do list[#list + 1] = block end
+        list[#list + 1] = rhi.params { camera = secondCamera, encodeGamma = 0 }
 
-        graph = rhi.graph()
-        scene.addShadowPasses(graph)
-        scene.addCameraPass(graph, { name = "main camera", view = blocks.mainCamera, clear = { 0.015, 0.018, 0.025, 1 } })
-        local secondPass = scene.addCameraPass(graph, {
+        local secondPass = scene.addCameraPass(g, {
             name = "second camera",
-            view = secondCameraBlock,
+            view = list,
             target = secondView,
             clear = { 0.03, 0.035, 0.05, 1 },
         })
-
-        local compositePass = graph:render_pass { name = "composite", viewport_fraction = INSET }
+        local compositePass = g:render_pass { name = "second camera inset", viewport_fraction = INSET }
         compositePass:draw {
             pipeline = composite,
             count = 3,
@@ -376,7 +387,21 @@ return function(setTitle)
                 decodeGamma = 0,
             },
         }
-        insetPasses = { secondPass, compositePass }
+        insetPasses[#insetPasses + 1] = secondPass
+        insetPasses[#insetPasses + 1] = compositePass
+    end
+
+    -- The scene's own graph: its main camera into the window, and a second camera
+    -- composited into the corner.
+    function scene.init()
+        local srgb = rhi.window_srgb()
+        scene.createResources()
+        blocks.mainCamera = rhi.params { camera = scene.orbitCamera(camera), encodeGamma = srgb and 0 or 1 }
+
+        graph = rhi.graph()
+        scene.addShadowPasses(graph)
+        scene.addCameraPass(graph, { name = "main camera", view = blocks.mainCamera, clear = { 0.015, 0.018, 0.025, 1 } })
+        scene.addInsetCamera(graph)
     end
 
     -- Called whenever the scene is shown: hands the graph to the host.

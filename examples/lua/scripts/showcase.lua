@@ -3,7 +3,7 @@
 -- another in the same window.
 --
 --   Left / Right arrows     previous / next mode
---   1 .. 7                  jump to a mode
+--   1 .. 5                  jump to a mode
 --   Steam Controller LB/RB  previous / next mode
 --   Left mouse button       moves iMouse in the ShaderToy modes, orbits the camera in the
 --                           physics, the splats and the depth composite
@@ -109,8 +109,6 @@ local physics = rhi.include("lib/physics-mode.lua")(modeDetails)
 
 modes = {
     physics,
-    shaderToyMode("Circle", "circle.slang"),
-    shaderToyMode("Ocean", "ocean.slang"),
     shaderToyMode("2D SDFs", "sdfs2d.slang"),
     shaderToyMode("Controller", "controller.slang"),
     splat,
@@ -184,6 +182,7 @@ end
 function on_mouse_button(button, action, mods) forward("on_mouse_button", button, action, mods) end
 function on_mouse_move(x, y) forward("on_mouse_move", x, y) end
 function on_scroll(x, y) forward("on_scroll", x, y) end
+function on_resize(width, height) forward("on_resize", width, height) end
 
 function on_controller_button(slot, button, pressed)
     if not pressed then return end

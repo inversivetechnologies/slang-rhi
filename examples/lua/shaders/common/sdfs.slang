@@ -169,7 +169,7 @@ float SDF (Polygon obj, float2 p)
     float t = Radial(p);
     int k = int(t*float(n));
     float t0 = float(k) / float(n);
-    float t1 = float((k+1)%n) / float(n);
+    float t1 = float(uint(k+1)%uint(n)) / float(n);
     float2 p0 = float2(cos(t0*PI2),sin(t0*PI2));
     float2 p1 = float2(cos(t1*PI2),sin(t1*PI2));
     float2 v = p1-p0;
