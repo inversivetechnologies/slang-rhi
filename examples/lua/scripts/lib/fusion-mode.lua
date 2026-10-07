@@ -10,7 +10,8 @@
 --                        a translucent shadow map: how much they dim the light in each
 --                        direction, and how far from it they start
 --   mesh                 the lit scene -> meshColor, meshDepth
---   splats: preprocess, sort                       (as in the splat example)
+--   splats: preprocess, lighting, sort             (as in the splat example), lit by the
+--                        point light and shadowed in between (shaders/splat/lighting.slang)
 --   splats: color        the blended splats -> splatColor (transparent background)
 --   splats: depth        the same splats, depth only -> splatDepth: where a splat is at
 --                        least 30% opaque, its depth; the nearest wins
@@ -25,6 +26,7 @@
 --
 --   Mouse drag      orbit the camera          Mouse wheel   zoom
 --   V               combined / mesh only / splats only / depth buffers
+--   L               splats lit by the point light / as captured (only shadowed)
 --   [ / ]           splat size                other keys    as in the scene
 
 return function(scene, splat, setTitle)
@@ -60,8 +62,12 @@ return function(scene, splat, setTitle)
         }
     end
 
+    -- 1: the splats lit by the point light; 0: their captured colors, only shadowed.
+    local relight = 1
+
     local function updateTitle()
-        setTitle("showing " .. SHOW_MODES[showMode] .. " (V)")
+        setTitle(string.format("showing %s (V) | splats %s (L)", SHOW_MODES[showMode],
+            relight == 1 and "lit by the light" or "as captured"))
     end
 
     function fusion.init()
@@ -89,12 +95,13 @@ return function(scene, splat, setTitle)
         -- The splats cast shadows on the meshes: drawn as seen from the light into a
         -- translucent shadow map of their own, which the lit pass reads along with the
         -- scene's.
-        local splatShadowAtlas, faceSize = scene.splatShadowAtlas()
+        local splatShadowAtlas, splatShadowLayers, faceSize = scene.splatShadowAtlas()
         splat.addShadowPasses(graph, {
             name = "splats",
             view = blocks.view,
             light = scene.lightBlock(),
             atlas = splatShadowAtlas,
+            layers = splatShadowLayers,
             faceSize = faceSize,
         })
         scene.addCameraPass(graph, {
@@ -110,6 +117,8 @@ return function(scene, splat, setTitle)
             target = splatColor,
             clear = { 0, 0, 0, 0 }, -- transparent: the mesh shows through where no splat is
             depthTarget = splatDepth,
+            -- Lit by the scene's light, and shadowed by the meshes and by each other.
+            lighting = { scene.lightBlock(), scene.shadowBlock() },
         })
 
         blocks.composite = rhi.params {
@@ -141,6 +150,10 @@ return function(scene, splat, setTitle)
         if key == keys.V and action == input.PRESS then
             showMode = showMode % #SHOW_MODES + 1
             blocks.composite.showMode = showMode - 1
+            updateTitle()
+        elseif key == keys.L and action == input.PRESS then
+            relight = 1 - relight
+            splat.setRelight(relight)
             updateTitle()
         elseif key == keys.LEFT_BRACKET or key == keys.RIGHT_BRACKET then
             splat.on_key(key, action, mods)

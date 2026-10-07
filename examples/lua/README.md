@@ -28,9 +28,10 @@ examples/lua/
   shaders/             every shader, shared by all scripts
     common/            Slang libraries: math, quaternions, transforms, SDFs, splines, ...
     mesh/              the vertex format, and mesh generators (spherified-cube)
-    scene/             the scene's lighting and shadows (scene-common, shadow, lit)
+    scene/             the scene's lighting and shadows (scene-common, shadow, lit,
+                       shadow-lookup)
     splat/             Gaussian splatting (ply, splat-common, preprocess, render,
-                       shadow-casters, shadow)
+                       shadow-casters, shadow, receive-shadows)
     sort/              GPU sorting (bitonic)
     post/              full-screen passes (composite, depth-composite)
     shader-toy/        the ShaderToy framework (shader-toy.slang) and the toys
@@ -684,8 +685,9 @@ which one is nearer the camera:
 | scene: generate sphere, shadow faces | the shadow atlas (the meshes) | |
 | splats: shadow casters (once) | each splat's center, opacity and covariance | the PLY data |
 | splats: shadow faces | the splat shadow atlas: optical depth and nearest distance | the casters |
+| splats: shadow layers faces | the splats' deep opacity map | the casters, the splat shadow atlas |
 | mesh | `meshColor` (rgba16f), `meshDepth` | the shadow atlas |
-| splats: preprocess, sort | the projected and sorted splats | the PLY data |
+| splats: preprocess, receive shadows, sort | the projected (and now shadowed) splats, sorted | the PLY data, all shadow maps |
 | splats: color | `splatColor` (rgba16f, transparent background) | the sorted splats |
 | splats: depth (`color = false`) | `splatDepth` | the sorted splats |
 | depth composite | the window | all four |
@@ -714,8 +716,9 @@ view distances and compares them per pixel:
 - **Mesh nearer:** the mesh hides the splats behind it.
 
 So the horns pass in front of the sphere, the floor cuts off the jaw, and orbiting the
-camera moves each in front of or behind the other. The skull also casts its shadow on
-the floor, the cube and the sphere (see [Splat shadows](#splat-shadows)). V shows the inputs: the mesh or the
+camera moves each in front of or behind the other. Light and shadow go both ways: the
+skull shadows the floor, the cube and the sphere, and the meshes and the skull itself
+shadow the skull (see [Splat shadows](#splat-shadows)). V shows the inputs: the mesh or the
 splats alone, or both depth buffers, with the mesh's in blue, the splats' in orange, and
 nearer shown brighter.
 
@@ -726,74 +729,104 @@ nearer shown brighter.
   the edge is hard.
 - **Splats inside a surface:** faint splats in front of a nearer mesh surface are dropped
   with the rest.
-- **Light goes one way:** the splats shadow the meshes, but nothing shadows or lights the
-  splats. Their lighting is baked into their colors, from the capture.
-- **Cost:** about 46 ms per frame on an RTX 3050 Laptop GPU (Release, default window
-  size), against 31 ms for the splats alone. Of the difference, about 5 ms is the splats'
-  second, depth-only draw, and about 10 ms their shadows.
+- **Shadows only take light away from the splats:** their colors have the lighting of
+  their capture baked in, so shadows darken them, but the point light doesn't light
+  them.
+- **Cost:** about 40 ms per frame on an RTX 3050 Laptop GPU (Release, default window
+  size), against 31 ms for the splats alone. The rest is the splats' second, depth-only
+  draw and their shadows, both ways.
 
 ### Splat shadows
 
-The splats dim the point light as it passes through them, like a translucent medium. This
-is a translucent shadow map: the technique used for hair, smoke and foliage.
+Shadows go both ways between the splats and the meshes, and the splats shadow each
+other:
 
-**Why not solid casters?** A first version drew each fairly opaque splat as a solid disc
-into the meshes' shadow map. The result was speckled with spots of light:
-
-- **Fixed cutoff:** the discs only stood in for splats above an opacity cutoff. The many
-  faint, overlapping splats that together block most of the light cast nothing.
-- **Gaps:** round discs didn't match the splats' real, often elongated shapes, so light
-  leaked between them.
-
-**What is stored instead.** The splats draw into a shadow map of their own, laid out like
-the meshes' (six cube-face cells), in an `rgba16f` texture. Each texel holds two values,
-both gathered by the `accumulate` blend:
-
-| Channel | Holds | Blend |
+| Caster | Receiver | Through |
 | --- | --- | --- |
-| r | optical depth: the sum of `-ln(1 - α)` over every splat in that direction | add |
-| a | the distance from the light to the nearest of those splats | min |
+| meshes | meshes | the shadow map (scene/shadow.slang) |
+| splats | meshes | the splats' translucent shadow map and its deep opacity layers |
+| meshes | splats | the shadow map |
+| splats | splats (self-shadowing) | the deep opacity layers |
 
-The transmittance through all of them is then `exp(-r)`. That is the product of each
-splat's `1 - α`, so faint splats count for exactly what they block.
+Every receiver looks the light up through the same function, `shadowVisibility` in
+`shaders/scene/shadow-lookup.slang`: the lit pass for the meshes, and
+`shaders/splat/receive-shadows.slang` for the splats.
 
-**How it is drawn.**
+#### The splats as a translucent medium
+
+A Gaussian has no hard surface: light passing through splats is dimmed by each in turn, to
+a transmittance of `∏(1 - αᵢ)`. That is the technique used for hair and smoke. It needs to
+know, for a point, how much of the splats lies between it and the light, so it builds
+two maps per cube face, in the meshes' atlas layout:
+
+1. **Translucent shadow map** (`rgba16f`, `accumulate` blend):
+   - **r:** the optical depth, `Σ -ln(1 - α)`, of all splats in that direction.
+   - **a:** the distance to the nearest of them (min).
+   - **Which splats set the distance:** only splats at least 20% opaque there count as the
+     nearest. A few faint strays in front of a surface would otherwise put all of it
+     "behind".
+2. **Deep opacity map** (`rgba16f`, `additive` blend; Yuksel & Keyser 2008): the same
+   splats again, now that the nearest distances are known.
+   - **What each channel holds:** channel k holds the optical depth of the splats within
+     0.05, 0.15, 0.4 and 1.2 units past the nearest.
+   - **Between the layers:** the depth is interpolated linearly. Past the last layer, all
+     the splats in that direction count.
+   - **Layer spacing:** the layers are close together near the surface and farther apart
+     behind it, so a point on the far side of the skull is dimmed by the near side, and a
+     point on the lit side isn't.
+
+The light that reaches a point is then the light not blocked by a mesh, times
+`exp(-optical depth in front of it)`, averaged over 3×3 texels for soft edges.
+
+#### How the splats' shadow maps are drawn
 
 1. **Casters** (`shaders/splat/shadow-casters.slang`, compute, once):
    - **What it stores:** each splat's center, opacity and 3D covariance in the world.
    - **Placement:** it goes through `shaders/splat/ply.slang`, the same code that places
      and shapes the drawn splats, so the shadows match them exactly.
    - **When it runs:** again when the splat size changes or the shader is edited.
-2. **Shadow faces** (`shaders/splat/shadow.slang`): six passes, one per cube face.
-   - **Shape:** each splat is drawn as its actual Gaussian, seen from the light. Its
+2. **Shadow faces and shadow layers faces** (`shaders/splat/shadow.slang`, six passes each):
+   - **Shape:** each splat is drawn as its actual Gaussian seen from the light. Its
      covariance is projected onto the plane facing the light, and a triangle covers the
      resulting ellipse out to 3σ.
-   - **Output:** the fragment shader adds the splat's `-ln(1 - α)` and offers its
-     distance.
-   - **Culling:** splats the face can't see collapse to nothing in the vertex shader.
-3. **Lit pass** (`shaders/scene/lit.slang`): for each of the 9 texels it already reads
-   from the meshes' shadow map, it also reads the splats'. If the point is farther from
-   the light than the nearest splat, the light is scaled by `exp(-r)`. The 3×3 average then
-   softens the edges, as for the meshes.
+   - **Entry points:** `fragmentMain` fills the first map. `layersFragmentMain` fills the
+     second, reading the first.
 
-The meshes' shadow map is unchanged, and the two combine per texel: a texel's light is
-`(not blocked by a mesh) × (splat transmittance)`.
+#### Shadows on the splats
 
-**Wiring.**
+`shaders/splat/receive-shadows.slang` runs between preprocessing and sorting, one thread
+per visible splat:
 
-- **The scene** owns the splat shadow texture and binds it for every lit draw, but only
-  reads it where a view sets `splatShadows = 1`. In the Scene mode it is never read, even
-  after the Depth Composite mode has drawn into it.
-- **The fusion module** sets `splatShadows = 1` in its view block. It adds the splats'
-  shadow passes with `splat.addShadowPasses()`, given the scene's light block and the
-  texture (`scene.lightBlock()`, `scene.splatShadowAtlas()`).
+- **Lookup:** it looks up the light at the splat's center with `shadowVisibility`.
+- **Darkening:** it scales the splat's color down to `1 - shadowStrength` (0.75) where no
+  light gets through.
+- **Bias:** each splat counts as 0.08 units nearer to the light than its center, so that
+  the few splats making up a surface don't shadow each other ("shadow acne").
 
-**Limits.**
+Because the splats' colors have their capture's lighting baked in, shadows only take light
+away. A splat facing away from the light isn't darkened for that, only for what stands
+between it and the light, including the rest of the skull.
 
-- **One distance per texel:** a point between two splats along the same direction is
-  dimmed by both, not only by the nearer one.
+#### Wiring
+
+- **The scene** owns the splats' two shadow textures (`scene.splatShadowAtlas()`) and binds
+  them for every lit draw.
+  - **When they are read:** only where a view sets `splatShadows = 1`. In the Scene mode
+    they are never read, even after the Depth Composite mode has drawn into them.
+  - **For other receivers:** `scene.shadowBlock()` hands all shadow maps to them.
+- **The fusion module** sets `splatShadows = 1` in its view block. It adds the shadow
+  passes with `splat.addShadowPasses()`, and the receiving pass through
+  `splat.addPasses{ receiveShadows = { scene.lightBlock(), scene.shadowBlock() } }`.
+
+#### Limits
+
 - **Resolution:** at 512 texels per cube face, the far ends of long shadows show their
   texels.
+- **Fixed layers:** the four layers are spaced for an object about the skull's size. Much
+  larger or smaller splat scenes would want them rescaled (`kSplatLayerBounds` in
+  `shadow-lookup.slang`).
+- **One value per splat:** a splat is shadowed by the light at its center only, so a large
+  splat straddling a shadow edge is shaded all one way.
 
 ## Shader parameters
 

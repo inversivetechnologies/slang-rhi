@@ -1,7 +1,7 @@
 // Lit pass: draws one object as seen by the camera, lit by the point light and shadowed
-// by the shadow atlas the shadow pass rendered (see scene-common.slang).
+// by the shadow maps (see shadow-lookup.slang).
 
-#include "scene-common.slang"
+#include "shadow-lookup.slang"
 
 struct Material
 {
@@ -22,13 +22,6 @@ uniform Transform transform;
 uniform Material material;
 uniform Camera camera;
 uniform float2 viewportSize; // provided by the host: the size of the viewport drawn into
-Texture2D<float> shadowMap;
-uniform uint shadowFaceSize;
-// Translucent shadows of Gaussian splats (splat/shadow.slang), in the same atlas layout:
-// r is the optical depth of the splats in a direction, a the distance to the nearest one.
-// Only read when splatShadows is 1 (the fusion example draws it).
-Texture2D<float4> splatShadowMap;
-uniform uint splatShadows;
 uniform uint encodeGamma; // 1 if the window doesn't do the sRGB encoding itself
 
 struct VertexOutput
@@ -63,41 +56,14 @@ VertexOutput vertexMain(uint vertexId: SV_VertexID)
     return output;
 }
 
-// Fraction of the light reaching `world` (0: in shadow, 1: lit), averaged over a 3x3
-// texel neighborhood for soft edges: blocked by the meshes in the shadow map, and dimmed
-// by the splats in the splat shadow map, if there is one.
+// Fraction of the light reaching `world` (0: in shadow, 1: lit).
 float shadowFactor(float3 world, float3 normal, float3 toLight, float3 lightPos)
 {
     // Push the lookup off the surface along its normal, more so where the light grazes
     // it, so a surface doesn't shadow itself ("shadow acne").
     float grazing = 1.0 - saturate(dot(normal, toLight));
     float3 d = world + normal * (0.02 + 0.04 * grazing) - lightPos;
-    float current = length(d);
-
-    uint face = cubeFaceOf(d);
-    float2 texel = shadowFaceTexel(d, face, shadowFaceSize);
-    int2 origin = int2(shadowFaceOrigin(face, shadowFaceSize));
-    int last = int(shadowFaceSize) - 1;
-
-    float lit = 0;
-    for (int y = -1; y <= 1; ++y)
-    {
-        for (int x = -1; x <= 1; ++x)
-        {
-            // Stay inside this face's cell: the next cell over is a different view.
-            int2 p = clamp(int2(texel) + int2(x, y), int2(0, 0), int2(last, last));
-            float occluder = shadowMap.Load(int3(origin + p, 0));
-            float transmittance = 1.0;
-            if (splatShadows != 0)
-            {
-                // Behind the nearest splat: dimmed by all of them in that direction.
-                float4 splats = splatShadowMap.Load(int3(origin + p, 0));
-                transmittance = current - 0.02 > splats.a ? exp(-splats.r) : 1.0;
-            }
-            lit += current - 0.02 <= occluder ? transmittance : 0.0;
-        }
-    }
-    return lit / 9.0;
+    return shadowVisibility(d, 0.02);
 }
 
 [shader("fragment")]

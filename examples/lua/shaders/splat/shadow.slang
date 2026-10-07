@@ -13,12 +13,18 @@
 // scene/lit.slang then dims a point by exp(-r) if it is farther from the light than `a`,
 // i.e. behind the splats -- softly and without gaps, because faint splats count too.
 //
+// layersFragmentMain draws the same splats again, into the deep opacity map
+// (splatShadowLayers, see scene/shadow-lookup.slang): it reads the nearest splat's distance
+// from the map above, and adds a splat's optical depth to every layer that reaches past
+// it. That says how much of the splats lies in front of a point -- what a splat behind
+// others needs to be shadowed by them.
+//
 // Each splat is drawn as its actual Gaussian, seen from the light: its 3D covariance is
 // projected onto the plane facing the light, and one triangle covers the resulting
 // ellipse out to 3 sigma. Splats this cube face can't see collapse to nothing in the
 // vertex shader.
 
-#include "scene/scene-common.slang"
+#include "scene/shadow-lookup.slang"
 
 StructuredBuffer<float4> shadowCasters; // see shadow-casters.slang
 uniform uint face;                      // which cube face this draw renders
@@ -30,6 +36,9 @@ struct VertexOutput
     float2 offset : OFFSET; // position on the ellipse, in units of its 3-sigma half axes
     nointerpolation float opacity : OPACITY;
 };
+
+// How opaque a splat must be at a texel to count as the nearest splat there.
+static const float kNearestOpacity = 0.2;
 
 // An equilateral triangle around the unit circle.
 static const float2 kTriangle[3] = { float2(0, 2), float2(-1.7320508, -1), float2(1.7320508, -1) };
@@ -102,5 +111,31 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     {
         discard;
     }
-    return float4(-log(1.0 - alpha), 0, 0, distance(input.world, lightPosition()));
+    // Only splats that are fairly opaque here count as the nearest: a few faint strays in
+    // front of a surface would otherwise put every splat of it "behind", in the shadow of
+    // everything. They still dim the light.
+    float nearest = alpha >= kNearestOpacity ? distance(input.world, lightPosition()) : 60000.0;
+    return float4(-log(1.0 - alpha), 0, 0, nearest);
+}
+
+// For the deep opacity map, drawn with "additive" blending after fragmentMain's map is
+// complete; that map is read here (splatShadowMap) at the same atlas texel.
+[shader("fragment")]
+float4 layersFragmentMain(VertexOutput input) : SV_Target
+{
+    float alpha = min(0.99, input.opacity * exp(-4.5 * dot(input.offset, input.offset)));
+    if (alpha < 1.0 / 255.0)
+    {
+        discard;
+    }
+    float opticalDepth = -log(1.0 - alpha);
+    float nearest = splatShadowMap.Load(int3(int2(input.position.xy), 0)).a;
+    float behind = distance(input.world, lightPosition()) - nearest;
+    float4 layers;
+    [unroll]
+    for (int k = 0; k < 4; ++k)
+    {
+        layers[k] = behind < kSplatLayerBounds[k] ? opticalDepth : 0.0;
+    }
+    return layers;
 }

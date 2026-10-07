@@ -13,13 +13,6 @@
 #include "splat-common.slang"
 #include "ply.slang"
 
-struct SplatCamera
-{
-    float3 eye;
-    float fovY; // vertical field of view, radians
-    float3 target;
-};
-
 uniform uint sortCount;      // splatCount padded to the sort's power of two
 uniform SplatCamera camera;
 uniform float2 viewportSize; // provided by the host

@@ -119,6 +119,8 @@ return function(setTitle, file)
             -- shaders/splat/shadow.slang.
             shadowCasters = rhi.compute_pipeline("splat/shadow-casters.slang", "shadowCastersMain"),
             shadow = rhi.render_pipeline { shader = "splat/shadow.slang", format = "rgba16f", blend = "accumulate" },
+            shadowLayers = rhi.render_pipeline { shader = "splat/shadow.slang", fragment = "layersFragmentMain", format = "rgba16f", blend = "additive" },
+            lighting = rhi.compute_pipeline("splat/lighting.slang", "lightSplatsMain"),
             casters = rhi.buffer(count * 48), -- three float4s per splat
             projected = rhi.buffer(count * 48), -- sizeof(ProjectedSplat)
             sortKeys = rhi.buffer(sortCount * 4),
@@ -130,6 +132,8 @@ return function(setTitle, file)
             splatScale = splatScale,
             model = IDENTITY_MODEL,
         }
+        -- How the splats are lit, where a graph lights them (addPasses' `lighting`).
+        blocks.lighting = rhi.params { relight = 1, shadowStrength = 0.75, shadowBias = 0.08 }
         return resources
     end
 
@@ -143,6 +147,9 @@ return function(setTitle, file)
     --   name          a prefix for the passes' names
     --   view          a parameter block applied after the splats' own (e.g. a `camera`
     --                 and a `model` placing the splats), or nil
+    --   lighting      if given, a list of parameter blocks with a light and shadow maps
+    --                 (the scene's lightBlock() and shadowBlock()): the splats are then lit
+    --                 by that light, and shadowed by the meshes and by each other
     --   target        the rgba16f texture to draw the splats' color into
     --   clear         the color to clear it to first
     --   depthTarget   if given, the splats are also drawn into this depth target
@@ -164,6 +171,16 @@ return function(setTitle, file)
         }
         for _, block in ipairs(view) do preprocessParams[#preprocessParams + 1] = block end
         g:dispatch { name = name .. ": preprocess", pipeline = r.preprocess, params = preprocessParams, threads = { r.sortCount, 1, 1 } }
+
+        -- Light and shadows on the splats, if asked for: changes the colors preprocess just
+        -- wrote, before the sort reorders the keys (shaders/splat/lighting.slang).
+        if options.lighting then
+            local params = { preprocessParams[1], blocks.view }
+            for _, block in ipairs(options.lighting) do params[#params + 1] = block end
+            params[#params + 1] = options.view -- after those: it can switch the splat maps on
+            params[#params + 1] = blocks.lighting
+            g:dispatch { name = name .. ": lighting", pipeline = r.lighting, params = params, threads = { count, 1, 1 } }
+        end
 
         -- The bitonic sort, as laid out in bitonic.slang: sort each block of 1024, then for
         -- every longer sequence length k, the long-range steps one dispatch each, and the
@@ -217,7 +234,8 @@ return function(setTitle, file)
     --   name       a prefix for the passes' names
     --   view       a parameter block applied after the splats' own (the `model`)
     --   light      the light's parameter block (the scene's)
-    --   atlas      the rgba16f texture to draw into, faceSize the size of its cube-face cells
+    --   atlas      the rgba16f texture to draw the map into, layers the one for its deep
+    --              opacity layers, faceSize the size of their cube-face cells
     function splat.addShadowPasses(g, options)
         local r = splat.createResources()
         local params = {
@@ -257,6 +275,29 @@ return function(setTitle, file)
                 params = { { shadowCasters = r.casters, face = face }, options.light },
             }
         end
+
+        -- The deep opacity layers: the same splats again, now that the nearest distances
+        -- are known, sorted into layers by how far past the nearest they are.
+        for face = 0, 5 do
+            local pass = g:render_pass {
+                name = string.format("%s: shadow layers face %d", name, face),
+                target = options.layers,
+                viewport = { (face % 3) * size, (face // 3) * size, size, size },
+                clear = face == 0 and { 0, 0, 0, 0 } or nil,
+            }
+            pass:draw {
+                pipeline = r.shadowLayers,
+                count = count * 3,
+                params = { { shadowCasters = r.casters, face = face, splatShadowMap = options.atlas }, options.light },
+            }
+        end
+    end
+
+    -- Where graphs light the splats: 1 lights them by the light as albedo, 0 keeps their
+    -- captured colors and only shadows them (see shaders/splat/lighting.slang).
+    function splat.setRelight(amount)
+        splat.createResources()
+        blocks.lighting.relight = amount
     end
 
     -- The splats' own graph: drawn on a dark background, composited onto the window.

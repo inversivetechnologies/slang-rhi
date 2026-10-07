@@ -1,9 +1,7 @@
 {
-    "permissions": {
-        "allow": [
-            "Bash(gh api:*)"
-        ],
-        "deny": [],
-        "ask": []
-    }
+  "permissions": {
+    "allow": [],
+    "deny": [],
+    "ask": []
+  }
 }

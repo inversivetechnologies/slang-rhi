@@ -47,7 +47,7 @@ return function(setTitle)
     -- Parameters
     -- ---------------------------------------------------------------------------------
 
-    local sphere = { subdivision = 24, radius = 0.8 }
+    local sphere = { subdivision = 8, radius = 0.8 }
     local MAX_SUBDIVISION = 128
     local MIN_RADIUS, MAX_RADIUS = 0.2, 1.4
 
@@ -194,6 +194,8 @@ return function(setTitle)
             -- Translucent shadows of other things (the fusion example's splats), in the same
             -- layout; read by the lit shader only where a view sets splatShadows = 1.
             splatShadowAtlas = rhi.texture { width = 3 * SHADOW_FACE_SIZE, height = 2 * SHADOW_FACE_SIZE, format = "rgba16f" },
+            -- ...and their deep opacity map, for what lies between the light and a point.
+            splatShadowLayers = rhi.texture { width = 3 * SHADOW_FACE_SIZE, height = 2 * SHADOW_FACE_SIZE, format = "rgba16f" },
         }
 
         -- Parameter blocks. Each object has one with its mesh, transform and material;
@@ -203,6 +205,7 @@ return function(setTitle)
             shadowMap = resources.shadowAtlas,
             shadowFaceSize = SHADOW_FACE_SIZE,
             splatShadowMap = resources.splatShadowAtlas,
+            splatShadowLayers = resources.splatShadowLayers,
             splatShadows = 0,
         }
         blocks.generate = rhi.params {
@@ -260,11 +263,19 @@ return function(setTitle)
         return blocks.light
     end
 
-    -- Where other things draw translucent shadows for the lit pass to read: the texture,
-    -- and the size of its cube-face cells (laid out as in scene-common.slang).
+    -- Where other things draw translucent shadows for the lit pass to read: the map, its
+    -- deep opacity layers, and the size of their cube-face cells (laid out as in
+    -- scene-common.slang). See shaders/scene/shadow-lookup.slang.
     function scene.splatShadowAtlas()
         local r = scene.createResources()
-        return r.splatShadowAtlas, SHADOW_FACE_SIZE
+        return r.splatShadowAtlas, r.splatShadowLayers, SHADOW_FACE_SIZE
+    end
+
+    -- The parameter block with every shadow map, for other things that receive shadows
+    -- (through scene/shadow-lookup.slang, as the lit pass does).
+    function scene.shadowBlock()
+        scene.createResources()
+        return blocks.shadowMap
     end
 
     -- Adds what every view of the scene needs first: the sphere's generator, and the six

@@ -9,6 +9,13 @@ struct ProjectedSplat
     float4 color;       // rgb: color as trained (display space), a: opacity
 };
 
+struct SplatCamera
+{
+    float3 eye;
+    float fovY; // vertical field of view, radians
+    float3 target;
+};
+
 // Sort key of splats that aren't drawn (culled, or padding): sorts after every real one.
 static const float kCulledKey = 1e30;
 

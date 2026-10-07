@@ -85,6 +85,23 @@ float3x3 quaternionToMatrix(float4 q)
     );
 }
 
+// The splat's surface normal in the world, as Gaussians on a surface lie flat along it: the
+// direction of its shortest axis. Its sign is arbitrary. `flatness` says how much to trust
+// it -- 0 for a round splat, whose shortest axis means nothing, toward 1 for a flat one.
+float3 splatWorldNormal(uint base, out float flatness)
+{
+    float3 s = exp(loadFloat3(base + ply.scale));
+    float4 q = float4(plyData[base + ply.rotation], plyData[base + ply.rotation + 1],
+                      plyData[base + ply.rotation + 2], plyData[base + ply.rotation + 3]);
+    float3x3 rotation = quaternionToMatrix(normalize(q));
+    // The axes are the rotation's columns.
+    uint shortest = s.x <= s.y && s.x <= s.z ? 0 : (s.y <= s.z ? 1 : 2);
+    float middle = max(min(s.x, s.y), min(max(s.x, s.y), s.z));
+    flatness = 1.0 - s[shortest] / max(middle, 1e-12);
+    float3 axis = float3(rotation[0][shortest], rotation[1][shortest], rotation[2][shortest]);
+    return normalize(mul(splatYaw(), axis * splatFlip()));
+}
+
 // The splat's 3D covariance in the world: R S S^T R^T from its rotation and scale, then
 // flipped and turned like its position.
 float3x3 splatWorldCovariance(uint base)
