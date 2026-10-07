@@ -11,7 +11,7 @@ All examples are scripts, in `scripts/`:
 | Script | What it shows |
 | --- | --- |
 | `showcase.lua` | the physics, the ShaderToy shaders, the splats and the depth composite in one window, switchable at runtime |
-| `physics.lua` | rigid body physics on Jolt: a ball, a ramp, dominoes, a box pyramid and a tower; throw balls, drop boxes -- the host simulates and draws, instanced |
+| `physics.lua` | rigid body physics on Jolt: a ball, a ramp, dominoes, a box pyramid and a tower, and a player character to smash them, steered with a Steam Controller the way Darksiders is -- the host simulates and draws, instanced |
 | `surface.lua` | clearing the window |
 | `scene.lua` | a lit 3D scene: a GPU-generated spherified cube, a cube and a floor, with a point light, realtime shadow mapping and a second camera composited into the corner -- built as a render graph the host runs without Lua |
 | `shader-toy.lua` | ShaderToy-style compute shaders blitted to the window |
@@ -38,7 +38,7 @@ examples/lua/
     sdf/               SDF compositions: smooth booleans (smooth-ops), the DAG evaluator
                        (sdf-dag), placement in the world (sdf-world), and the
                        raymarching pass (raymarch)
-    post/              full-screen passes (composite, depth-composite)
+    post/              full-screen passes (composite, depth-composite, crosshair)
     shader-toy/        the ShaderToy framework (shader-toy.slang) and the toys
   assets/              data files the scripts load (skull.ply)
 ```
@@ -87,7 +87,7 @@ and exits. It doesn't fall back to another API.
 | Left / Right arrow | previous / next mode |
 | `1` .. `5` | jump to a mode |
 | Steam Controller LB / RB | previous / next mode |
-| Left mouse button | moves `iMouse` in the ShaderToy modes; orbits the camera in the physics, the splats and the depth composite |
+| Left mouse button | moves `iMouse` in the ShaderToy modes; turns the camera in the physics; orbits it in the splats and the depth composite |
 | Escape | gives the mouse pointer back (click the window to hide it again) |
 | F11 | toggles fullscreen |
 
@@ -132,17 +132,29 @@ How it renders is described in [Example: Gaussian splatting](#example-gaussian-s
 
 ### The physics
 
-`example-lua physics`, or mode 1 of the showcase.
+`example-lua physics`, or mode 1 of the showcase. You play a horned, caped warrior with
+a big sword, with the camera behind them, in the style of Darksiders.
 
-| Input | Action |
-| --- | --- |
-| Drag with the left mouse button | orbit the camera |
-| Mouse wheel | zoom |
-| E | throw a ball from the camera, toward the point it looks at |
-| Space | drop a burst of 24 boxes and balls from the sky |
-| R | reset: the dynamic bodies back where they started |
-| P | pause the simulation |
-| T | slow motion (a quarter of the speed) |
+| Steam Controller | Keyboard and mouse | Action |
+| --- | --- | --- |
+| Left stick | W A S D | move, relative to the camera (the stick walks to a run) |
+| Right stick, right trackpad | drag with the left mouse button | turn the camera |
+| A | Space | jump; again in the air: double jump (with a flip); hold while falling after it: glide |
+| B | Left Shift | dodge roll, toward the stick (or forward) |
+| X | F | sword combo: forehand, backhand, overhead slam. In the air: plunge to the ground, with a shockwave |
+| Y | G | launcher: an upward swing that throws what it hits into the air |
+| R3 (press the right stick) | Q | toggle aim mode: the camera goes over the right shoulder, a crosshair appears, the character faces where the camera looks and strafes |
+| RT | E | throw a fireball (a heavy ball): at the crosshair in aim mode (hold to keep throwing), else straight ahead |
+| Gyro | | in aim mode: a small extra tilt of the aim (up to about 8° sideways, 6° up and down), on top of the right stick |
+| LT | C | camera back behind the character |
+| | Mouse wheel | camera distance |
+| View | B | drop a burst of 24 boxes and balls from the sky |
+| Menu | R | reset: the bodies and the player back where they started |
+| | P | pause the simulation |
+| | T | slow motion (a quarter of the speed) |
+
+LB and RB still switch the showcase's modes. The crosshair turns orange over anything
+that can move.
 
 How it works is described in [Example: rigid body physics](#example-rigid-body-physics).
 
@@ -558,7 +570,8 @@ which CMake clones and builds with the example host.
 - **The host simulates:** it steps the world every frame and writes each group's
   transforms straight into a GPU buffer.
 - **Lua sets up:** a script builds the world and its bodies, then only reacts to input.
-- **No Lua per frame:** neither the physics nor the drawing calls into Lua.
+- **No Lua per frame:** neither the physics nor the drawing calls into Lua. A script that
+  steers a character does so from its own `update`.
 
 | Call | |
 | --- | --- |
@@ -571,13 +584,16 @@ which CMake clones and builds with the example host.
 | `group.count`, `group.capacity`, `group.buffer` | bodies in the group; its size; its transforms |
 | `rhi.set_physics(world)` | makes the host step `world` every frame; `nil` stops it |
 | `world.paused`, `world.time_scale`, `world.gravity` | settable |
+| `world:character{ ... }` | a character, see below |
+| `world:raycast(origin, direction, max_distance)` | the nearest hit: `distance, point, normal, moving` (whether the body hit can move); `nil` if none. Characters are ignored |
+| `group:set_transform(i, position [, rotation [, scale]])` | places visual body `i` (and rescales it: half extents, or the radius on all three axes) |
 
 `group:add` takes:
 
 | Field | Default | |
 | --- | --- | --- |
 | `shape` | `"box"` | `"box"` with `half_extents = {x, y, z}`, or `"sphere"` with `radius` |
-| `motion` | `"dynamic"` | `"dynamic"`, `"static"`, or `"kinematic"` (moved by its velocity, never pushed) |
+| `motion` | `"dynamic"` | `"dynamic"`, `"static"`, `"kinematic"` (moved by its velocity, never pushed), or `"visual"`: no physics at all, only drawn, where `group:set_transform` puts it |
 | `position`, `rotation` | origin, none | `rotation` is a quaternion `{x, y, z, w}` |
 | `velocity`, `angular_velocity` | 0 | initial |
 | `friction`, `restitution`, `density` | 0.5, 0, 1000 | density in kg/m³; with the shape's volume, it gives the mass |
@@ -586,6 +602,24 @@ which CMake clones and builds with the example host.
 **Stepping.** The world steps at a fixed 1/60 s whatever the frame rate: steps accumulate
 over frames, at most four per frame. A long frame therefore slows the simulation down
 rather than stalling it.
+
+**Characters.** `world:character{ radius = 0.35, height = 1.8, position, max_slope = 50,
+mass = 90, strength = 600 }` adds a capsule a script steers: Jolt's `CharacterVirtual`,
+with an inner rigid body so that the bodies collide with it too.
+
+- **What it does:** it walks on the bodies, slides along walls, steps up small steps,
+  sticks to slopes and won't climb ones steeper than `max_slope` (degrees). It pushes what
+  it walks into, with up to `strength` newtons.
+- **Each step:** the host moves it before the bodies. Its velocity is its `move`, plus its
+  vertical velocity under gravity, plus the velocity of whatever it stands on.
+
+| Field or call | |
+| --- | --- |
+| `character.move = {x, z}` | the horizontal velocity to move with (m/s), until changed |
+| `character:jump(speed)` | sets the vertical velocity on the next step, on the ground or not |
+| `character.gravity_scale`, `character.max_fall_speed` | gravity's multiplier; the fastest it falls (0: no limit) |
+| `character.position`, `character.velocity` | the feet's position and the velocity; setting the position teleports it |
+| `character.on_ground`, `character.ground` | standing on something? `"ground"`, `"steep"`, `"unsupported"` or `"air"` |
 
 **Drawing bodies.**
 
@@ -601,13 +635,13 @@ rather than stalling it.
 ## Example: rigid body physics
 
 `scripts/physics.lua` (and mode 1 of the showcase, in `scripts/lib/physics-mode.lua`) is a
-test scene for the physics:
+test scene for the physics, with a player character in it:
 
 - **The chain reaction:** a ball at the top of a ramp rolls down into a row of 14
   dominoes. They topple one after another, and the last falls into a seven-level box
   pyramid.
 - **The tower:** beside them stands a tower of 12 layers of three boards, each layer turned
-  a quarter turn. E throws heavy balls at it from the camera.
+  a quarter turn.
 - **The bursts:** Space rains random boxes and spinning balls onto all of it.
 
 **Bodies.** Three groups, each drawn by one instanced draw per pass:
@@ -617,18 +651,71 @@ test scene for the physics:
 | statics | the floor, the ramp and its rails (static) | cube |
 | boxes | dominoes, pyramid, tower, dropped boxes | cube |
 | balls | the rolling ball, thrown and dropped balls | sphere |
+| the player's parts | the figure's boxes (visual) | cube |
+| the player's orb | the glow in its hand in aim mode (visual) | sphere |
 
 **The graph:** six shadow passes into its own shadow atlas, then the lit pass into the
-window, as in the scene. The splat and SDF inputs of the shadow lookup are switched off,
-and bound to placeholders.
+window, as in the scene, then the crosshair (`post/crosshair.slang`, alpha-blended, its
+pass enabled in aim mode only). The splat and SDF inputs of the shadow lookup are
+switched off, and bound to placeholders.
 
-**What Lua does after `init`:** adds bodies (E, Space), clears and re-adds them (R), and
-sets `world.paused` and `world.time_scale` (P, T). Every draw follows its group's body
-count by itself.
+**What Lua does after `init`:** steers and poses the player every frame (below), adds
+bodies (fireballs, bursts), clears and re-adds them (reset), and sets `world.paused` and
+`world.time_scale`. Every draw follows its group's body count by itself.
 
-**Cost:** about 8 ms per frame (≈120 fps) on an RTX 3050 Laptop GPU, Release, with about
-280 bodies. That covers the physics on the CPU (Jolt's job system uses all but one core)
-and the seven passes.
+### The player
+
+`scripts/lib/player.lua` plays like a third-person action game, Darksiders in particular.
+Every frame, in `update`, it reads the controller (or the keyboard), steers the character,
+runs the attacks, moves the camera and poses the figure.
+
+- **The body:** a character (`world:character`), 1.85 m tall, with 1.7 times the scene's
+  gravity, for snappy jumps of about 1.7 m (1.3 m more with the double jump). The physics
+  steps happen in the host; Lua sets `move` and calls `jump`.
+- **Moving:** the left stick's direction is taken relative to the camera, and the steered
+  velocity follows it quickly on the ground and slowly in the air. The character turns to
+  face where it runs. A short window after leaving a ledge still allows a normal jump.
+  Holding jump while falling after the double jump glides: `max_fall_speed` drops to
+  1.7 m/s.
+- **Attacks:** each swing lunges forward a little, and hits once, partway through. It sets
+  the velocity of every box and ball in range, in an arc in front of the character, out
+  and along the swing. Pressing X during a swing queues the next one of the combo. The
+  overhead slam, the launcher and the plunge throw things around in a circle or upward.
+  Hits shake the camera.
+- **The camera:** it orbits a point that trails the character, closely sideways and
+  loosely up and down, so that jumps don't bob the view.
+  - **Following:** when the player runs and leaves the camera alone for a moment, it
+    eases round behind the character.
+  - **Obstacles:** a ray cast from that point pulls it in front of anything in the way,
+    and it eases back out.
+  - **Aim mode:** blends it over the right shoulder (2.7 m back, 0.8 m to the side, the
+    field of view from 55° to 42°).
+- **Throwing:** in aim mode, a ray cast from the camera through the crosshair finds the
+  target, and the fireball flies from the character's hand to that point. It is a heavy
+  ball, so it knocks things over.
+- **The figure:** 21 boxes and a sphere, visual bodies in two groups, posed every frame
+  with a few quaternions.
+  - **Its frames:** hips, torso, head, arms, legs and sword, each relative to the last.
+  - **Animations:** a run cycle with a bob and a lean; poses for jumping and gliding; the
+    rolls of the dodge and the double jump; the swings. Each swing goes from a wind-up to
+    a strike, a follow-through and a recovery.
+  - **Drawing:** the host draws it like any other bodies, so it is lit and casts shadows.
+- **The gyro:** the Steam Controller's gyro is taken as ±2000°/s over its range, yaw on z
+  and pitch on x, as SDL maps the Steam Deck's. The controller tested here read a
+  constant offset (−0.147 on x, about 5 rad/s) at rest. So the player tracks the offset
+  while not aiming, and subtracts it.
+  - **Only a tilt:** in aim mode the gyro doesn't turn the camera; the right stick does.
+    The gyro tilts the aim a little away from where the stick points it: by half the
+    controller's own turn, at most about 8° sideways and 6° up or down. The camera and
+    the throws follow the tilted aim.
+  - **No drift:** the tilt eases back to nothing (`GYRO_TILT_RETURN`, 0.6 per second),
+    so leftover drift can't pile up. It is gone right after leaving aim mode.
+  - **Tuning:** the gain, the limits and the axis signs are constants at the top of
+    `player.lua`, untested against real motion.
+
+**Cost:** about 8.3 ms per frame (≈120 fps) on an RTX 3050 Laptop GPU, Release, with about
+280 bodies, the player running. That covers the physics on the CPU (Jolt's job system uses
+all but one core), the player's Lua, and the eight passes.
 
 ## Example: a scene as a render graph
 

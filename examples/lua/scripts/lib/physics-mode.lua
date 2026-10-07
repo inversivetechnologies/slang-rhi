@@ -11,13 +11,19 @@
 -- has), lit and shadowed as the scene's meshes are (scene/lit.slang, scene/shadow.slang:
 -- bodyVertexMain). Neither the physics nor the drawing runs Lua per frame.
 --
---   Mouse drag      orbit the camera      Mouse wheel   zoom
---   E               throw a ball from the camera
---   Space           drop a burst of boxes and balls
+-- A player character (lib/player.lua) runs through it all, steered with a Steam
+-- Controller (or the keyboard) the way Darksiders is, with the camera on it. Its input,
+-- movement and pose are Lua, every frame; its body is a Jolt character the host moves.
+--
+--   Steam Controller  see lib/player.lua; also Menu reset, View drop a burst
+--   WASD, Space, Shift, F, G, Q, E, C   the player (see lib/player.lua)
+--   Mouse drag      turn the camera       Mouse wheel   camera distance
+--   B               drop a burst of boxes and balls
 --   R               reset the scene       P             pause
 --   T               slow motion
 
 local meshes = rhi.include("lib/meshes.lua")
+local createPlayer = rhi.include("lib/player.lua")
 
 return function(setTitle)
     local mode = { name = "Physics" }
@@ -26,29 +32,19 @@ return function(setTitle)
     end
 
     local SHADOW_FACE_SIZE = 512
-    local camera = { yaw = 0.55, pitch = 0.42, distance = 13, target = { 0.5, 0.8, 0 }, fovY = math.rad(50) }
 
-    local world, groups, blocks, graph
-    local slowMotion, thrown = false, 0
-
-    local function orbitCamera()
-        local cp, sp = math.cos(camera.pitch), math.sin(camera.pitch)
-        local t = camera.target
-        return {
-            eye = {
-                t[1] + camera.distance * cp * math.sin(camera.yaw),
-                t[2] + camera.distance * sp,
-                t[3] - camera.distance * cp * math.cos(camera.yaw),
-            },
-            target = t,
-            fovY = camera.fovY,
-        }
-    end
+    local world, groups, blocks, graph, player, crosshairPass
+    local slowMotion = false
+    local title = ""
 
     local function updateTitle()
-        setTitle(string.format("%d boxes, %d balls%s%s | E throw, Space drop, R reset, P pause, T slow motion",
-            groups.boxes.count, groups.balls.count,
-            world.paused and " | paused" or "", slowMotion and " | slow motion" or ""))
+        local text = string.format("%s | %d boxes, %d balls%s%s | B drop, R reset, P pause, T slow motion",
+            player.describe(), groups.boxes.count, groups.balls.count,
+            world.paused and " | paused" or "", slowMotion and " | slow motion" or "")
+        if text ~= title then
+            title = text
+            setTitle(text)
+        end
     end
 
     -- A rotation of `angle` radians about the y or z axis, as a quaternion x, y, z, w.
@@ -123,7 +119,7 @@ return function(setTitle)
         groups.boxes:clear()
         groups.balls:clear()
         addDynamics()
-        thrown = 0
+        player.reset()
     end
 
     -- ---------------------------------------------------------------------------------
@@ -139,6 +135,14 @@ return function(setTitle)
         }
         addStatics()
         addDynamics()
+        -- The player starts behind the dominoes, looking at the tower and the pyramid; its
+        -- attacks hit the boxes and the balls, and it throws balls.
+        player = createPlayer(world, {
+            spawn = { 0, 0.05, -5 },
+            targets = { groups.boxes, groups.balls },
+            projectiles = groups.balls,
+        })
+        player.init()
 
         local cube = meshes.cube()
         local ball = meshes.sphere(16)
@@ -165,13 +169,21 @@ return function(setTitle)
             sdfShadows = 0, sdfShadowSharpness = 8, sdfNodes = rhi.buffer(128), sdfNodeCount = 0,
             sdfResultSlot = 0, smoothScale = 1, sdfOrigin = { 0, 0, 0 }, sdfSpin = 0, sdfBoundsRadius = 0,
         }
-        blocks.camera = rhi.params { camera = orbitCamera(), encodeGamma = rhi.window_srgb() and 0 or 1 }
+        blocks.camera = rhi.params { camera = player.camera(), encodeGamma = rhi.window_srgb() and 0 or 1 }
+        blocks.crosshair = rhi.params {
+            crosshairColor = { 1, 1, 1, 0.85 },
+            crosshairHotColor = { 1, 0.45, 0.15, 1 },
+            crosshairHot = 0,
+            crosshairSpread = 0,
+        }
 
         -- What to draw: each group with its mesh, one instance per body.
         local draws = {
             { group = groups.statics, mesh = cube },
             { group = groups.boxes, mesh = cube },
             { group = groups.balls, mesh = ball },
+            { group = player.parts, mesh = cube },
+            { group = player.round, mesh = ball },
         }
 
         graph = rhi.graph()
@@ -196,9 +208,34 @@ return function(setTitle)
                 params = { { vertices = d.mesh.buffer, bodies = d.group.buffer }, blocks.light, blocks.shadows, blocks.camera },
             }
         end
+
+        -- The crosshair, over everything, in aim mode only.
+        crosshairPass = graph:render_pass { name = "crosshair" }
+        crosshairPass:draw {
+            pipeline = rhi.render_pipeline { shader = "post/crosshair.slang", blend = "alpha" },
+            count = 3,
+            params = blocks.crosshair,
+        }
+        crosshairPass.enabled = false
+    end
+
+    -- Every frame: the player, and what follows it (the camera, the crosshair, the title).
+    function mode.update(_, dt)
+        if world.paused then dt = 0 end
+        player.update(dt * world.time_scale)
+        blocks.camera.camera = player.camera()
+        local aiming = player.aiming()
+        crosshairPass.enabled = aiming
+        if aiming then
+            local hot, spread = player.crosshair()
+            blocks.crosshair.crosshairHot = hot
+            blocks.crosshair.crosshairSpread = spread
+        end
+        updateTitle()
     end
 
     function mode.on_enter()
+        player.clear_input()
         rhi.set_graph(graph)
         rhi.set_physics(world)
         updateTitle()
@@ -212,20 +249,6 @@ return function(setTitle)
     -- ---------------------------------------------------------------------------------
     -- Input: adds and removes bodies, and changes the world's settings
     -- ---------------------------------------------------------------------------------
-
-    local function throwBall()
-        local c = orbitCamera()
-        local dir = { c.target[1] - c.eye[1], c.target[2] - c.eye[2], c.target[3] - c.eye[3] }
-        local length = math.sqrt(dir[1] ^ 2 + dir[2] ^ 2 + dir[3] ^ 2)
-        local speed = 22
-        thrown = thrown + 1
-        groups.balls:add {
-            shape = "sphere", radius = 0.25, density = 4000, restitution = 0.3, friction = 0.4,
-            position = { c.eye[1] + dir[1] / length, c.eye[2] + dir[2] / length, c.eye[3] + dir[3] / length },
-            velocity = { dir[1] / length * speed, dir[2] / length * speed + 2, dir[3] / length * speed },
-            color = PALETTE[thrown % #PALETTE + 1], pattern = 1,
-        }
-    end
 
     local function dropBurst()
         for _ = 1, 24 do
@@ -244,10 +267,9 @@ return function(setTitle)
     end
 
     function mode.on_key(key, action)
+        if player.on_key(key, action) then return end
         if action ~= input.PRESS then return end
-        if key == keys.E then
-            throwBall()
-        elseif key == keys.SPACE then
+        if key == keys.B then
             dropBurst()
         elseif key == keys.R then
             reset()
@@ -271,15 +293,25 @@ return function(setTitle)
 
     function mode.on_mouse_move(x, y)
         if not drag then return end
-        camera.yaw = camera.yaw - (x - drag[1]) * 0.008
-        camera.pitch = math.max(0.05, math.min(1.45, camera.pitch + (y - drag[2]) * 0.008))
+        player.look((x - drag[1]) * 0.006, (y - drag[2]) * 0.006)
         drag = { x, y }
-        blocks.camera.camera = orbitCamera()
     end
 
-    function mode.on_scroll(x, y)
-        camera.distance = math.max(3, math.min(30, camera.distance - y * 0.8))
-        blocks.camera.camera = orbitCamera()
+    function mode.on_scroll(_, y)
+        player.zoom(y)
+    end
+
+    function mode.on_controller_button(slot, button, pressed)
+        if player.on_controller_button(slot, button, pressed) then return true end
+        if not pressed then return false end
+        if button == buttons.Menu then
+            reset()
+        elseif button == buttons.View then
+            dropBurst()
+        else
+            return false
+        end
+        return true
     end
 
     blocks = {}

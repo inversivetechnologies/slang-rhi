@@ -2,7 +2,7 @@
 -- showcase can run it too (as its first mode).
 --
 -- The host steps the physics and draws the bodies every frame; Lua builds the scene in
--- init() and afterwards only reacts to input.
+-- init(), and every frame steers and poses the player character (lib/player.lua).
 
 config = { title = "Physics", features = { "rasterization" } }
 
@@ -16,3 +16,5 @@ function on_key(key, action, mods) physics.on_key(key, action, mods) end
 function on_mouse_button(button, action, mods) physics.on_mouse_button(button, action, mods) end
 function on_mouse_move(x, y) physics.on_mouse_move(x, y) end
 function on_scroll(x, y) physics.on_scroll(x, y) end
+function update(time, dt) physics.update(time, dt) end
+function on_controller_button(slot, button, pressed) physics.on_controller_button(slot, button, pressed) end

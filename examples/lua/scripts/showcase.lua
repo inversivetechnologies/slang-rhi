@@ -185,6 +185,9 @@ function on_scroll(x, y) forward("on_scroll", x, y) end
 function on_resize(width, height) forward("on_resize", width, height) end
 
 function on_controller_button(slot, button, pressed)
+    -- The mode first: the physics mode's player takes most buttons.
+    local handler = modes[current].on_controller_button
+    if handler and handler(slot, button, pressed) then return end
     if not pressed then return end
     if button == buttons.RB then
         switchTo(current + 1)

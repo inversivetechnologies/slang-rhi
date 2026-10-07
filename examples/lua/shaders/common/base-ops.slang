@@ -38,8 +38,8 @@ float AngleNormalized(float2 a, float2 b) {
 float2 SquareSample(int n, int k)
 {
     const float l = .5 / float(n);
-    int kx = k % n;
-    int ky = k / n;
+    int kx = int(uint(k) % uint(n));
+    int ky = int(uint(k) / uint(n));
     float x = float(kx) / float(n) + l;
     float y = float(ky) / float(n) + l;
     return float2(x, y);

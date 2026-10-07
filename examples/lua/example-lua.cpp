@@ -570,11 +570,17 @@ static constexpr uint32_t kBodyFloats = 16;
 
 struct PhysicsWorld;
 
+// A group entry with this id is not a physics body but a "visual" one: drawn like the
+// others, placed by the script (group:set_transform), colliding with nothing.
+static constexpr uint32_t kVisualBody = UINT32_MAX;
+
 struct BodyGroup
 {
     std::weak_ptr<PhysicsWorld> world;
     uint32_t capacity = 0;
-    std::vector<uint32_t> ids; // physics body ids, in instance order
+    std::vector<uint32_t> ids; // physics body ids (or kVisualBody), in instance order
+    // Per body: position xyz, rotation xyzw -- used for the visual ones only.
+    std::vector<float> placements;
     // Per body: scale xyz, pattern, color rgb, unused -- what doesn't come from the physics.
     std::vector<float> looks;
     std::shared_ptr<Buffer> buffer;
@@ -587,6 +593,16 @@ struct PhysicsWorld
     std::vector<std::weak_ptr<BodyGroup>> groups;
     bool paused = false;
     float timeScale = 1.0f;
+};
+
+// A script's handle on one of a world's characters.
+struct CharacterHandle
+{
+    std::weak_ptr<PhysicsWorld> world;
+    uint32_t index = 0;
+    float gravityScale = 1.0f;
+    float maxFallSpeed = 0.0f;
+    float move[2] = {0, 0};
 };
 
 // ---------------------------------------------------------------------------------------
@@ -664,6 +680,7 @@ const char* kNodeType = "rhi.Pass";
 const char* kDrawType = "rhi.Draw";
 const char* kPhysicsType = "rhi.PhysicsWorld";
 const char* kBodyGroupType = "rhi.BodyGroup";
+const char* kCharacterType = "rhi.Character";
 
 // Script handles hold a shared_ptr to the host-side object.
 template<typename T>
@@ -846,7 +863,13 @@ public:
             {
                 float* body = &group->staging[i * kBodyFloats];
                 const float* looks = &group->looks[i * 8];
-                m_physics->world->getTransform(group->ids[i], body, body + 4);
+                if (group->ids[i] == kVisualBody)
+                {
+                    std::copy_n(&group->placements[i * 7], 3, body);
+                    std::copy_n(&group->placements[i * 7 + 3], 4, body + 4);
+                }
+                else
+                    m_physics->world->getTransform(group->ids[i], body, body + 4);
                 body[3] = 0;
                 body[8] = looks[0];
                 body[9] = looks[1];
@@ -2727,6 +2750,128 @@ public:
         return 1;
     }
 
+    // world:character{ radius = 0.35, height = 1.8, position = {x, y, z} (the feet),
+    //                  max_slope = 50 (degrees), mass = 90, strength = 600 }
+    static int physicsCharacter(lua_State* L)
+    {
+        auto world = checkShared<PhysicsWorld>(L, 1, kPhysicsType);
+        physics::CharacterDesc desc;
+        if (lua_istable(L, 2))
+        {
+            desc.radius = readFloat(L, 2, "radius", desc.radius);
+            desc.height = readFloat(L, 2, "height", desc.height);
+            readFloats(L, 2, "position", desc.position, 3);
+            desc.maxSlopeDegrees = readFloat(L, 2, "max_slope", desc.maxSlopeDegrees);
+            desc.mass = readFloat(L, 2, "mass", desc.mass);
+            desc.maxStrength = readFloat(L, 2, "strength", desc.maxStrength);
+        }
+        auto handle = std::make_shared<CharacterHandle>();
+        handle->world = world;
+        handle->index = world->world->addCharacter(desc);
+        pushHandle(L, handle, kCharacterType);
+        return 1;
+    }
+
+    // world:raycast({x, y, z}, {dx, dy, dz}, max_distance) -> distance, point, normal,
+    // moving (whether the body hit can move); nil if nothing is hit. Characters are ignored.
+    static int physicsRaycast(lua_State* L)
+    {
+        auto world = checkShared<PhysicsWorld>(L, 1, kPhysicsType);
+        float origin[3], direction[3];
+        checkVector(L, 2, origin, 3);
+        checkVector(L, 3, direction, 3);
+        float maxDistance = float(luaL_checknumber(L, 4));
+        physics::RayHit hit;
+        if (!world->world->castRay(origin, direction, maxDistance, hit))
+        {
+            lua_pushnil(L);
+            return 1;
+        }
+        lua_pushnumber(L, hit.distance);
+        pushNumbers(L, hit.point, 3);
+        pushNumbers(L, hit.normal, 3);
+        lua_pushboolean(L, hit.moving);
+        return 4;
+    }
+
+    static std::shared_ptr<PhysicsWorld> characterWorld(lua_State* L, CharacterHandle& handle)
+    {
+        auto world = handle.world.lock();
+        if (!world)
+            luaL_error(L, "the character's physics world is gone");
+        return world;
+    }
+
+    // character:jump(speed): sets the vertical velocity on the next step.
+    static int characterJump(lua_State* L)
+    {
+        auto handle = checkShared<CharacterHandle>(L, 1, kCharacterType);
+        characterWorld(L, *handle)->world->jumpCharacter(handle->index, float(luaL_checknumber(L, 2)));
+        return 0;
+    }
+
+    static int characterIndex(lua_State* L)
+    {
+        auto handle = checkShared<CharacterHandle>(L, 1, kCharacterType);
+        const char* key = luaL_checkstring(L, 2);
+        physics::CharacterState state;
+        characterWorld(L, *handle)->world->getCharacter(handle->index, state);
+        if (strcmp(key, "position") == 0)
+            pushNumbers(L, state.position, 3);
+        else if (strcmp(key, "velocity") == 0)
+            pushNumbers(L, state.velocity, 3);
+        else if (strcmp(key, "on_ground") == 0)
+            lua_pushboolean(L, state.ground == physics::Ground::OnGround);
+        else if (strcmp(key, "ground") == 0)
+        {
+            static const char* kNames[] = {"ground", "steep", "unsupported", "air"};
+            lua_pushstring(L, kNames[int(state.ground)]);
+        }
+        else if (strcmp(key, "move") == 0)
+            pushNumbers(L, handle->move, 2);
+        else if (strcmp(key, "gravity_scale") == 0)
+            lua_pushnumber(L, handle->gravityScale);
+        else if (strcmp(key, "max_fall_speed") == 0)
+            lua_pushnumber(L, handle->maxFallSpeed);
+        else
+        {
+            lua_pushvalue(L, lua_upvalueindex(1));
+            lua_getfield(L, -1, key);
+        }
+        return 1;
+    }
+
+    // character.move = {x, z} (horizontal velocity, m/s), .gravity_scale, .max_fall_speed
+    // (0: none), .position = {x, y, z} (teleports), .velocity = {x, y, z}
+    static int characterNewIndex(lua_State* L)
+    {
+        auto handle = checkShared<CharacterHandle>(L, 1, kCharacterType);
+        const char* key = luaL_checkstring(L, 2);
+        physics::World& world = *characterWorld(L, *handle)->world;
+        if (strcmp(key, "move") == 0)
+        {
+            checkVector(L, 3, handle->move, 2);
+            world.setCharacterMove(handle->index, handle->move[0], handle->move[1]);
+        }
+        else if (strcmp(key, "gravity_scale") == 0 || strcmp(key, "max_fall_speed") == 0)
+        {
+            (key[0] == 'g' ? handle->gravityScale : handle->maxFallSpeed) = float(luaL_checknumber(L, 3));
+            world.setCharacterGravity(handle->index, handle->gravityScale, handle->maxFallSpeed);
+        }
+        else if (strcmp(key, "position") == 0 || strcmp(key, "velocity") == 0)
+        {
+            float v[3];
+            checkVector(L, 3, v, 3);
+            if (key[0] == 'p')
+                world.setCharacterPosition(handle->index, v);
+            else
+                world.setCharacterVelocity(handle->index, v);
+        }
+        else
+            luaL_error(L, "can't set '%s' on a character", key);
+        return 0;
+    }
+
     static int physicsIndex(lua_State* L)
     {
         auto world = checkShared<PhysicsWorld>(L, 1, kPhysicsType);
@@ -2807,8 +2952,9 @@ public:
             desc.motion = physics::Motion::Static;
         else if (strcmp(motion, "kinematic") == 0)
             desc.motion = physics::Motion::Kinematic;
-        else if (strcmp(motion, "dynamic") != 0)
-            luaL_error(L, "unknown body motion '%s' (dynamic, static, kinematic)", motion);
+        bool visual = strcmp(motion, "visual") == 0;
+        if (!visual && strcmp(motion, "static") != 0 && strcmp(motion, "kinematic") != 0 && strcmp(motion, "dynamic") != 0)
+            luaL_error(L, "unknown body motion '%s' (dynamic, static, kinematic, visual)", motion);
         lua_pop(L, 1);
         readFloats(L, 2, "half_extents", desc.halfExtents, 3);
         desc.radius = readFloat(L, 2, "radius", desc.radius);
@@ -2823,12 +2969,14 @@ public:
         readFloats(L, 2, "color", color, 3);
         float pattern = readFloat(L, 2, "pattern", 0);
 
-        uint32_t id = world->world->addBody(desc);
-        if (id == UINT32_MAX)
+        uint32_t id = visual ? kVisualBody : world->world->addBody(desc);
+        if (!visual && id == UINT32_MAX)
         {
             lua_pushnil(L);
             return 1;
         }
+        group->placements.insert(group->placements.end(), desc.position, desc.position + 3);
+        group->placements.insert(group->placements.end(), desc.rotation, desc.rotation + 4);
         // The unit meshes are -1..1 cubes and radius 1 spheres; the scale makes them the body.
         bool sphere = desc.shape == physics::Shape::Sphere;
         group->looks.insert(group->looks.end(), {
@@ -2848,18 +2996,56 @@ public:
         auto group = checkShared<BodyGroup>(L, 1, kBodyGroupType);
         auto world = groupWorld(L, *group);
         for (uint32_t id : group->ids)
-            world->world->removeBody(id);
+            if (id != kVisualBody)
+                world->world->removeBody(id);
         group->ids.clear();
         group->looks.clear();
+        group->placements.clear();
         return 0;
     }
 
-    static uint32_t checkBodyId(lua_State* L, BodyGroup& group, int index)
+    static size_t checkBodyIndex(lua_State* L, BodyGroup& group, int index)
     {
         lua_Integer i = luaL_checkinteger(L, index);
         if (i < 0 || size_t(i) >= group.ids.size())
             luaL_error(L, "no body %d in the group", int(i));
-        return group.ids[size_t(i)];
+        return size_t(i);
+    }
+
+    // The physics body at `index`: not a visual one, which has none.
+    static uint32_t checkBodyId(lua_State* L, BodyGroup& group, int index)
+    {
+        uint32_t id = group.ids[checkBodyIndex(L, group, index)];
+        if (id == kVisualBody)
+            luaL_error(L, "body %d is visual: it has no physics", int(lua_tointeger(L, index)));
+        return id;
+    }
+
+    static void checkVector(lua_State* L, int index, float* out, int count)
+    {
+        luaL_checktype(L, index, LUA_TTABLE);
+        for (int i = 0; i < count; ++i)
+        {
+            lua_rawgeti(L, index, i + 1);
+            out[i] = float(luaL_checknumber(L, -1));
+            lua_pop(L, 1);
+        }
+    }
+
+    // group:set_transform(i, {x, y, z}, {qx, qy, qz, qw} [, {sx, sy, sz}]): places a
+    // visual body (and rescales it: half extents, or the radius on every axis).
+    static int groupSetTransform(lua_State* L)
+    {
+        auto group = checkShared<BodyGroup>(L, 1, kBodyGroupType);
+        size_t i = checkBodyIndex(L, *group, 2);
+        if (group->ids[i] != kVisualBody)
+            luaL_error(L, "set_transform is for visual bodies; physics moves the others");
+        checkVector(L, 3, &group->placements[i * 7], 3);
+        if (!lua_isnoneornil(L, 4))
+            checkVector(L, 4, &group->placements[i * 7 + 3], 4);
+        if (!lua_isnoneornil(L, 5))
+            checkVector(L, 5, &group->looks[i * 8], 3);
+        return 0;
     }
 
     // group:set_velocity(i, {x, y, z}) and group:impulse(i, {x, y, z})
@@ -2899,9 +3085,12 @@ public:
     static int groupPosition(lua_State* L)
     {
         auto group = checkShared<BodyGroup>(L, 1, kBodyGroupType);
-        uint32_t id = checkBodyId(L, *group, 2);
+        size_t i = checkBodyIndex(L, *group, 2);
         float position[3], rotation[4];
-        groupWorld(L, *group)->world->getTransform(id, position, rotation);
+        if (group->ids[i] == kVisualBody)
+            std::copy_n(&group->placements[i * 7], 3, position);
+        else
+            groupWorld(L, *group)->world->getTransform(group->ids[i], position, rotation);
         lua_pushnumber(L, position[0]);
         lua_pushnumber(L, position[1]);
         lua_pushnumber(L, position[2]);
@@ -3588,6 +3777,8 @@ public:
 
         static const luaL_Reg kPhysicsMethods[] = {
             {"group", physicsGroup},
+            {"character", physicsCharacter},
+            {"raycast", physicsRaycast},
             {nullptr, nullptr},
         };
         newType(L, kPhysicsType, physicsIndex, kPhysicsMethods, collectHandle<PhysicsWorld>);
@@ -3599,9 +3790,17 @@ public:
             {"set_velocity", groupSetVelocity},
             {"impulse", groupImpulse},
             {"position", groupPosition},
+            {"set_transform", groupSetTransform},
             {nullptr, nullptr},
         };
         newType(L, kBodyGroupType, groupIndex, kGroupMethods, collectHandle<BodyGroup>);
+
+        static const luaL_Reg kCharacterMethods[] = {
+            {"jump", characterJump},
+            {nullptr, nullptr},
+        };
+        newType(L, kCharacterType, characterIndex, kCharacterMethods, collectHandle<CharacterHandle>);
+        setNewIndex(L, kCharacterType, characterNewIndex);
         setNewIndex(L, kDrawType, drawNewIndex);
     }
 
