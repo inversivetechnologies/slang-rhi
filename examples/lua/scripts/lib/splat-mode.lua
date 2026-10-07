@@ -115,6 +115,11 @@ return function(setTitle, file)
             render = rhi.render_pipeline { shader = "splat/render.slang", format = "rgba16f", blend = "premultiplied" },
             -- The same quads into a depth buffer only: no color target.
             renderDepth = rhi.render_pipeline { shader = "splat/render.slang", fragment = "depthFragmentMain", format = "none", depth = true },
+            -- Shadows: the splats' Gaussians drawn into a translucent shadow map, see
+            -- shaders/splat/shadow.slang.
+            shadowCasters = rhi.compute_pipeline("splat/shadow-casters.slang", "shadowCastersMain"),
+            shadow = rhi.render_pipeline { shader = "splat/shadow.slang", format = "rgba16f", blend = "accumulate" },
+            casters = rhi.buffer(count * 48), -- three float4s per splat
             projected = rhi.buffer(count * 48), -- sizeof(ProjectedSplat)
             sortKeys = rhi.buffer(sortCount * 4),
             sortValues = rhi.buffer(sortCount * 4),
@@ -202,6 +207,58 @@ return function(setTitle, file)
         end
     end
 
+    -- Shadows, for graphs that draw the splats into a scene with a light (the fusion
+    -- example). The splats dim the light like a translucent medium: each is drawn as its
+    -- Gaussian, seen from the light, into a translucent shadow map that the lit pass reads
+    -- (see shaders/splat/shadow.slang).
+    local casterNodes = {} -- rerun when the splats change size
+
+    -- Adds the passes that draw that map. `options`:
+    --   name       a prefix for the passes' names
+    --   view       a parameter block applied after the splats' own (the `model`)
+    --   light      the light's parameter block (the scene's)
+    --   atlas      the rgba16f texture to draw into, faceSize the size of its cube-face cells
+    function splat.addShadowPasses(g, options)
+        local r = splat.createResources()
+        local params = {
+            {
+                plyData = r.ply.buffer,
+                ply = plyLayout(r.ply),
+                splatCount = count,
+                shadowCastersOut = r.casters,
+            },
+            blocks.view,
+            options.view,
+        }
+        -- The splats don't move, so what the shadow passes need of them (center, opacity,
+        -- covariance) is gathered once, and again when their size or the shader changes.
+        local name = options.name or "splats"
+        casterNodes[#casterNodes + 1] = g:dispatch {
+            name = name .. ": shadow casters",
+            pipeline = r.shadowCasters,
+            params = params,
+            threads = { count, 1, 1 },
+            once = true,
+        }
+
+        -- One pass per cube face, into its cell of the atlas. The first clears the whole
+        -- atlas: no optical depth, and the nearest splat as far as rgba16f goes.
+        local size = options.faceSize
+        for face = 0, 5 do
+            local pass = g:render_pass {
+                name = string.format("%s: shadow face %d", name, face),
+                target = options.atlas,
+                viewport = { (face % 3) * size, (face // 3) * size, size, size },
+                clear = face == 0 and { 0, 0, 0, 60000 } or nil,
+            }
+            pass:draw {
+                pipeline = r.shadow,
+                count = count * 3, -- a triangle per splat
+                params = { { shadowCasters = r.casters, face = face }, options.light },
+            }
+        end
+    end
+
     -- The splats' own graph: drawn on a dark background, composited onto the window.
     function splat.init()
         splat.createResources()
@@ -259,6 +316,7 @@ return function(setTitle, file)
         end
         updateView()
         updateTitle()
+        for _, node in ipairs(casterNodes) do node:rerun() end
     end
 
     local drag

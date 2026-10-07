@@ -472,6 +472,7 @@ struct Pipeline
         Alpha,         // color * a + target * (1 - a)
         Premultiplied, // color + target * (1 - a): the shader has multiplied color by a
         Additive,      // color + target
+        Accumulate,    // rgb: color + target; a: min(a, target a) -- sums and a nearest value
     };
     Blend blend = Blend::None;
     // No color target at all (format = "none"): for depth-only passes.
@@ -1150,6 +1151,11 @@ public:
             BlendFactor dst = pipeline.blend == Pipeline::Blend::Additive ? BlendFactor::One : BlendFactor::InvSrcAlpha;
             colorTarget.color = {src, dst, BlendOp::Add};
             colorTarget.alpha = {BlendFactor::One, dst, BlendOp::Add};
+            if (pipeline.blend == Pipeline::Blend::Accumulate)
+            {
+                colorTarget.color = {BlendFactor::One, BlendFactor::One, BlendOp::Add};
+                colorTarget.alpha = {BlendFactor::One, BlendFactor::One, BlendOp::Min};
+            }
         }
         RenderPipelineDesc desc = {};
         desc.program = compiled.program;
@@ -1948,6 +1954,7 @@ public:
             {"alpha", Pipeline::Blend::Alpha},
             {"premultiplied", Pipeline::Blend::Premultiplied},
             {"additive", Pipeline::Blend::Additive},
+            {"accumulate", Pipeline::Blend::Accumulate},
         };
         lua_getfield(L, 1, "blend");
         const char* blend = luaL_optstring(L, -1, "none");

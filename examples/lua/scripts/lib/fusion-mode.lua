@@ -6,6 +6,9 @@
 -- The render graph, built once in init():
 --
 --   scene: generate sphere, shadow faces 0..5      (as in the scene)
+--   splats: shadow casters, shadow faces 0..5     the splats as seen from the light, in
+--                        a translucent shadow map: how much they dim the light in each
+--                        direction, and how far from it they start
 --   mesh                 the lit scene -> meshColor, meshDepth
 --   splats: preprocess, sort                       (as in the splat example)
 --   splats: color        the blended splats -> splatColor (transparent background)
@@ -78,10 +81,22 @@ return function(scene, splat, setTitle)
             camera = scene.orbitCamera(orbit),
             encodeGamma = 0,
             model = placement(),
+            splatShadows = 1, -- the lit pass reads the splats' shadow map
         }
 
         graph = rhi.graph()
         scene.addShadowPasses(graph)
+        -- The splats cast shadows on the meshes: drawn as seen from the light into a
+        -- translucent shadow map of their own, which the lit pass reads along with the
+        -- scene's.
+        local splatShadowAtlas, faceSize = scene.splatShadowAtlas()
+        splat.addShadowPasses(graph, {
+            name = "splats",
+            view = blocks.view,
+            light = scene.lightBlock(),
+            atlas = splatShadowAtlas,
+            faceSize = faceSize,
+        })
         scene.addCameraPass(graph, {
             name = "mesh",
             view = blocks.view,

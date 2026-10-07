@@ -15,7 +15,7 @@ All examples are scripts, in `scripts/`:
 | `scene.lua` | a lit 3D scene: a GPU-generated spherified cube, a cube and a floor, with a point light, realtime shadow mapping and a second camera composited into the corner -- built as a render graph the host runs without Lua |
 | `shader-toy.lua` | ShaderToy-style compute shaders blitted to the window |
 | `splat.lua` | Gaussian splatting with compute shaders: loads `assets/skull.ply` (1.9 million splats), projects, sorts and draws them every frame |
-| `fusion.lua` | the scene and the splats in one picture: each rendered with its own depth buffer, combined per pixel by depth |
+| `fusion.lua` | the scene and the splats in one picture: each rendered with its own depth buffer, combined per pixel by depth; the splats cast shadows on the meshes |
 
 ## Layout
 
@@ -29,7 +29,8 @@ examples/lua/
     common/            Slang libraries: math, quaternions, transforms, SDFs, splines, ...
     mesh/              the vertex format, and mesh generators (spherified-cube)
     scene/             the scene's lighting and shadows (scene-common, shadow, lit)
-    splat/             Gaussian splatting (splat-common, preprocess, render)
+    splat/             Gaussian splatting (ply, splat-common, preprocess, render,
+                       shadow-casters, shadow)
     sort/              GPU sorting (bitonic)
     post/              full-screen passes (composite, depth-composite)
     shader-toy/        the ShaderToy framework (shader-toy.slang) and the toys
@@ -220,7 +221,7 @@ local draw = rhi.render_pipeline {
     topology = "triangles",         -- triangles | triangle-strip | lines | line-strip | points
     depth = false,                  -- test and write the target's depth buffer
     format = nil,                   -- color target format; default: the window's
-    blend = "none",                 -- none | alpha | premultiplied | additive
+    blend = "none",                 -- none | alpha | premultiplied | additive | accumulate
 }
 ```
 
@@ -237,6 +238,7 @@ local draw = rhi.render_pipeline {
   | `alpha` | `color * a + target * (1 - a)` |
   | `premultiplied` | `color + target * (1 - a)`, for shaders that output color already multiplied by alpha |
   | `additive` | `color + target` |
+  | `accumulate` | rgb: `color + target`; alpha: `min(a, target a)`, to sum values and keep a nearest distance in one target |
 - **`format`**: the color format the pipeline writes. Leave it out to draw into the
   window. Set it to a texture's format to draw into that texture (see [Drawing into a
   texture](#drawing-into-a-texture)).
@@ -613,6 +615,7 @@ rotation, scale, opacity, and degree-3 spherical harmonics for view-dependent co
 | --- | --- |
 | `scripts/splat.lua` | runs it on its own |
 | `scripts/lib/splat-mode.lua` | loads the file, builds the render graph, handles input |
+| `shaders/splat/ply.slang` | reads splats from the PLY data and places them in the world |
 | `shaders/splat/preprocess.slang` | compute: projects each splat, evaluates its color, writes a sort key |
 | `shaders/sort/bitonic.slang` | compute: sorts the keys |
 | `shaders/splat/render.slang` | draws the sorted splats as blended quads |
@@ -678,7 +681,9 @@ which one is nearer the camera:
 
 | Pass | Writes | Reads |
 | --- | --- | --- |
-| scene: generate sphere, shadow faces | the shadow atlas | |
+| scene: generate sphere, shadow faces | the shadow atlas (the meshes) | |
+| splats: shadow casters (once) | each splat's center, opacity and covariance | the PLY data |
+| splats: shadow faces | the splat shadow atlas: optical depth and nearest distance | the casters |
 | mesh | `meshColor` (rgba16f), `meshDepth` | the shadow atlas |
 | splats: preprocess, sort | the projected and sorted splats | the PLY data |
 | splats: color | `splatColor` (rgba16f, transparent background) | the sorted splats |
@@ -709,7 +714,8 @@ view distances and compares them per pixel:
 - **Mesh nearer:** the mesh hides the splats behind it.
 
 So the horns pass in front of the sphere, the floor cuts off the jaw, and orbiting the
-camera moves each in front of or behind the other. V shows the inputs: the mesh or the
+camera moves each in front of or behind the other. The skull also casts its shadow on
+the floor, the cube and the sphere (see [Splat shadows](#splat-shadows)). V shows the inputs: the mesh or the
 splats alone, or both depth buffers, with the mesh's in blue, the splats' in orange, and
 nearer shown brighter.
 
@@ -720,21 +726,74 @@ nearer shown brighter.
   the edge is hard.
 - **Splats inside a surface:** faint splats in front of a nearer mesh surface are dropped
   with the rest.
-- **No shadows from the splats:** they don't cast shadows on the meshes; only the mesh
-  objects are in the shadow passes.
-- **Cost:** about 36 ms per frame on an RTX 3050 Laptop GPU (Release, default window
-  size), against 31 ms for the splats alone. Most of the difference is the splats' second,
-  depth-only draw.
+- **Light goes one way:** the splats shadow the meshes, but nothing shadows or lights the
+  splats. Their lighting is baked into their colors, from the capture.
+- **Cost:** about 46 ms per frame on an RTX 3050 Laptop GPU (Release, default window
+  size), against 31 ms for the splats alone. Of the difference, about 5 ms is the splats'
+  second, depth-only draw, and about 10 ms their shadows.
 
-**Shared resources.** The fusion module builds its graph from pieces of the scene and
-splat modules:
+### Splat shadows
 
-- **The scene's** `addShadowPasses` and `addCameraPass`.
-- **The splats'** `addPasses`, with a `depthTarget` for the depth pass.
+The splats dim the point light as it passes through them, like a translucent medium. This
+is a translucent shadow map: the technique used for hair, smoke and foliage.
 
-Those modules make their pipelines, meshes and the loaded file once, in `createResources()`.
-The showcase therefore shares them between the Scene, Gaussian Splats and Depth Composite
-modes, and only the graphs differ.
+**Why not solid casters?** A first version drew each fairly opaque splat as a solid disc
+into the meshes' shadow map. The result was speckled with spots of light:
+
+- **Fixed cutoff:** the discs only stood in for splats above an opacity cutoff. The many
+  faint, overlapping splats that together block most of the light cast nothing.
+- **Gaps:** round discs didn't match the splats' real, often elongated shapes, so light
+  leaked between them.
+
+**What is stored instead.** The splats draw into a shadow map of their own, laid out like
+the meshes' (six cube-face cells), in an `rgba16f` texture. Each texel holds two values,
+both gathered by the `accumulate` blend:
+
+| Channel | Holds | Blend |
+| --- | --- | --- |
+| r | optical depth: the sum of `-ln(1 - α)` over every splat in that direction | add |
+| a | the distance from the light to the nearest of those splats | min |
+
+The transmittance through all of them is then `exp(-r)`. That is the product of each
+splat's `1 - α`, so faint splats count for exactly what they block.
+
+**How it is drawn.**
+
+1. **Casters** (`shaders/splat/shadow-casters.slang`, compute, once):
+   - **What it stores:** each splat's center, opacity and 3D covariance in the world.
+   - **Placement:** it goes through `shaders/splat/ply.slang`, the same code that places
+     and shapes the drawn splats, so the shadows match them exactly.
+   - **When it runs:** again when the splat size changes or the shader is edited.
+2. **Shadow faces** (`shaders/splat/shadow.slang`): six passes, one per cube face.
+   - **Shape:** each splat is drawn as its actual Gaussian, seen from the light. Its
+     covariance is projected onto the plane facing the light, and a triangle covers the
+     resulting ellipse out to 3σ.
+   - **Output:** the fragment shader adds the splat's `-ln(1 - α)` and offers its
+     distance.
+   - **Culling:** splats the face can't see collapse to nothing in the vertex shader.
+3. **Lit pass** (`shaders/scene/lit.slang`): for each of the 9 texels it already reads
+   from the meshes' shadow map, it also reads the splats'. If the point is farther from
+   the light than the nearest splat, the light is scaled by `exp(-r)`. The 3×3 average then
+   softens the edges, as for the meshes.
+
+The meshes' shadow map is unchanged, and the two combine per texel: a texel's light is
+`(not blocked by a mesh) × (splat transmittance)`.
+
+**Wiring.**
+
+- **The scene** owns the splat shadow texture and binds it for every lit draw, but only
+  reads it where a view sets `splatShadows = 1`. In the Scene mode it is never read, even
+  after the Depth Composite mode has drawn into it.
+- **The fusion module** sets `splatShadows = 1` in its view block. It adds the splats'
+  shadow passes with `splat.addShadowPasses()`, given the scene's light block and the
+  texture (`scene.lightBlock()`, `scene.splatShadowAtlas()`).
+
+**Limits.**
+
+- **One distance per texel:** a point between two splats along the same direction is
+  dimmed by both, not only by the nearer one.
+- **Resolution:** at 512 texels per cube face, the far ends of long shadows show their
+  texels.
 
 ## Shader parameters
 

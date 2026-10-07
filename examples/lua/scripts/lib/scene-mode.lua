@@ -191,12 +191,20 @@ return function(setTitle)
             litWindow = rhi.render_pipeline { shader = "scene/lit.slang", depth = true },
             litTexture = rhi.render_pipeline { shader = "scene/lit.slang", format = "rgba16f", depth = true },
             shadowAtlas = rhi.texture { width = 3 * SHADOW_FACE_SIZE, height = 2 * SHADOW_FACE_SIZE, format = "r32f" },
+            -- Translucent shadows of other things (the fusion example's splats), in the same
+            -- layout; read by the lit shader only where a view sets splatShadows = 1.
+            splatShadowAtlas = rhi.texture { width = 3 * SHADOW_FACE_SIZE, height = 2 * SHADOW_FACE_SIZE, format = "rgba16f" },
         }
 
         -- Parameter blocks. Each object has one with its mesh, transform and material;
         -- the light, the shadow atlas and each camera have one shared by every draw.
         blocks.light = rhi.params { light = light }
-        blocks.shadowMap = rhi.params { shadowMap = resources.shadowAtlas, shadowFaceSize = SHADOW_FACE_SIZE }
+        blocks.shadowMap = rhi.params {
+            shadowMap = resources.shadowAtlas,
+            shadowFaceSize = SHADOW_FACE_SIZE,
+            splatShadowMap = resources.splatShadowAtlas,
+            splatShadows = 0,
+        }
         blocks.generate = rhi.params {
             subdivision = sphere.subdivision,
             radius = sphere.radius,
@@ -246,8 +254,22 @@ return function(setTitle)
         if object.isSphere then sphereDraws[#sphereDraws + 1] = draw end
     end
 
+    -- The parameter block with the light, for other things that cast shadows.
+    function scene.lightBlock()
+        scene.createResources()
+        return blocks.light
+    end
+
+    -- Where other things draw translucent shadows for the lit pass to read: the texture,
+    -- and the size of its cube-face cells (laid out as in scene-common.slang).
+    function scene.splatShadowAtlas()
+        local r = scene.createResources()
+        return r.splatShadowAtlas, SHADOW_FACE_SIZE
+    end
+
     -- Adds what every view of the scene needs first: the sphere's generator, and the six
-    -- shadow passes that render the shadow atlas.
+    -- shadow passes that render the shadow atlas. Returns those passes, faces 0..5 in
+    -- order, so that other shadow casters can be drawn into them too.
     function scene.addShadowPasses(g)
         local r = scene.createResources()
         generateNodes[#generateNodes + 1] = g:dispatch {
@@ -257,6 +279,7 @@ return function(setTitle)
             threads = { sphere.subdivision, sphere.subdivision, 6 }, -- one thread per quad, per face
             once = true,
         }
+        local passes = {}
         for face = 0, 5 do
             local pass = g:render_pass {
                 name = "shadow face " .. face,
@@ -271,7 +294,9 @@ return function(setTitle)
                     addDraw(pass, object, r.shadow, { blocks.light, faceBlock })
                 end
             end
+            passes[#passes + 1] = pass
         end
+        return passes
     end
 
     -- Adds a pass that draws the lit scene from a camera. `options`:

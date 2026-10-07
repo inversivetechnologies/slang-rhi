@@ -2,9 +2,8 @@
 // the rasterizer needs -- the ellipse it covers on screen, its color as seen from the
 // camera, and a depth to sort by.
 //
-// The splats come straight from the PLY file (rhi.load_ply), as records of floats whose
-// layout the script passes in `ply`. Following "3D Gaussian Splatting for Real-Time
-// Radiance Field Rendering" (Kerbl et al. 2023):
+// The splats are read and placed by ply.slang. Following "3D Gaussian Splatting for
+// Real-Time Radiance Field Rendering" (Kerbl et al. 2023):
 //
 //   - the 3D covariance is built from the splat's rotation and scale: R S S^T R^T
 //   - it is projected to 2D with the Jacobian of the perspective projection (EWA splatting)
@@ -12,19 +11,7 @@
 //     from the camera
 
 #include "splat-common.slang"
-
-// Where each property sits in a splat's record (offsets in floats).
-struct PlyLayout
-{
-    uint stride;    // floats per splat
-    uint position;  // x, y, z
-    uint rotation;  // rot_0..3: quaternion w, x, y, z (not normalized)
-    uint scale;     // scale_0..2: log of the scale along each axis
-    uint opacity;   // logit of the opacity
-    uint dc;        // f_dc_0..2: spherical harmonics band 0, per channel
-    uint rest;      // f_rest_*: the higher bands, all of red's, then green's, then blue's
-    uint restCount; // number of f_rest floats: 0, 9, 24 or 45 (degree 0 to 3)
-};
+#include "ply.slang"
 
 struct SplatCamera
 {
@@ -33,33 +20,13 @@ struct SplatCamera
     float3 target;
 };
 
-// Places the splats in the world: scaled, turned about the vertical axis, then moved
-// (after the optional y/z flip). The identity is { position = 0, yaw = 0, scale = 1 }.
-struct SplatModel
-{
-    float3 position;
-    float yaw;
-    float scale;
-};
-
-StructuredBuffer<float> plyData;
-uniform PlyLayout ply;
-uniform uint splatCount;
 uniform uint sortCount;      // splatCount padded to the sort's power of two
 uniform SplatCamera camera;
-uniform uint flipYZ;         // 1: the scene is y-down (as COLMAP captures are); turn it upright
-uniform SplatModel model;
-uniform float splatScale;    // multiplies every splat's size; 1 is as trained
 uniform float2 viewportSize; // provided by the host
 
 RWStructuredBuffer<ProjectedSplat> projected;
 RWStructuredBuffer<float> sortKeys;
 RWStructuredBuffer<uint> sortValues;
-
-float3 loadFloat3(uint index)
-{
-    return float3(plyData[index], plyData[index + 1], plyData[index + 2]);
-}
 
 // Spherical harmonics coefficient `k` (0 = band 0) of all three channels.
 float3 shCoefficient(uint base, uint k)
@@ -106,17 +73,6 @@ float3 evaluateColor(uint base, float3 dir)
     return max(color + 0.5, 0.0);
 }
 
-// The rotation matrix of a unit quaternion (w, x, y, z).
-float3x3 quaternionToMatrix(float4 q)
-{
-    float w = q.x, x = q.y, y = q.z, z = q.w;
-    return float3x3(
-        1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
-        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
-        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)
-    );
-}
-
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void preprocessMain(uint3 tid: SV_DispatchThreadID)
@@ -133,19 +89,18 @@ void preprocessMain(uint3 tid: SV_DispatchThreadID)
     {
         return;
     }
-    uint base = i * ply.stride;
+    uint base = splatBase(i);
 
-    float opacity = 1.0 / (1.0 + exp(-plyData[base + ply.opacity]));
+    float opacity = splatOpacity(base);
     if (opacity < 1.0 / 255.0)
     {
         return;
     }
 
     // The splat's frame to the world: optionally turned upright, then placed by `model`.
-    float3 flip = flipYZ != 0 ? float3(1, -1, -1) : float3(1, 1, 1);
-    float yawCos = cos(model.yaw), yawSin = sin(model.yaw);
-    float3x3 yaw = float3x3(yawCos, 0, yawSin, 0, 1, 0, -yawSin, 0, yawCos);
-    float3 world = mul(yaw, loadFloat3(base + ply.position) * flip * model.scale) + model.position;
+    float3 flip = splatFlip();
+    float3x3 yaw = splatYaw();
+    float3 world = splatWorldPosition(base);
 
     // Into the camera's view: x right, y up, z forward.
     float3 forward = normalize(camera.target - camera.eye);
@@ -158,16 +113,8 @@ void preprocessMain(uint3 tid: SV_DispatchThreadID)
         return;
     }
 
-    // 3D covariance: R S S^T R^T, flipped and placed into the world, then into the view.
-    float4 q = float4(plyData[base + ply.rotation], plyData[base + ply.rotation + 1],
-                      plyData[base + ply.rotation + 2], plyData[base + ply.rotation + 3]);
-    float3x3 rotation = quaternionToMatrix(normalize(q));
-    float3 scale = exp(loadFloat3(base + ply.scale)) * splatScale * model.scale;
-    float3x3 m = float3x3(rotation[0] * scale, rotation[1] * scale, rotation[2] * scale);
-    float3x3 covariance = mul(m, transpose(m));
-    float3x3 flipOuter = float3x3(flip * flip.x, flip * flip.y, flip * flip.z);
-    float3x3 toView = mul(view, yaw);
-    covariance = mul(toView, mul(covariance * flipOuter, transpose(toView)));
+    // 3D covariance (R S S^T R^T, in the world), into the view.
+    float3x3 covariance = mul(view, mul(splatWorldCovariance(base), transpose(view)));
 
     // Project to pixels (y down) and take the Jacobian there. Clamping the point to a bit
     // beyond the frustum keeps splats at the edges from blowing up.
