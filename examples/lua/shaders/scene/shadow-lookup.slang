@@ -101,12 +101,21 @@ float sdfSoftShadow(float3 origin, float3 toLight, float distanceToLight)
     return lit * lit * (3.0 - 2.0 * lit); // smooth the penumbra's falloff
 }
 
-// Fraction of the light reaching a point (0: in shadow, 1: lit), averaged over a 3x3 texel
-// neighborhood for soft edges: blocked by the meshes, dimmed by the splats in front of it,
-// and shaded softly by the SDF composition. `d` is the point minus the light's position;
-// `bias` how far the point counts as nearer to the light than it is, so that a surface
-// doesn't shadow itself.
-float shadowVisibility(float3 d, float bias)
+// The size of a shadow map texel at `distance` from the light: a cube face spans 90
+// degrees, 2 x distance across, over shadowFaceSize texels.
+float shadowTexelSize(float distance)
+{
+    return 2.0 * distance / float(shadowFaceSize);
+}
+
+// Fraction of the light reaching a point (0: in shadow, 1: lit), averaged over a 3x3 grid
+// of texels `spacing` texels apart (1: the texel and its neighbors), for soft edges:
+// blocked by the meshes, dimmed by the splats in front of it, and shaded softly by the SDF
+// composition. `d` is the point minus the light's position; `bias` how far the point
+// counts as nearer to the light than it is, so that a surface doesn't shadow itself. A
+// receiver that covers many texels (a merged splat of the levels of detail) samples them
+// that far apart, so it gets the average over its extent rather than over one spot.
+float shadowVisibilitySpread(float3 d, float bias, float spacing)
 {
     float current = length(d) - bias;
     uint face = cubeFaceOf(d);
@@ -120,7 +129,8 @@ float shadowVisibility(float3 d, float bias)
         for (int x = -1; x <= 1; ++x)
         {
             // Stay inside this face's cell: the next cell over is a different view.
-            int3 p = int3(origin + clamp(int2(texel) + int2(x, y), int2(0, 0), int2(last, last)), 0);
+            int2 offset = int2(round(float2(x, y) * spacing));
+            int3 p = int3(origin + clamp(int2(texel) + offset, int2(0, 0), int2(last, last)), 0);
             if (current <= shadowMap.Load(p)) // not behind a mesh
             {
                 float transmittance = 1.0;
@@ -139,4 +149,9 @@ float shadowVisibility(float3 d, float bias)
         visibility *= sdfSoftShadow(lightPosition() + d, -d / distanceToLight, distanceToLight - bias);
     }
     return visibility;
+}
+
+float shadowVisibility(float3 d, float bias)
+{
+    return shadowVisibilitySpread(d, bias, 1.0);
 }

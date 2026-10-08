@@ -1,21 +1,43 @@
 // Splat shadows, levels of detail: every frame, picks the splats the shadow passes draw
-// (shadow.slang), as preprocess.slang picks the ones the camera sees -- a cut through the
-// tree of merged splats (splat-lod.h), but measured from the light, against the shadow
-// map's resolution. The picked splats' indices are packed into `shadowList`.
+// (shadow.slang), as lod.slang and preprocess.slang pick the ones the camera sees -- the
+// cut through the tree of merged splats (splat-lod.h) that fits a budget, but measured
+// from the light, in shadow map texels, and over every direction (a cube map culls
+// nothing). The picked splats and their instances are packed into `shadowList`.
 //
-// Run as resetShadowMain (one thread), then selectShadowMain (one thread per splat,
-// merged ones included).
+// Run, every frame: lodClearMain, lodHistogramLightMain, lodPickMain (with the shadows'
+// budget), resetShadowMain, then selectShadowMain -- one thread per splat and instance for
+// the histogram and the selection.
 
-#include "ply.slang"
+#include "lod.slang"
 #include "scene/scene-common.slang"
 
-StructuredBuffer<float4> lodBounds; // per splat: its bounds, then its parent's
-uniform uint lodEnabled;            // 0: no merged splats; every one of the file's casts
-uniform float lodShadowTexels;      // small enough: a bounds radius of this many shadow map texels
-uniform float shadowFaceSize;       // texels across a cube face of the shadow map
+uniform float shadowFaceSize; // texels across a cube face of the shadow map
+uniform uint shadowCapacity;  // what shadowList holds
 
-RWStructuredBuffer<uint> shadowList;  // the picked splats, packed
-RWStructuredBuffer<uint> shadowCount; // [0]: how many
+RWStructuredBuffer<uint2> shadowList; // the picked splats and their instances, packed
+RWStructuredBuffer<uint> shadowCount; // [0]: how many (no more than shadowCapacity are kept)
+
+LodView lightLodView()
+{
+    LodView v;
+    v.eye = lightPosition();
+    // A cube face spans 90 degrees: its focal length is half its size, in texels.
+    v.focal = shadowFaceSize * 0.5;
+    v.right = float3(1, 0, 0);
+    v.up = float3(0, 1, 0);
+    v.forward = float3(0, 0, 1);
+    v.tanX = 1;
+    v.tanY = 1;
+    v.cull = 0;
+    return v;
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void lodHistogramLightMain(uint3 tid: SV_DispatchThreadID, uint groupIndex: SV_GroupIndex)
+{
+    lodHistogramBody(lightLodView(), tid, groupIndex);
+}
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
@@ -29,19 +51,13 @@ void resetShadowMain()
 void selectShadowMain(uint3 tid: SV_DispatchThreadID)
 {
     uint i = tid.x;
-    if (i >= splatCount)
+    uint instance = tid.y;
+    if (i >= splatCount || instance >= instanceCount)
     {
         return;
     }
-    bool picked = true;
-    if (lodEnabled != 0)
-    {
-        // A cube face spans 90 degrees: its focal length is half its size, in texels.
-        float focal = shadowFaceSize * 0.5;
-        float3 lightPos = lightPosition();
-        picked = lodSmallEnough(lodBounds[2 * i], lightPos, focal, lodShadowTexels) &&
-                 !lodSmallEnough(lodBounds[2 * i + 1], lightPos, focal, lodShadowTexels);
-    }
+    beginInstance(instance);
+    bool picked = lodInCut(lightLodView(), i);
     // [branch]: D3D11's fxc otherwise flattens the writes, and fails ("flattened side
     // effect").
     [branch]
@@ -49,6 +65,9 @@ void selectShadowMain(uint3 tid: SV_DispatchThreadID)
     {
         uint slot;
         InterlockedAdd(shadowCount[0], 1, slot);
-        shadowList[slot] = i;
+        if (slot < shadowCapacity)
+        {
+            shadowList[slot] = uint2(i, instance);
+        }
     }
 }

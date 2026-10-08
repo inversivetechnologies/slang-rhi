@@ -10,13 +10,16 @@
 // and about their coverage. It is appended to the file's records in the same layout, so
 // every shader that reads a splat reads a merged one the same way.
 //
-// For choosing which splats to draw, every entry (leaves and inner nodes) also gets two
-// spheres: its own bounds and its parent's. A node's sphere contains its children's, so
-// any measure of on-screen size that grows with radius and shrinks with distance never
-// grows from a node to its children. Drawing an entry exactly when it is small enough and
-// its parent isn't then draws one entry on every path from the root to a leaf: a
-// consistent cut through the tree, decided by each entry on its own (in parallel, on the
-// GPU: shaders/splat/preprocess.slang).
+// For choosing which splats to draw, every node gets a bounding sphere, which contains its
+// children's (a leaf's is a point: it is always small enough), and every entry knows its
+// parent. So any measure of on-screen size that grows with radius and shrinks with
+// distance never grows from a node to its children. Drawing an entry exactly when it is
+// small enough and its parent isn't then draws one entry on every path from the root to a
+// leaf: a consistent cut through the tree, decided by each entry on its own (in parallel,
+// on the GPU: shaders/splat/lod.slang).
+//
+// The file's splats are reordered to the tree's order: siblings are next to each other, so
+// that neighboring GPU threads read the same parent.
 
 #include <cstdint>
 #include <string>
@@ -46,15 +49,19 @@ struct Result
     uint32_t leafCount = 0;  // the file's splats: entries 0 .. leafCount - 1
     uint32_t entryCount = 0; // leaves and inner nodes
     uint32_t levels = 0;     // the tree's depth: leaves are level 0
-    // Per entry, 8 floats: own bounds (center xyz, radius; radius 0 for a leaf, which is
-    // always small enough), then the parent's (center xyz, radius; radius -1 at the root,
-    // whose parent is never small enough). In the file's frame.
-    std::vector<float> bounds;
+    // Per entry, its parent's entry index; UINT32_MAX at the root.
+    std::vector<uint32_t> parent;
+    // Per node (entry leafCount + k is node k), 4 floats: its bounding sphere's center and
+    // radius, in the file's frame.
+    std::vector<float> nodeBounds;
     // Per entry, its level: 0 for a leaf, the height above the leaves for a node.
     std::vector<uint32_t> level;
+    // The reordering: leaf k is the file's splat order[k].
+    std::vector<uint32_t> order;
 };
 
-// Appends the inner nodes' records to `data` (leafCount records of layout.stride floats).
+// Reorders the file's records in `data` (leafCount records of layout.stride floats) to the
+// tree's order, and appends the inner nodes' records.
 Result build(const Layout& layout, std::vector<float>& data, uint32_t leafCount);
 
 // As build, but through a cache file: if `cachePath` holds levels built for the same

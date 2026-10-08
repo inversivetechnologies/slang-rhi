@@ -25,13 +25,17 @@
 // vertex shader.
 //
 // Which splats: the ones shadow-select.slang picked this frame (the levels of detail, seen
-// from the light), packed in `shadowList`. Triangles past the picked ones draw nothing.
+// from the light), with their instances, packed in `shadowList`. Each is placed by its
+// instance here. Triangles past the picked ones draw nothing.
 
 #include "scene/shadow-lookup.slang"
+#include "splat/ply.slang"
+#include "splat/clip.slang"
 
-StructuredBuffer<float4> shadowCasters; // see shadow-casters.slang
-StructuredBuffer<uint> shadowList;      // the splats to draw (shadow-select.slang)
-StructuredBuffer<uint> shadowCount;     // [0]: how many
+StructuredBuffer<float4> shadowCasters; // see shadow-casters.slang: in the file's frame
+StructuredBuffer<uint2> shadowList;     // the splats to draw and their instances (shadow-select.slang)
+StructuredBuffer<uint> shadowCount;     // [0]: how many (maybe more than fit)
+uniform uint shadowCapacity;            // how many fit
 uniform uint face;                      // which cube face this draw renders
 
 struct VertexOutput
@@ -40,7 +44,39 @@ struct VertexOutput
     float3 world : WORLD;
     float2 offset : OFFSET; // position on the ellipse, in units of its 3-sigma half axes
     nointerpolation float opacity : OPACITY;
+    // Clipping per pixel (clip.slang), as render.slang does, along rays from the light:
+    // the picked splat's slot in shadowList + 1, or 0 not to clip.
+    nointerpolation uint clipSlot : CLIP;
 };
+
+// A picked splat's center and covariance in the world: its caster, placed by its instance.
+void placedCaster(uint2 picked, out float4 centerOpacity, out float3x3 covariance)
+{
+    centerOpacity = shadowCasters[3 * picked.x];
+    float4 c0 = shadowCasters[3 * picked.x + 1];
+    float4 c1 = shadowCasters[3 * picked.x + 2];
+    float3x3 fileCovariance = float3x3(c0.x, c0.y, c0.z, c0.y, c0.w, c1.x, c0.z, c1.x, c1.y);
+    beginInstance(picked.y);
+    centerOpacity.xyz = splatPlace(centerOpacity.xyz);
+    float3x3 yaw = splatYaw();
+    covariance = mul(yaw, mul(fileCovariance, transpose(yaw))) * (placement.scale * placement.scale);
+}
+
+// Whether the fragment is clipped away: the splat's densest point along the ray from the
+// light through it is outside what the clip field keeps.
+bool clippedAway(VertexOutput input)
+{
+    if (input.clipSlot == 0)
+    {
+        return false;
+    }
+    float4 centerOpacity;
+    float3x3 covariance;
+    placedCaster(shadowList[input.clipSlot - 1], centerOpacity, covariance);
+    float3 lightPos = lightPosition();
+    float3 ray = normalize(input.world - lightPos);
+    return clipAtRay(lightPos, ray, centerOpacity.xyz, covariance) < 0;
+}
 
 // How opaque a splat must be at a texel to count as the nearest splat there.
 static const float kNearestOpacity = 0.2;
@@ -56,21 +92,21 @@ VertexOutput vertexMain(uint vertexId: SV_VertexID)
     output.world = float3(0, 0, 0);
     output.offset = float2(0, 0);
     output.opacity = 0;
+    output.clipSlot = 0;
 
     uint slot = vertexId / 3;
-    if (slot >= shadowCount[0])
+    if (slot >= min(shadowCount[0], shadowCapacity))
     {
         return output;
     }
-    uint splat = shadowList[slot];
-    float4 centerOpacity = shadowCasters[3 * splat];
+    // Into the world, by its instance: turned and scaled like its center.
+    float4 centerOpacity;
+    float3x3 covariance;
+    placedCaster(shadowList[slot], centerOpacity, covariance);
     if (centerOpacity.w <= 0)
     {
         return output;
     }
-    float4 c0 = shadowCasters[3 * splat + 1];
-    float4 c1 = shadowCasters[3 * splat + 2];
-    float3x3 covariance = float3x3(c0.x, c0.y, c0.z, c0.y, c0.w, c1.x, c0.z, c1.x, c1.y);
 
     float3 lightPos = lightPosition();
     float3 d = centerOpacity.xyz - lightPos;
@@ -78,6 +114,11 @@ VertexOutput vertexMain(uint vertexId: SV_VertexID)
     // Skip splats this face can't see: behind it, or outside its 90-degree frustum. Three
     // sigma along the largest axis bounds the splat.
     float extent = 3.0 * sqrt(max(covariance[0][0], max(covariance[1][1], covariance[2][2])) * 3.0);
+    uint clipClass = clipClassify(centerOpacity.xyz, extent);
+    if (clipClass == 2)
+    {
+        return output; // cut away wholly: casts nothing
+    }
     CubeFace f = cubeFace(face);
     float z = dot(d, f.forward);
     if (z + extent < kShadowNear || abs(dot(d, f.right)) > z + 2 * extent || abs(dot(d, f.up)) > z + 2 * extent)
@@ -109,6 +150,7 @@ VertexOutput vertexMain(uint vertexId: SV_VertexID)
     output.world = world;
     output.offset = corner;
     output.opacity = centerOpacity.w;
+    output.clipSlot = clipClass == 1 ? slot + 1 : 0;
     return output;
 }
 
@@ -117,7 +159,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
 {
     // The Gaussian falls off over the half axes, which are 3 sigma long: exp(-(3r)^2 / 2).
     float alpha = min(0.99, input.opacity * exp(-4.5 * dot(input.offset, input.offset)));
-    if (alpha < 1.0 / 255.0)
+    if (alpha < 1.0 / 255.0 || clippedAway(input))
     {
         discard;
     }
@@ -134,7 +176,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
 float4 layersFragmentMain(VertexOutput input) : SV_Target
 {
     float alpha = min(0.99, input.opacity * exp(-4.5 * dot(input.offset, input.offset)));
-    if (alpha < 1.0 / 255.0)
+    if (alpha < 1.0 / 255.0 || clippedAway(input))
     {
         discard;
     }

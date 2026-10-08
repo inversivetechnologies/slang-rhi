@@ -8,9 +8,7 @@
 #pragma once
 
 #include "mesh/mesh-vertex.slang"
-
-// Seconds since start; provided by the host to every draw that declares it.
-uniform float time;
+#include "common/time.slang"
 
 struct PointLight
 {

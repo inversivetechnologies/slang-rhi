@@ -33,9 +33,10 @@
 --
 --   Mouse drag      orbit the camera          Mouse wheel   zoom
 --   V               combined / mesh only / splats only / SDFs only / depth buffers
---   L               splats lit by the point light / as captured (only shadowed)
+--   L               splats lit by the point light / as captured (only shadowed) /
+--                   only the light reaching them (to see the shadows)
 --   [ / ]           splat size                J / K         SDF blend radii /1.25 / x1.25
---   , / .           splat LOD threshold       /             tint the splats by LOD level
+--   , / .           splat budget /1.25 x1.25  /             tint the splats by LOD level
 --   Tab             show / hide the second camera
 --   other keys      as in the scene
 
@@ -104,15 +105,17 @@ return function(scene, splat, setTitle)
         }
     end
 
-    -- 1: the splats lit by the point light; 0: their captured colors, only shadowed.
-    local relight = 1
+    -- How the splats are lit: by the point light; their captured colors, only shadowed; or
+    -- only the light reaching them (white to black), to see the shadows.
+    local LIGHTINGS = { "lit by the light", "as captured", "light visibility" }
+    local lighting = 1
     -- Multiplies every blend radius of the SDF composition.
     local smoothScale = 1
     local sdfInfo = ""
 
     local function updateTitle()
         setTitle(string.format("showing %s (V) | splats %s (L) | SDF %s, blend x%.2f (J/K)", SHOW_MODES[showMode],
-            relight == 1 and "lit by the light" or "as captured", sdfInfo, smoothScale))
+            LIGHTINGS[lighting], sdfInfo, smoothScale))
     end
 
     -- The color textures and depth buffers one view renders into, one pair per side:
@@ -133,8 +136,9 @@ return function(scene, splat, setTitle)
     -- Adds one view of the composite to the graph: the meshes, the SDFs and the splats,
     -- each into its own targets, combined by depth into `target` (the window if nil).
     -- `views` is the list of blocks the passes see the world through (camera last).
+    -- `budgetScale` is the view's share of the splat budget (1 if nil).
     -- Returns the composite's parameter block, and the nodes added.
-    local function addView(g, prefix, views, targets, target, encodeGamma)
+    local function addView(g, prefix, views, targets, target, encodeGamma, budgetScale)
         local nodes = {}
         nodes[#nodes + 1] = scene.addCameraPass(g, {
             name = prefix .. "mesh",
@@ -166,6 +170,7 @@ return function(scene, splat, setTitle)
             depthTarget = targets.splatDepth,
             -- Lit by the scene's light, and shadowed by the meshes and by each other.
             lighting = { scene.lightBlock(), scene.shadowBlock() },
+            budgetScale = budgetScale,
         })
         for _, node in ipairs(splatNodes) do nodes[#nodes + 1] = node end
 
@@ -267,8 +272,10 @@ return function(scene, splat, setTitle)
         local _, side = insetLayout(width, height)
         blocks.second = rhi.params { camera = scene.secondCamera(), viewportSize = { side, side } }
         local nodes
+        -- Its square is a small part of the window: it gets that share of the splat budget
+        -- (about a tenth), for about the same detail.
         blocks.secondComposite, nodes = addView(graph, "second camera: ", { blocks.view, blocks.second },
-            createTargets(INSET_SCALE, "square"), insetColor, 0)
+            createTargets(INSET_SCALE, "square"), insetColor, 0, INSET_SCALE * INSET_SCALE)
 
         -- ...framed, on top of the main view in the lower right corner.
         insetPass = graph:render_pass { name = "second camera inset", viewport = insetLayout(width, height) }
@@ -317,8 +324,9 @@ return function(scene, splat, setTitle)
             blocks.sdf.smoothScale = smoothScale
             updateTitle()
         elseif key == keys.L and action == input.PRESS then
-            relight = 1 - relight
-            splat.setRelight(relight)
+            lighting = lighting % #LIGHTINGS + 1
+            splat.setRelight(lighting == 2 and 0 or 1)
+            splat.setShowVisibility(lighting == 3)
             updateTitle()
         elseif key == keys.LEFT_BRACKET or key == keys.RIGHT_BRACKET or key == keys.COMMA or key == keys.PERIOD
             or key == keys.SLASH then

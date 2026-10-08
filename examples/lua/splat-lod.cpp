@@ -300,8 +300,14 @@ struct Builder
         g.radius = std::max(g.radius, 3.0 * std::max({s[0], s[1], s[2]})) * 1.0001;
         g.area = s[0] * s[1] + s[1] * s[2] + s[0] * s[2];
         // About the same coverage: the children's opacity times area, spread over the
-        // merged splat's area.
-        g.alpha = std::clamp(total / std::max(g.area, 1e-30), 1e-4, 0.99);
+        // merged splat's area -- but no more transparent than its most opaque child. The
+        // merged Gaussian is wider and softer than the children it stands for; spreading
+        // their opacity over all of it would let a solid surface turn see-through (the
+        // background showing through in specks, light leaking through the shadow maps).
+        double mostOpaque = 0;
+        for (uint32_t c : children)
+            mostOpaque = std::max(mostOpaque, entries[c].alpha);
+        g.alpha = std::clamp(std::max(total / std::max(g.area, 1e-30), mostOpaque), 1e-4, 0.99);
 
         // Its record: every property a weighted average of the children's (the spherical
         // harmonics among them), then position, scale, rotation and opacity set.
@@ -400,6 +406,36 @@ Layout findLayout(const std::vector<std::string>& properties)
     return layout;
 }
 
+// Reorders the first order.size() records in place: record k becomes the one that was at
+// order[k]. Follows each cycle of the permutation with one record of scratch.
+void permuteRecords(std::vector<float>& data, uint32_t stride, const std::vector<uint32_t>& order)
+{
+    std::vector<bool> done(order.size(), false);
+    std::vector<float> scratch(stride);
+    for (size_t start = 0; start < order.size(); ++start)
+    {
+        if (done[start] || order[start] == start)
+        {
+            done[start] = true;
+            continue;
+        }
+        std::copy_n(&data[start * stride], stride, scratch.data());
+        size_t k = start;
+        while (true)
+        {
+            done[k] = true;
+            size_t from = order[k];
+            if (from == start)
+            {
+                std::copy_n(scratch.data(), stride, &data[k * stride]);
+                break;
+            }
+            std::copy_n(&data[from * stride], stride, &data[k * stride]);
+            k = from;
+        }
+    }
+}
+
 Result build(const Layout& layout, std::vector<float>& data, uint32_t leafCount)
 {
     Result result;
@@ -432,39 +468,36 @@ Result build(const Layout& layout, std::vector<float>& data, uint32_t leafCount)
 
     result.entryCount = uint32_t(b.entries.size());
     result.levels = b.level[root] + 1;
-    result.bounds.resize(size_t(result.entryCount) * 8);
     result.level = b.level;
-    for (uint32_t e = 0; e < result.entryCount; ++e)
+    uint32_t nodeCount = result.entryCount - leafCount;
+    result.nodeBounds.resize(size_t(nodeCount) * 4);
+    for (uint32_t k = 0; k < nodeCount; ++k)
     {
-        float* out = &result.bounds[size_t(e) * 8];
-        const Gaussian& g = b.entries[e];
+        const Gaussian& g = b.entries[leafCount + k];
         for (int a = 0; a < 3; ++a)
-            out[a] = float(g.mean[a]);
-        out[3] = e < leafCount ? 0.0f : float(g.radius);
-        uint32_t p = b.parent[e];
-        if (p == UINT32_MAX)
-        {
-            out[4] = out[5] = out[6] = 0.0f;
-            out[7] = -1.0f;
-        }
-        else
-        {
-            const Gaussian& pg = b.entries[p];
-            for (int a = 0; a < 3; ++a)
-                out[4 + a] = float(pg.mean[a]);
-            out[7] = float(pg.radius);
-        }
+            result.nodeBounds[size_t(k) * 4 + a] = float(g.mean[a]);
+        result.nodeBounds[size_t(k) * 4 + 3] = float(g.radius);
     }
+
+    // The leaves in the tree's order: leaf k is the file's splat order[k].
+    result.parent.resize(result.entryCount);
+    for (uint32_t k = 0; k < leafCount; ++k)
+        result.parent[k] = b.parent[b.order[k]];
+    for (uint32_t e = leafCount; e < result.entryCount; ++e)
+        result.parent[e] = b.parent[e];
+    permuteRecords(data, layout.stride, b.order);
+    result.order = std::move(b.order);
     return result;
 }
 
 namespace {
 
-// The cache file: this header, then the merged records, the bounds and the levels.
+// The cache file: this header, then the leaves' order, the merged records, the parents,
+// the nodes' bounds and the levels.
 struct CacheHeader
 {
     char magic[8] = {'S', 'P', 'L', 'A', 'T', 'L', 'O', 'D'};
-    uint32_t version = 1;
+    uint32_t version = 3;
     uint32_t stride = 0;
     uint32_t leafCount = 0;
     uint32_t entryCount = 0;
@@ -472,6 +505,18 @@ struct CacheHeader
     uint32_t reserved = 0;
     uint64_t sourceKey = 0;
 };
+
+template<typename T>
+bool readArray(std::ifstream& file, T* out, size_t count)
+{
+    return bool(file.read(reinterpret_cast<char*>(out), std::streamsize(count * sizeof(T))));
+}
+
+template<typename T>
+void writeArray(std::ofstream& file, const T* data, size_t count)
+{
+    file.write(reinterpret_cast<const char*>(data), std::streamsize(count * sizeof(T)));
+}
 
 bool readCache(const std::string& path, const CacheHeader& expected, std::vector<float>& data, Result& result)
 {
@@ -487,22 +532,26 @@ bool readCache(const std::string& path, const CacheHeader& expected, std::vector
         return false;
     size_t nodes = header.entryCount - header.leafCount;
     size_t leafFloats = size_t(header.leafCount) * header.stride;
-    std::vector<float> bounds(size_t(header.entryCount) * 8);
-    std::vector<uint32_t> level(header.entryCount);
-    data.resize(leafFloats + nodes * header.stride);
-    bool ok = file.read(reinterpret_cast<char*>(data.data() + leafFloats), std::streamsize(nodes * header.stride * sizeof(float))) &&
-              file.read(reinterpret_cast<char*>(bounds.data()), std::streamsize(bounds.size() * sizeof(float))) &&
-              file.read(reinterpret_cast<char*>(level.data()), std::streamsize(level.size() * sizeof(uint32_t)));
-    if (!ok)
-    {
-        data.resize(leafFloats);
+    Result r;
+    r.leafCount = header.leafCount;
+    r.entryCount = header.entryCount;
+    r.levels = header.levels;
+    r.order.resize(header.leafCount);
+    r.parent.resize(header.entryCount);
+    r.nodeBounds.resize(nodes * 4);
+    r.level.resize(header.entryCount);
+    std::vector<float> merged(nodes * header.stride);
+    if (!readArray(file, r.order.data(), r.order.size()) || !readArray(file, merged.data(), merged.size()) ||
+        !readArray(file, r.parent.data(), r.parent.size()) || !readArray(file, r.nodeBounds.data(), r.nodeBounds.size()) ||
+        !readArray(file, r.level.data(), r.level.size()))
         return false;
-    }
-    result.leafCount = header.leafCount;
-    result.entryCount = header.entryCount;
-    result.levels = header.levels;
-    result.bounds = std::move(bounds);
-    result.level = std::move(level);
+    for (uint32_t k = 0; k < header.leafCount; ++k)
+        if (r.order[k] >= header.leafCount)
+            return false;
+    data.resize(leafFloats);
+    permuteRecords(data, header.stride, r.order);
+    data.insert(data.end(), merged.begin(), merged.end());
+    result = std::move(r);
     return true;
 }
 
@@ -517,9 +566,11 @@ void writeCache(const std::string& path, CacheHeader header, const std::vector<f
             return;
         size_t leafFloats = size_t(result.leafCount) * header.stride;
         file.write(reinterpret_cast<const char*>(&header), sizeof(header));
-        file.write(reinterpret_cast<const char*>(data.data() + leafFloats), std::streamsize((data.size() - leafFloats) * sizeof(float)));
-        file.write(reinterpret_cast<const char*>(result.bounds.data()), std::streamsize(result.bounds.size() * sizeof(float)));
-        file.write(reinterpret_cast<const char*>(result.level.data()), std::streamsize(result.level.size() * sizeof(uint32_t)));
+        writeArray(file, result.order.data(), result.order.size());
+        writeArray(file, data.data() + leafFloats, data.size() - leafFloats);
+        writeArray(file, result.parent.data(), result.parent.size());
+        writeArray(file, result.nodeBounds.data(), result.nodeBounds.size());
+        writeArray(file, result.level.data(), result.level.size());
         if (!file)
             return;
     }

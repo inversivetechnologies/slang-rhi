@@ -2425,7 +2425,6 @@ public:
         }
     }
 
-    // A dispatch's `threads`: {x, y, z}, or "window" for one thread per window pixel.
     // A dispatch's `threads`: {x, y, z}; "window" for one thread per window pixel; or a
     // texture, for one thread per texel (its size is then the dispatch's viewportSize).
     static void readDispatchThreads(lua_State* L, int index, GraphNode& node)
@@ -3142,11 +3141,13 @@ public:
     // (mean, and the root of the summed variances), for framing a camera.
     //
     // A file of Gaussian splats (x, y, z, scale_*, rot_*, opacity, f_dc_*) also gets
-    // levels of detail (splat-lod.h), unless `lod = false`: merged splats appended to the
-    // buffer after the file's `count`, and `lod = { count, nodes, levels, bounds, level,
-    // seconds }` -- count is all entries (file's splats and merged ones), nodes the merged
-    // ones, bounds a buffer of 8 floats per entry (its bounds and its parent's), level a
-    // buffer of a uint per entry, seconds the time the build took.
+    // levels of detail (splat-lod.h), unless `lod = false`: its splats reordered (to the
+    // tree's order), merged splats appended to the buffer after the file's `count`, and
+    // `lod = { count, nodes, levels, bounds, parents, level, seconds }` -- count is all
+    // entries (file's splats and merged ones), nodes the merged ones, bounds a buffer of a
+    // float4 per merged splat (its bounding sphere), parents and level buffers of a uint
+    // per entry (its parent's entry, 0xFFFFFFFF at the root; its level), seconds the time
+    // the build or the cache read took.
     static int apiLoadPly(lua_State* L)
     {
         LuaApp* app = requireDevice(L);
@@ -3212,8 +3213,10 @@ public:
             lua_setfield(L, -2, "levels");
             lua_pushnumber(L, lodSeconds);
             lua_setfield(L, -2, "seconds");
-            pushHandle(L, createDataBuffer(L, lod.bounds.data(), lod.bounds.size() * sizeof(float), "Splat LOD bounds"), kBufferType);
+            pushHandle(L, createDataBuffer(L, lod.nodeBounds.data(), lod.nodeBounds.size() * sizeof(float), "Splat LOD bounds"), kBufferType);
             lua_setfield(L, -2, "bounds");
+            pushHandle(L, createDataBuffer(L, lod.parent.data(), lod.parent.size() * sizeof(uint32_t), "Splat LOD parents"), kBufferType);
+            lua_setfield(L, -2, "parents");
             pushHandle(L, createDataBuffer(L, lod.level.data(), lod.level.size() * sizeof(uint32_t), "Splat LOD levels"), kBufferType);
             lua_setfield(L, -2, "level");
             lua_setfield(L, -2, "lod");

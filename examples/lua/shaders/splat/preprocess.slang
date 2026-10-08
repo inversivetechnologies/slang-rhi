@@ -2,12 +2,12 @@
 // the rasterizer needs -- the ellipse it covers on screen, its color as seen from the
 // camera, and a depth to sort by.
 //
-// Levels of detail: the splats include merged ones (built by the host when the file was
-// loaded: splat-lod.h), one per node of a tree over the file's splats. A splat is drawn
-// when it is small enough on screen and its parent isn't -- each decides on its own, and
-// the tree's bounds make sure exactly one splat on every path from the root to a file's
-// splat is drawn. The drawn ones are packed at the front of the sort's buffers (an atomic
-// counter, `drawCount`), so the sort, the lighting and the draw skip the rest.
+// One thread per splat and instance (threads x: splats, y: instances). Levels of detail:
+// the splats include merged ones (built by the host when the file was loaded:
+// splat-lod.h), one per node of a tree over the file's splats, and lod.slang has picked
+// the cut through it that fits the splat budget. Only the splats in that cut go on. The
+// drawn ones are packed at the front of the buffers (an atomic counter, `drawCount`), so
+// the sort, the lighting and the draw skip the rest; the buffers hold at most `sortCount`.
 //
 // The splats are read and placed by ply.slang. Following "3D Gaussian Splatting for
 // Real-Time Radiance Field Rendering" (Kerbl et al. 2023):
@@ -17,24 +17,19 @@
 //   - the color is evaluated from spherical harmonics (up to degree 3) in the direction
 //     from the camera
 
-#include "splat-common.slang"
-#include "ply.slang"
+#include "lod.slang"
 
-uniform uint sortCount;      // splatCount padded to the sort's power of two
-uniform SplatCamera camera;
-uniform float2 viewportSize; // provided by the host
+uniform uint sortCount;      // what the buffers below hold: the most splats drawn, a power of two
 
+// Per drawn splat, in the order they were packed (`slot`):
 RWStructuredBuffer<ProjectedSplat> projected;
-RWStructuredBuffer<float> sortKeys;
+RWStructuredBuffer<uint2> drawnSplats; // which splat and instance it is
+RWStructuredBuffer<float> sortKeys;    // sorted, with sortValues: the slots
 RWStructuredBuffer<uint> sortValues;
 RWStructuredBuffer<uint> drawCount; // [0]: splats drawn this frame (packed at the front)
 
-// Levels of detail.
-StructuredBuffer<float4> lodBounds; // per splat: its bounds, then its parent's (splat-lod.h)
-StructuredBuffer<uint> lodLevel;    // per splat: 0 for the file's, the height above them for merged ones
-uniform uint lodEnabled;            // 0: no merged splats; draw every one of the file's
-uniform float lodPixels;            // a merged splat stands in for its children once its bounds' radius is this small, in pixels
-uniform uint lodShowLevels;         // 1: tint the splats by level
+StructuredBuffer<uint> lodLevel; // per splat: 0 for the file's, the height above them for merged ones
+uniform uint lodShowLevels;      // 1: tint the splats by level
 
 // A color per level, for lodShowLevels.
 float3 levelColor(uint level)
@@ -55,13 +50,18 @@ void resetCountMain()
 }
 
 // After preprocessMain (and the lighting): fills the rest of what the sort will work on
-// with keys that sort last.
+// with keys that sort last. Also holds the count to what the buffers hold, for the sort
+// and the draw (more never fit: preprocessMain drops them).
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void padMain(uint3 tid: SV_DispatchThreadID)
 {
-    uint count = drawCount[0];
+    uint count = min(drawCount[0], sortCount);
     uint i = tid.x;
+    if (i == 0)
+    {
+        drawCount[0] = count;
+    }
     bool padding = i >= count && i < sortSizeFor(count) && i < sortCount;
     // [branch]: D3D11's fxc otherwise flattens the writes, and fails ("flattened side
     // effect").
@@ -123,20 +123,18 @@ float3 evaluateColor(uint base, float3 dir)
 void preprocessMain(uint3 tid: SV_DispatchThreadID)
 {
     uint i = tid.x;
-    if (i >= splatCount)
+    uint instance = tid.y;
+    if (i >= splatCount || instance >= instanceCount)
     {
         return;
     }
-    float focal = viewportSize.y * 0.5 / tan(camera.fovY * 0.5);
-    if (lodEnabled != 0)
+    beginInstance(instance);
+    LodView lodView = cameraLodView();
+    if (!lodInCut(lodView, i))
     {
-        // Drawn if small enough, and its parent isn't (so its parent isn't drawn).
-        if (!lodSmallEnough(lodBounds[2 * i], camera.eye, focal, lodPixels) ||
-            lodSmallEnough(lodBounds[2 * i + 1], camera.eye, focal, lodPixels))
-        {
-            return;
-        }
+        return;
     }
+    float focal = lodView.focal;
     uint base = splatBase(i);
 
     float opacity = splatOpacity(base);
@@ -149,6 +147,14 @@ void preprocessMain(uint3 tid: SV_DispatchThreadID)
     float3 flip = splatFlip();
     float3x3 yaw = splatYaw();
     float3 world = splatWorldPosition(base);
+
+    // Clipping (clip.slang): cut away wholly, or flagged for render.slang to clip per pixel.
+    float3 worldScale = splatWorldScale(base);
+    uint clipClass = clipClassify(world, 3.0 * max(worldScale.x, max(worldScale.y, worldScale.z)));
+    if (clipClass == 2)
+    {
+        return;
+    }
 
     // Into the camera's view: x right, y up, z forward.
     float3 forward = normalize(camera.target - camera.eye);
@@ -206,13 +212,18 @@ void preprocessMain(uint3 tid: SV_DispatchThreadID)
 
     ProjectedSplat splat;
     splat.centerAxis1 = float4(center, axis * radius1);
-    splat.axis2 = float4(float2(-axis.y, axis.x) * radius2, t.z, 0);
+    splat.axis2 = float4(float2(-axis.y, axis.x) * radius2, t.z, clipClass == 1 ? 1.0 : 0.0);
     splat.color = float4(color, opacity);
-    projected[i] = splat;
     // Packed at the front; sorted ascending, so far splats (large z) come first: drawn
     // back to front.
     uint slot;
     InterlockedAdd(drawCount[0], 1, slot);
-    sortKeys[slot] = -t.z;
-    sortValues[slot] = i;
+    [branch]
+    if (slot < sortCount)
+    {
+        projected[slot] = splat;
+        drawnSplats[slot] = uint2(i, instance);
+        sortKeys[slot] = -t.z;
+        sortValues[slot] = slot;
+    }
 }

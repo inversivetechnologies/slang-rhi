@@ -2,10 +2,12 @@
 // draws them.
 
 // A splat after preprocessing: the ellipse it covers on screen, and its color.
+#pragma once
+
 struct ProjectedSplat
 {
     float4 centerAxis1; // xy: center in pixels, zw: the ellipse's first half axis (3 sigma), pixels
-    float4 axis2;       // xy: the second half axis (3 sigma), pixels; z: view depth; w: unused
+    float4 axis2;       // xy: the second half axis (3 sigma), pixels; z: view depth; w: 1 to clip per pixel (clip.slang)
     float4 color;       // rgb: color as trained (display space), a: opacity
 };
 

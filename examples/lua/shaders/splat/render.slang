@@ -7,21 +7,57 @@
 // depthFragmentMain draws the same quads into a depth buffer instead, for compositing
 // with other passes by depth: where a splat is at least fairly opaque, it writes the
 // splat's depth (its center's, for the whole splat), and depth testing keeps the nearest.
+//
+// Clipping (clip.slang): a splat across the clip field's surface is clipped per pixel --
+// its vertices hand the fragments which splat it is, and each fragment finds where the
+// splat is densest along its own ray, and clips there.
 
 #include "splat-common.slang"
+#include "ply.slang"
+#include "clip.slang"
 
 StructuredBuffer<ProjectedSplat> projected;
 StructuredBuffer<float> sortKeys;
 StructuredBuffer<uint> sortValues;
+StructuredBuffer<uint2> drawnSplats; // per drawn splat: which splat and instance it is
 StructuredBuffer<uint> drawCount; // [0]: how many splats are drawn; the rest of the slots aren't
 uniform float2 viewportSize; // provided by the host
+uniform SplatCamera camera;
 
 struct VertexOutput
 {
     float4 position : SV_Position;
     float2 offset : OFFSET; // position on the ellipse, in units of its half axes (3 sigma)
     nointerpolation float4 color : COLOR;
+    // For clipping per pixel: the splat's slot + 1, or 0 not to clip.
+    nointerpolation uint clipSlot : CLIP;
 };
+
+// The ray from the camera through a pixel (SV_Position.xy), as preprocess.slang projects.
+float3 pixelRay(float2 pixel)
+{
+    float3 forward = normalize(camera.target - camera.eye);
+    float3 right = normalize(cross(float3(0, 1, 0), forward));
+    float3 up = cross(forward, right);
+    float tanY = tan(camera.fovY * 0.5);
+    float tanX = tanY * viewportSize.x / viewportSize.y;
+    float2 ndc = float2(pixel.x / viewportSize.x * 2 - 1, 1 - pixel.y / viewportSize.y * 2);
+    return normalize(forward + right * ndc.x * tanX + up * ndc.y * tanY);
+}
+
+// Whether the fragment is clipped away.
+bool clippedAway(VertexOutput input)
+{
+    if (input.clipSlot == 0)
+    {
+        return false;
+    }
+    uint2 drawn = drawnSplats[input.clipSlot - 1];
+    beginInstance(drawn.y);
+    uint base = splatBase(drawn.x);
+    float3 ray = pixelRay(input.position.xy);
+    return clipAtRay(camera.eye, ray, splatWorldPosition(base), splatWorldCovariance(base)) < 0;
+}
 
 static const float2 kCorners[6] = {
     float2(-1, -1), float2(1, -1), float2(1, 1),
@@ -39,6 +75,7 @@ VertexOutput vertexMain(uint vertexId: SV_VertexID)
         output.position = float4(0, 0, 0, 1);
         output.offset = float2(0, 0);
         output.color = float4(0, 0, 0, 0);
+        output.clipSlot = 0;
         return output;
     }
 
@@ -48,6 +85,7 @@ VertexOutput vertexMain(uint vertexId: SV_VertexID)
     output.position = float4(pixel.x / viewportSize.x * 2 - 1, 1 - pixel.y / viewportSize.y * 2, depthFromViewZ(splat.axis2.z), 1);
     output.offset = corner;
     output.color = splat.color;
+    output.clipSlot = splat.axis2.w > 0.5 ? sortValues[slot] + 1 : 0;
     return output;
 }
 
@@ -56,7 +94,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
 {
     // The Gaussian falls off over the half axes, which are 3 sigma long: exp(-(3r)^2 / 2).
     float alpha = min(0.99, input.color.a * exp(-4.5 * dot(input.offset, input.offset)));
-    if (alpha < 1.0 / 255.0)
+    if (alpha < 1.0 / 255.0 || clippedAway(input))
     {
         discard;
     }
@@ -69,7 +107,7 @@ static const float kDepthOpacity = 0.3;
 [shader("fragment")]
 void depthFragmentMain(VertexOutput input)
 {
-    if (input.color.a * exp(-4.5 * dot(input.offset, input.offset)) < kDepthOpacity)
+    if (input.color.a * exp(-4.5 * dot(input.offset, input.offset)) < kDepthOpacity || clippedAway(input))
     {
         discard;
     }

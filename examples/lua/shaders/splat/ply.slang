@@ -6,6 +6,8 @@
 // layout the script passes in `ply`.
 
 // Where each property sits in a splat's record (offsets in floats).
+#pragma once
+
 struct PlyLayout
 {
     uint stride;    // floats per splat
@@ -31,8 +33,37 @@ StructuredBuffer<float> plyData;
 uniform PlyLayout ply;
 uniform uint splatCount;
 uniform uint flipYZ;      // 1: the scene is y-down (as COLMAP captures are); turn it upright
-uniform SplatModel model;
+uniform SplatModel model; // where all the instances go
 uniform float splatScale; // multiplies every splat's size; 1 is as trained
+
+// Instances: copies of all the splats, each placed by its own SplatModel and then by
+// `model`. Two float4s per instance: position and yaw, then scale and three unused.
+StructuredBuffer<float4> instances;
+uniform uint instanceCount;
+
+// The placement the functions below use: set per thread, by beginInstance (or
+// beginFileFrame), before any of them.
+static SplatModel placement;
+
+// Places the splats as instance `instance`, then `model`: the two placements composed.
+void beginInstance(uint instance)
+{
+    float4 positionYaw = instances[2 * instance];
+    float scale = instances[2 * instance + 1].x;
+    float yawCos = cos(model.yaw), yawSin = sin(model.yaw);
+    float3x3 modelYaw = float3x3(yawCos, 0, yawSin, 0, 1, 0, -yawSin, 0, yawCos);
+    placement.position = mul(modelYaw, positionYaw.xyz * model.scale) + model.position;
+    placement.yaw = model.yaw + positionYaw.w;
+    placement.scale = model.scale * scale;
+}
+
+// Leaves the splats in the file's frame: only the flip.
+void beginFileFrame()
+{
+    placement.position = float3(0, 0, 0);
+    placement.yaw = 0;
+    placement.scale = 1;
+}
 
 float3 loadFloat3(uint index)
 {
@@ -56,50 +87,28 @@ float3 splatFlip()
     return flipYZ != 0 ? float3(1, -1, -1) : float3(1, 1, 1);
 }
 
-// The model's turn about the vertical axis.
+// The placement's turn about the vertical axis.
 float3x3 splatYaw()
 {
-    float yawCos = cos(model.yaw), yawSin = sin(model.yaw);
+    float yawCos = cos(placement.yaw), yawSin = sin(placement.yaw);
     return float3x3(yawCos, 0, yawSin, 0, 1, 0, -yawSin, 0, yawCos);
+}
+
+// A point already flipped (in the file's frame, upright) to the world, by the placement.
+float3 splatPlace(float3 flipped)
+{
+    return mul(splatYaw(), flipped * placement.scale) + placement.position;
 }
 
 float3 splatWorldPosition(uint base)
 {
-    return mul(splatYaw(), loadFloat3(base + ply.position) * splatFlip() * model.scale) + model.position;
-}
-
-// Levels of detail (splat-lod.h): whether a splat's bounds (center in the file's frame,
-// radius) look small enough from `viewer`: a radius of at most `threshold` pixels at focal
-// length `focal`. Radius 0: one of the file's splats, always small enough; below 0: the
-// root's parent, never. A splat is drawn when its own bounds are small enough and its
-// parent's aren't.
-bool lodSmallEnough(float4 bounds, float3 viewer, float focal, float threshold)
-{
-    if (bounds.w == 0.0)
-    {
-        return true;
-    }
-    if (bounds.w < 0.0)
-    {
-        return false;
-    }
-    float3 center = mul(splatYaw(), bounds.xyz * splatFlip() * model.scale) + model.position;
-    float radius = bounds.w * model.scale;
-    // The distance to the sphere's nearest point: it only grows from a node to its
-    // children, as the radius only shrinks, so the test never passes for a node and fails
-    // for one of its children.
-    float distance = length(center - viewer) - radius;
-    if (distance <= 0.1)
-    {
-        return false;
-    }
-    return radius * focal / distance <= threshold;
+    return splatPlace(loadFloat3(base + ply.position) * splatFlip());
 }
 
 // The splat's scale along its three axes, in world units.
 float3 splatWorldScale(uint base)
 {
-    return exp(loadFloat3(base + ply.scale)) * splatScale * model.scale;
+    return exp(loadFloat3(base + ply.scale)) * splatScale * placement.scale;
 }
 
 // The rotation matrix of a unit quaternion (w, x, y, z).
