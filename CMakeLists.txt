@@ -1259,7 +1259,7 @@ if(SLANG_RHI_BUILD_EXAMPLES)
             SOURCE_SUBDIR Build
         )
         FetchContent_MakeAvailable(JoltPhysics)
-        target_sources(example-lua PRIVATE examples/lua/physics.cpp)
+        target_sources(example-lua PRIVATE examples/lua/physics.cpp examples/lua/splat-lod.cpp)
         target_link_libraries(example-lua PRIVATE Jolt)
         if(SLANG_RHI_MASTER_PROJECT AND CMAKE_GENERATOR MATCHES "Visual Studio")
             set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT example-lua)

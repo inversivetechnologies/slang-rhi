@@ -8,6 +8,7 @@
 
 #include "example-base.h"
 #include "physics.h"
+#include "splat-lod.h"
 
 // Lua is built as C++ (see CMakeLists.txt), so its headers are included without the
 // extern "C" wrapper that lua.hpp adds.
@@ -16,6 +17,7 @@
 #include <lauxlib.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
@@ -3115,15 +3117,47 @@ public:
         return 1;
     }
 
-    // rhi.load_ply(path): loads the vertex element of a binary PLY file into a buffer of
-    // floats, one record of `stride` floats per vertex, in the file's property order.
-    // Returns { buffer, count, stride, properties = { name = offset, ... },
-    //           center = {x, y, z}, radius } -- center and radius summarize the x/y/z
-    // properties (mean, and the root of the summed variances), for framing a camera.
+    // A read-only structured buffer holding `bytes` of `contents`.
+    static std::shared_ptr<Buffer> createDataBuffer(lua_State* L, const void* contents, size_t bytes, const char* label)
+    {
+        LuaApp* app = get(L);
+        auto buffer = std::make_shared<Buffer>();
+        BufferDesc desc = {};
+        desc.size = std::max<size_t>(bytes, 4);
+        desc.usage = BufferUsage::ShaderResource | BufferUsage::CopyDestination;
+        desc.defaultState = ResourceState::ShaderResource;
+        desc.label = label;
+        if (SLANG_FAILED(app->m_device->createBuffer(desc, bytes ? contents : nullptr, buffer->buffer.writeRef())))
+        {
+            luaL_error(L, "could not create a buffer for %s", label);
+        }
+        buffer->size = desc.size;
+        return buffer;
+    }
+
+    // rhi.load_ply(path [, { lod = true }]): loads the vertex element of a binary PLY file
+    // into a buffer of floats, one record of `stride` floats per vertex, in the file's
+    // property order. Returns { buffer, count, stride, properties = { name = offset, ... },
+    // center = {x, y, z}, radius } -- center and radius summarize the x/y/z properties
+    // (mean, and the root of the summed variances), for framing a camera.
+    //
+    // A file of Gaussian splats (x, y, z, scale_*, rot_*, opacity, f_dc_*) also gets
+    // levels of detail (splat-lod.h), unless `lod = false`: merged splats appended to the
+    // buffer after the file's `count`, and `lod = { count, nodes, levels, bounds, level,
+    // seconds }` -- count is all entries (file's splats and merged ones), nodes the merged
+    // ones, bounds a buffer of 8 floats per entry (its bounds and its parent's), level a
+    // buffer of a uint per entry, seconds the time the build took.
     static int apiLoadPly(lua_State* L)
     {
         LuaApp* app = requireDevice(L);
         fs::path path = app->resolveAssetPath(luaL_checkstring(L, 1));
+        bool wantLod = true;
+        if (lua_istable(L, 2))
+        {
+            lua_getfield(L, 2, "lod");
+            wantLod = lua_isnil(L, -1) || lua_toboolean(L, -1);
+            lua_pop(L, 1);
+        }
         PlyData ply;
         std::string error;
         if (!readPly(path, ply, error))
@@ -3132,21 +3166,58 @@ public:
         }
         uint32_t stride = uint32_t(ply.properties.size());
 
-        auto buffer = std::make_shared<Buffer>();
-        BufferDesc desc = {};
-        desc.size = std::max<size_t>(ply.data.size(), 1) * sizeof(float);
-        desc.usage = BufferUsage::ShaderResource | BufferUsage::CopyDestination;
-        desc.defaultState = ResourceState::ShaderResource;
-        desc.label = "PLY data";
-        if (SLANG_FAILED(app->m_device->createBuffer(desc, ply.data.data(), buffer->buffer.writeRef())))
+        // Levels of detail, for splats: merged splats appended to the records.
+        splatlod::Result lod;
+        double lodSeconds = 0.0;
+        splatlod::Layout layout = splatlod::findLayout(ply.properties);
+        bool hasLod = wantLod && layout.isSplats() && ply.count > 1;
+        if (hasLod)
         {
-            luaL_error(L, "could not create a buffer for '%s'", path.generic_string().c_str());
+            // Cached between runs in the temp directory, keyed by the file's size and time.
+            std::error_code ec;
+            uint64_t sourceKey = uint64_t(fs::file_size(path, ec)) * 1000003ull ^
+                                 uint64_t(fs::last_write_time(path, ec).time_since_epoch().count());
+            fs::path cacheDir = fs::temp_directory_path(ec) / "slang-rhi-lua-lod";
+            fs::create_directories(cacheDir, ec);
+            fs::path cachePath = cacheDir / (path.filename().string() + ".lod");
+            bool cached = false;
+            auto start = std::chrono::steady_clock::now();
+            lod = splatlod::buildCached(layout, ply.data, ply.count, cachePath.string(), sourceKey, cached);
+            lodSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            printf(
+                "[lua] %s: levels of detail: %u splats + %u merged, %u levels, %s in %.2f s\n",
+                path.filename().generic_string().c_str(),
+                lod.leafCount,
+                lod.entryCount - lod.leafCount,
+                lod.levels,
+                cached ? "read from the cache" : "built",
+                lodSeconds
+            );
+            fflush(stdout);
         }
-        buffer->size = desc.size;
+
+        auto buffer = createDataBuffer(L, ply.data.data(), ply.data.size() * sizeof(float), "PLY data");
 
         lua_newtable(L);
         pushHandle(L, buffer, kBufferType);
         lua_setfield(L, -2, "buffer");
+        if (hasLod)
+        {
+            lua_newtable(L);
+            lua_pushinteger(L, lod.entryCount);
+            lua_setfield(L, -2, "count");
+            lua_pushinteger(L, lod.entryCount - lod.leafCount);
+            lua_setfield(L, -2, "nodes");
+            lua_pushinteger(L, lod.levels);
+            lua_setfield(L, -2, "levels");
+            lua_pushnumber(L, lodSeconds);
+            lua_setfield(L, -2, "seconds");
+            pushHandle(L, createDataBuffer(L, lod.bounds.data(), lod.bounds.size() * sizeof(float), "Splat LOD bounds"), kBufferType);
+            lua_setfield(L, -2, "bounds");
+            pushHandle(L, createDataBuffer(L, lod.level.data(), lod.level.size() * sizeof(uint32_t), "Splat LOD levels"), kBufferType);
+            lua_setfield(L, -2, "level");
+            lua_setfield(L, -2, "lod");
+        }
         lua_pushinteger(L, ply.count);
         lua_setfield(L, -2, "count");
         lua_pushinteger(L, stride);
@@ -3683,6 +3754,9 @@ public:
             {"EQUAL", GLFW_KEY_EQUAL},
             {"LEFT_BRACKET", GLFW_KEY_LEFT_BRACKET},
             {"RIGHT_BRACKET", GLFW_KEY_RIGHT_BRACKET},
+            {"COMMA", GLFW_KEY_COMMA},
+            {"PERIOD", GLFW_KEY_PERIOD},
+            {"SLASH", GLFW_KEY_SLASH},
             {"KP_ADD", GLFW_KEY_KP_ADD},
             {"KP_SUBTRACT", GLFW_KEY_KP_SUBTRACT},
         };

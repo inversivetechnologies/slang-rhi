@@ -19,6 +19,13 @@ struct SplatCamera
 // Sort key of splats that aren't drawn (culled, or padding): sorts after every real one.
 static const float kCulledKey = 1e30;
 
+// How many elements the sort works on for `count` drawn splats: a power of two, at least
+// one block of 1024 (shaders/sort/bitonic.slang).
+uint sortSizeFor(uint count)
+{
+    return count <= 1024 ? 1024 : 1u << (firstbithigh(count - 1) + 1);
+}
+
 // The depth range splats are written to a depth buffer with -- the same as the scene's
 // (scene/lit.slang), so depth buffers of both can be compared.
 static const float kDepthNear = 0.1;

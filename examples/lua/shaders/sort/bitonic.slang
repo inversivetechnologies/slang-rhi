@@ -13,9 +13,24 @@
 // sortBlocksMain does all of them in group shared memory in a single dispatch; only the
 // longer-range steps need a dispatch each. For 2^21 elements that is 78 dispatches instead
 // of 231.
+//
+// Only a prefix may hold keys: sortActive[0] says how many (the rest are ignored, and
+// never read). The sort then works on the smallest power of two that holds them (at
+// least 1024), which the caller pads with keys that sort last; threads past it return
+// at once. Once that prefix is sorted, the longer steps would leave it as it is, since
+// everything after it sorts last anyway -- so the dispatches can stay the same for any
+// count. For a full sort, sortActive[0] is the element count.
 
 RWStructuredBuffer<float> sortKeys;
 RWStructuredBuffer<uint> sortValues;
+StructuredBuffer<uint> sortActive;
+
+// The power of two the sort works on.
+uint activeSize()
+{
+    uint count = sortActive[0];
+    return count <= 1024 ? 1024 : 1u << (firstbithigh(count - 1) + 1);
+}
 
 uniform uint sortK;     // sortStepMain: the size of the bitonic sequences being merged
 uniform uint sortJ;     // sortStepMain: the distance between compared elements
@@ -41,6 +56,10 @@ void sortStepMain(uint3 tid: SV_DispatchThreadID)
 {
     uint i = pairStart(tid.x, sortJ);
     uint l = i + sortJ;
+    if (l >= activeSize())
+    {
+        return;
+    }
     bool ascending = (i & sortK) == 0;
     float a = sortKeys[i];
     float b = sortKeys[l];
@@ -82,6 +101,10 @@ void sortBlocksMain(uint3 groupId: SV_GroupID, uint3 threadId: SV_GroupThreadID)
 {
     uint t = threadId.x;
     uint blockStart = groupId.x * kBlockSize;
+    if (blockStart >= activeSize())
+    {
+        return; // the whole group: blocks are 1024, and so a multiple of the size
+    }
     blockKeys[t] = sortKeys[blockStart + t];
     blockKeys[t + 512] = sortKeys[blockStart + t + 512];
     blockValues[t] = sortValues[blockStart + t];

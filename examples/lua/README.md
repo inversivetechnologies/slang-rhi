@@ -24,6 +24,7 @@ All examples are scripts, in `scripts/`:
 examples/lua/
   example-lua.cpp      the host
   physics.h/.cpp       rigid body physics for the host, on Jolt Physics
+  splat-lod.h/.cpp     levels of detail for Gaussian splats, built when a PLY is loaded
   README.md
   scripts/             runnable scripts, one per example
     lib/               Lua modules used by scripts (rhi.include), not run on their own
@@ -33,7 +34,7 @@ examples/lua/
     scene/             the scene's lighting and shadows (scene-common, shadow, lit,
                        shadow-lookup)
     splat/             Gaussian splatting (ply, splat-common, preprocess, render,
-                       shadow-casters, shadow, lighting)
+                       shadow-casters, shadow-select, shadow, lighting)
     sort/              GPU sorting (bitonic)
     sdf/               SDF compositions: smooth booleans (smooth-ops), the DAG evaluator
                        (sdf-dag), placement in the world (sdf-world), and the
@@ -111,6 +112,8 @@ Gaussian Splats and Depth Composite modes share the loaded file.
 | L | splats lit by the point light / as captured (only shadowed) |
 | J / K | every blend radius of the SDF composition ÷1.25 / ×1.25 (down to hard booleans) |
 | `[` / `]` | splat size |
+| `,` / `.` | splat level-of-detail threshold down / up (see the splats) |
+| `/` | tint the splats by level of detail |
 | Tab | hide or show the second camera's square in the lower right corner (meshes, SDFs and splats, as in the main view) |
 | the scene's keys | change the scene as in its own mode (subdivision, radius, light) |
 
@@ -126,6 +129,8 @@ depth](#example-combining-passes-by-depth).
 | Drag with the left mouse button | orbit the camera |
 | Mouse wheel | zoom |
 | `[` / `]` | splat size ÷1.1 / ×1.1 |
+| `,` / `.` | level-of-detail threshold ÷1.5 / ×1.5, in pixels (3 to start); below 0.5 it is off: the file's splats only |
+| `/` | tint the splats by level of detail: grey for the file's own, then blue, green, yellow, orange, red, ... for each level of merged ones |
 | F | flip the scene upside down (for captures that aren't y-down) |
 
 How it renders is described in [Example: Gaussian splatting](#example-gaussian-splatting).
@@ -145,7 +150,7 @@ a big sword, with the camera behind them, in the style of Darksiders.
 | Y | G | launcher: an upward swing that throws what it hits into the air |
 | R3 (press the right stick) | Q | toggle aim mode: the camera goes over the right shoulder, a crosshair appears, the character faces where the camera looks and strafes |
 | RT | E | throw a fireball (a heavy ball): at the crosshair in aim mode (hold to keep throwing), else straight ahead |
-| Gyro | | in aim mode: a small extra tilt of the aim (up to about 8° sideways, 6° up and down), on top of the right stick |
+| Gyro | | in aim mode: turning the controller from where it was when aim mode began turns the aim as much, on top of the right stick |
 | LT | C | camera back behind the character |
 | | Mouse wheel | camera distance |
 | View | B | drop a burst of 24 boxes and balls from the sky |
@@ -349,7 +354,7 @@ pass's shader, to combine images by depth, or for any screen-space effect.
 | `rhi.include(path)` | runs a Lua file (relative to the script) and returns its result; saving that file reloads the script |
 | `rhi.window_srgb()` | `true` if the window's format encodes sRGB itself (as `frame.srgb`, but usable in `init`) |
 | `rhi.window_size()` | the window's size in pixels, `width, height` (usable in `init`) |
-| `rhi.load_ply(path)` | loads a PLY file's vertices into a buffer; see below |
+| `rhi.load_ply(path [, { lod = true }])` | loads a PLY file's vertices into a buffer; see below |
 
 `rhi.load_ply(path)` reads the vertex element of a binary little-endian PLY file whose
 vertex properties are all floats, which is the format Gaussian splatting scenes come in. It
@@ -362,8 +367,29 @@ uploads them unchanged, one record per vertex, and returns:
 | `stride` | floats per vertex |
 | `properties` | the offset of each property by name, e.g. `properties.x`, `properties.opacity` |
 | `center`, `radius` | the mean of `x`, `y`, `z`, and the square root of their summed variances, for framing a camera (when the file has `x`, `y` and `z`) |
+| `lod` | levels of detail, for a file of Gaussian splats; see below |
 
 Shaders then read whatever properties they need, at offsets the script passes in.
+
+**Levels of detail.** A file of Gaussian splats (with `x`, `y`, `z`, `scale_0..2`,
+`rot_0..3`, `opacity` and `f_dc_0..2`) gets levels of detail automatically, unless the
+second argument says `lod = false`. They are merged splats, appended to `buffer` after the
+file's `count` records in the same layout, so any shader reads them as it reads the
+file's. `lod` then holds:
+
+| Field | |
+| --- | --- |
+| `count` | all records: the file's splats and the merged ones |
+| `nodes`, `levels` | how many merged splats there are, and the tree's depth (the file's splats are level 0) |
+| `bounds` | a buffer of two `float4`s per record: its bounding sphere (center, radius; radius 0 for a file's splat), then its parent's (radius −1 at the root) |
+| `level` | a buffer of a `uint` per record: its level |
+| `seconds` | how long building (or reading) them took |
+
+They are built once per file and cached in the temp directory
+(`%TEMP%/slang-rhi-lua-lod/<file>.lod`). The cache is keyed by the file's size and
+modification time. For `skull.ply`, the build takes 1.8 s in Release and 11 s in Debug,
+and reading the cache takes about 0.5 s. How they are built and drawn is in [Levels of
+detail](#levels-of-detail).
 | `rhi.params{...}`, `rhi.graph()`, `rhi.set_graph(graph)` | see [Render graphs](#render-graphs) |
 
 `rhi.include` is for sharing Lua code between scripts in different folders. The showcase
@@ -704,14 +730,23 @@ runs the attacks, moves the camera and poses the figure.
   and pitch on x, as SDL maps the Steam Deck's. The controller tested here read a
   constant offset (−0.147 on x, about 5 rad/s) at rest. So the player tracks the offset
   while not aiming, and subtracts it.
-  - **Only a tilt:** in aim mode the gyro doesn't turn the camera; the right stick does.
-    The gyro tilts the aim a little away from where the stick points it: by half the
-    controller's own turn, at most about 8° sideways and 6° up or down. The camera and
-    the throws follow the tilted aim.
-  - **No drift:** the tilt eases back to nothing (`GYRO_TILT_RETURN`, 0.6 per second),
-    so leftover drift can't pile up. It is gone right after leaving aim mode.
-  - **Tuning:** the gain, the limits and the axis signs are constants at the top of
-    `player.lua`, untested against real motion.
+  - **An offset from a base pose:** entering aim mode takes the controller's orientation
+    (`controller.quat`) as the base pose. From then on, the aim is the right stick's plus
+    the controller's turn since that pose, without limit, except that the total pitch
+    stays within the camera's range.
+  - **Measuring the turn:** the relative rotation from the base pose turns the controller's
+    forward axis. Where that axis points gives the yaw (about the yaw axis) and the
+    pitch (toward it). Measured from the orientation itself, it doesn't drift.
+  - **Without an orientation:** only "Ibex" firmware reports one. The controller tested
+    here doesn't: its `quat` stays the identity. For such a controller, the turn is the
+    gyro's rates, added up since aim mode began.
+  - **Following the aim:** the camera, the throws and the character's facing all follow
+    the combined aim.
+  - **Leaving aim mode:** the offset is folded into the camera, so the view stays where
+    it was aimed. The next aim mode starts from a new base pose.
+  - **Tuning:** the gain (`GYRO_AIM_GAIN`, 1: the aim turns as much as the controller)
+    and the axis signs are constants at the top of `player.lua`, untested against real
+    motion.
 
 **Cost:** about 8.3 ms per frame (≈120 fps) on an RTX 3050 Laptop GPU, Release, with about
 280 bodies, the player running. That covers the physics on the CPU (Jolt's job system uses
@@ -819,7 +854,8 @@ rotation, scale, opacity, and degree-3 spherical harmonics for view-dependent co
 | `scripts/splat.lua` | runs it on its own |
 | `scripts/lib/splat-mode.lua` | loads the file, builds the render graph, handles input |
 | `shaders/splat/ply.slang` | reads splats from the PLY data and places them in the world |
-| `shaders/splat/preprocess.slang` | compute: projects each splat, evaluates its color, writes a sort key |
+| `splat-lod.h/.cpp` | the host: builds the levels of detail when the file is loaded |
+| `shaders/splat/preprocess.slang` | compute: picks the level of detail, projects each splat, evaluates its color, packs the drawn ones' sort keys |
 | `shaders/sort/bitonic.slang` | compute: sorts the keys |
 | `shaders/splat/render.slang` | draws the sorted splats as blended quads |
 | `shaders/post/composite.slang` | puts the result on the window |
@@ -831,7 +867,9 @@ them.
 
 **Every frame**, as a render graph built once in `init()`:
 
-1. **Preprocess** (one thread per splat):
+1. **Preprocess** (one thread per splat, merged ones included):
+   - **Level of detail:** a splat goes on only if it is part of this frame's cut through
+     the tree (see [Levels of detail](#levels-of-detail)).
    - **Covariance:** builds the splat's 3D covariance, `R S Sᵀ Rᵀ` from its rotation and
      scale.
    - **Projection:** projects the covariance to a 2D ellipse on screen through the
@@ -839,22 +877,31 @@ them.
      splat covers about a pixel.
    - **Color:** evaluates the spherical harmonics in the direction from the camera.
    - **Culling:** splats behind the camera, off screen, or nearly transparent are skipped.
-   - **Outputs:** each visible splat writes its ellipse (center and two half axes at 3σ,
+   - **Outputs:** each drawn splat writes its ellipse (center and two half axes at 3σ,
      from the eigenvectors of the 2D covariance) and its color. It also writes a sort key,
      the negated view depth.
-2. **Sort** the keys with their splat indices, on the GPU, with a bitonic sort.
-   - **Padding:** the 1,924,114 splats are padded to 2²¹ with keys that sort last.
-   - **Dispatches:** sorting them takes 78 dispatches. One sorts each block of 1024 in
-     group shared memory. Then, for every longer sequence length, there is one dispatch
-     per long-range step, plus one block dispatch for the remaining short-range steps.
+   - **Packing:** a drawn splat takes the next slot of the sort's buffers from an atomic
+     counter (`drawCount`, reset to 0 by a one-thread dispatch first). So the drawn splats
+     end up at the front, in no order.
+2. **Pad** (`padMain`): after the drawn splats, up to the next power of two (at least 1024),
+   keys that sort last.
+3. **Sort** the keys with their splat indices, on the GPU, with a bitonic sort.
+   - **Only the drawn splats:** the sort works on that power of two. Its threads past it
+     return at once, and never read what is there. Every longer step would leave the
+     sorted front as it is, so the graph's dispatches stay the same whatever the count.
+   - **Dispatches:** sorting takes 91 dispatches (the buffers have room for 2²² keys, all
+     2,223,707 splats with the merged ones). One sorts each block of 1024 in group shared
+     memory. Then, for every longer sequence length, there is one dispatch per long-range
+     step, plus one block dispatch for the remaining short-range steps.
    - **Built in Lua:** Lua creates these dispatches as graph nodes in `init()`, each with a
      parameter block holding its step.
-3. **Draw** all splats in one draw of six vertices each, in sorted order, so back to front.
+4. **Draw** in one draw of six vertices per file's splat (at most one splat per file's
+   splat is drawn), in sorted order, so back to front.
    - **Quads:** the vertex shader places a quad over the splat's ellipse.
    - **Falloff:** the fragment shader applies the Gaussian falloff.
    - **Blending:** the pipeline blends with `premultiplied` alpha.
-   - **Culled splats:** they sort to the end and become zero-area quads.
-4. **Composite** the result onto the window.
+   - **Past the drawn splats:** the slots after `drawCount` become zero-area quads.
+5. **Composite** the result onto the window.
 
 **Color.** Splats are trained against photos, so their colors are display-space values,
 and the reference renderer blends them as such. They are blended here the same way, in an
@@ -862,17 +909,64 @@ and the reference renderer blends them as such. They are blended here the same w
 composite pass converts to linear first (`decodeGamma`), so the window's encoding gives
 back the original values.
 
-**Input** only changes the view block: camera, splat size, and the y/z flip. The flip is
-needed because COLMAP-based captures are y-down.
+**Input** only changes parameter blocks: the view block (camera, splat size, and the y/z
+flip) and the level-of-detail block. The flip is needed because COLMAP-based captures
+are y-down.
 
-**Performance.** On an RTX 3050 Laptop GPU, at the default window size, a frame takes
-about 31 ms (≈ 32 fps), in both Debug and Release builds. The frame time is GPU-bound,
-spent on projecting, sorting and blending all 1.9 million splats every frame. The usual
-next steps, not done here:
+### Levels of detail
+
+**The tree** (`splat-lod.cpp`, built by `rhi.load_ply`):
+
+- **Clusters:** the splats are split top-down, three times per level at the median of
+  the longest axis of their centers, so each node has up to eight children. That
+  continues down to single splats, the leaves. `skull.ply`'s 1,924,114 splats get
+  299,593 nodes, in 8 levels.
+- **Merging:** each node is one more Gaussian, merged from its children (leaves or
+  nodes). Each child is weighted by its opacity times its area (`s₀s₁ + s₁s₂ + s₀s₂`, from
+  its scales).
+  - **Shape:** the merged mean and covariance are the children's weighted mean, and the
+    weighted sum of their covariances plus their spread around that mean (moment
+    matching). The covariance's eigenvectors and eigenvalues give the merged splat's
+    rotation and scales.
+  - **Opacity:** the children's opacity times area, spread over the merged splat's area,
+    at most 0.99. It covers about as much as they do.
+  - **Color:** every other property, the spherical harmonics among them, is the weighted
+    average of the children's.
+- **Bounds:** each node also gets a bounding sphere, which contains its children's
+  spheres (a leaf's is 3σ of its largest scale).
+
+**Choosing what to draw.** Each splat decides on its own, in preprocess, from its sphere and
+its parent's: it is drawn when its own sphere is small enough on screen and its parent's
+isn't.
+
+- **Small enough:** the sphere's radius, divided by the distance to its nearest point, in
+  pixels at the camera's focal length, is at most the threshold, `lodPixels` (3 to start;
+  `,` and `.` change it). A leaf is always small enough; the root's parent never is.
+- **A consistent cut:** a child's sphere lies inside its parent's, so it is never larger on
+  screen by this measure. So along every path from the root to a leaf, the splats go from
+  too large to small enough exactly once, and exactly that one splat is drawn. No region
+  is drawn twice, and none is left out, without any splat looking at another.
+- **At most as many as the file's:** a node replaces at least two splats, so the cut
+  never has more splats than the file.
+- **What it looks like:** at 3 pixels, merged splats stand in for clusters that are
+  about 6 pixels across, and the picture looks the same as with the file's splats
+  only. `/` tints each splat by its level. Up close it shows the file's splats with
+  level-1 merges in between; zoomed out, levels 2 and 3 take over.
+
+**Performance.** On an RTX 3050 Laptop GPU, Release, at the default window size:
+
+| | frame |
+| --- | --- |
+| before the levels of detail (every splat projected, sorted, drawn) | 31 ms |
+| levels of detail off (`,` down to 0): the file's splats, but only the drawn ones sorted | 26.3 ms |
+| levels of detail at 3 pixels, the starting view | 12.1 ms |
+| the same, zoomed out (14 wheel steps) | 8.3 ms |
+
+The frame time is GPU-bound. The usual next steps, not done here:
 
 - a radix sort in place of the bitonic one
-- sorting and drawing only the splats that survive culling (with indirect dispatch and
-  draw)
+- indirect dispatches and draws sized by `drawCount`, instead of full-size ones whose
+  threads past it return at once
 - tile-based compute rasterization, as in the paper, in place of blended quads
 
 ## Example: combining passes by depth
@@ -886,9 +980,10 @@ images per pixel, by which one is nearer the camera:
 | Pass | Writes | Reads |
 | --- | --- | --- |
 | scene: generate sphere, shadow faces | the shadow atlas (the meshes) | |
-| splats: shadow casters (once) | each splat's center, opacity and covariance | the PLY data |
-| splats: shadow faces | the splat shadow atlas: optical depth and nearest distance | the casters |
-| splats: shadow layers faces | the splats' deep opacity map | the casters, the splat shadow atlas |
+| splats: shadow casters (once) | each splat's center, opacity and covariance, merged ones included | the PLY data |
+| splats: shadow reset, shadow select | the splats the shadow maps draw: a level-of-detail cut seen from the light | the casters' bounds, the light |
+| splats: shadow faces | the splat shadow atlas: optical depth and nearest distance | the casters, the selection |
+| splats: shadow layers faces | the splats' deep opacity map | the casters, the selection, the splat shadow atlas |
 | mesh | `meshColor` (rgba16f), `meshDepth` | the shadow atlas |
 | raymarch | `sdfColor` (rgba16f), `sdfDepth` (r32f) | the SDF node buffer, `meshDepth`, all shadow maps |
 | splats: preprocess, lighting, sort | the projected splats, lit and shadowed, sorted | the PLY data, the light, all shadow maps |
@@ -960,11 +1055,15 @@ the splats' in orange, and nearer shown brighter.
   with the rest.
 - **Splat lighting is approximate:** the splats have no normals and their colors have
   the capture's lighting baked in; see [Lighting the splats](#lighting-the-splats).
-- **Cost:** about 73 ms per frame on an RTX 3050 Laptop GPU (Release, default window
-  size), against 31 ms for the splats alone.
-  - **The second camera:** about 29 ms of it; with Tab, 43–48 ms (it varied between
-    runs). Its pixels are few, but it repeats all the per-splat work: preprocess,
-    lighting and the 78 sort dispatches.
+- **Cost:** about 32 ms per frame on an RTX 3050 Laptop GPU (Release, default window
+  size), 26 ms with the second camera hidden, against 12 ms for the splats alone. Both
+  views and the splat shadows draw the splats with their own [levels of
+  detail](#levels-of-detail) (33.5 ms with them in the views only); with them off, it is
+  about 81 ms.
+  - **The second camera:** before the levels of detail, it cost about 29 ms of a 73 ms
+    frame. Its pixels are few, but it repeats all the per-splat work: preprocess,
+    lighting and the sort. With the levels of detail, it draws far fewer splats: its
+    view is small, so coarser levels are small enough.
   - **Splats:** the splats' second, depth-only draw, their shadows both ways, and their
     lighting.
   - **SDFs:** the raymarching and the receivers' soft-shadow marches. Most of those rays
@@ -1016,11 +1115,24 @@ The light that reaches a point is then the light not blocked by a mesh, times
 #### How the splats' shadow maps are drawn
 
 1. **Casters** (`shaders/splat/shadow-casters.slang`, compute, once):
-   - **What it stores:** each splat's center, opacity and 3D covariance in the world.
+   - **What it stores:** each splat's center, opacity and 3D covariance in the world, for
+     the merged splats of the [levels of detail](#levels-of-detail) too.
    - **Placement:** it goes through `shaders/splat/ply.slang`, the same code that places
      and shapes the drawn splats, so the shadows match them exactly.
    - **When it runs:** again when the splat size changes or the shader is edited.
-2. **Shadow faces and shadow layers faces** (`shaders/splat/shadow.slang`, six passes each):
+2. **Selection** (`shaders/splat/shadow-select.slang`, compute, every frame): which splats
+   the maps draw.
+   - **A cut seen from the light:** the same cut through the levels of detail as the
+     camera's (`lodSmallEnough` in `ply.slang`, shared by both), but from the light.
+   - **Threshold:** a splat is small enough when its bounds' radius is at most
+     `lodShadowTexels` texels of a cube face (whose focal length is half its 512 texels).
+     That threshold is two thirds of the camera's `lodPixels`, so `,` and `.` change both,
+     and down to 0 the maps draw the file's splats only.
+   - **Packing:** the picked splats are packed into a list, with an atomic counter. Every
+     face of both maps draws from it; triangles past its count draw nothing.
+   - **Every frame:** the light moves, so the selection runs every frame, while the
+     casters stay as they are.
+3. **Shadow faces and shadow layers faces** (`shaders/splat/shadow.slang`, six passes each):
    - **Shape:** each splat is drawn as its actual Gaussian seen from the light. Its
      covariance is projected onto the plane facing the light, and a triangle covers the
      resulting ellipse out to 3σ.
@@ -1030,8 +1142,8 @@ The light that reaches a point is then the light not blocked by a mesh, times
 #### Lighting the splats
 
 The point light lights the splats as it lights the meshes: `shaders/splat/lighting.slang`
-runs between preprocessing and sorting, one thread per visible splat, and changes the color
-preprocess wrote.
+runs between preprocessing and sorting, one thread per drawn splat (the first `drawCount`
+of the packed sort values), and changes the color preprocess wrote.
 
 - **Shadows:** it looks up the light at the splat's center with `shadowVisibility`, as the
   meshes do. Each splat counts as 0.08 units nearer to the light than its center, so that

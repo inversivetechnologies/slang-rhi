@@ -20,7 +20,8 @@
 #include "scene/shadow-lookup.slang"
 
 RWStructuredBuffer<ProjectedSplat> projected;
-StructuredBuffer<float> sortKeys; // still in splat order: preprocess wrote them, the sort hasn't run
+StructuredBuffer<uint> sortValues; // the drawn splats, packed at the front: the sort hasn't run
+StructuredBuffer<uint> drawCount;  // [0]: how many
 uniform SplatCamera camera;
 uniform float relight;
 uniform float shadowStrength;     // relight 0: how dark a fully shadowed splat gets
@@ -30,11 +31,11 @@ uniform float shadowBias;         // how far a splat counts as nearer the light 
 [numthreads(256, 1, 1)]
 void lightSplatsMain(uint3 tid: SV_DispatchThreadID)
 {
-    uint i = tid.x;
-    if (i >= splatCount || sortKeys[i] >= kCulledKey * 0.5)
+    if (tid.x >= drawCount[0])
     {
-        return; // not drawn this frame
+        return; // fewer drawn this frame
     }
+    uint i = sortValues[tid.x];
     uint base = splatBase(i);
     float3 world = splatWorldPosition(base);
     float3 lightPos = lightPosition();

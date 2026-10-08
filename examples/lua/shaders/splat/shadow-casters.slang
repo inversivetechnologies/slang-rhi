@@ -1,6 +1,7 @@
-// Splat shadows, step 1: one thread per splat writes what shadow.slang needs to draw it
-// into the light's view -- its center, opacity, and 3D covariance in the world. The
-// splats don't move, so this runs once, not every frame.
+// Splat shadows, step 1: one thread per splat (merged ones included: splat-lod.h) writes
+// what shadow.slang needs to draw it into the light's view -- its center, opacity, and 3D
+// covariance in the world. The splats don't move, so this runs once, not every frame;
+// which of them are drawn is picked every frame (shadow-select.slang).
 //
 // See shadow.slang for how the shadows are made.
 

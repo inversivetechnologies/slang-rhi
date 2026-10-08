@@ -2,7 +2,7 @@
 // covering its ellipse, blended with premultiplied alpha.
 //
 // Six vertices per splat, fetched by SV_VertexID: vertex v belongs to the splat in sorted
-// position v / 6. Splats that were culled sort to the end and become degenerate quads.
+// position v / 6. Slots past the drawn splats become degenerate quads.
 //
 // depthFragmentMain draws the same quads into a depth buffer instead, for compositing
 // with other passes by depth: where a splat is at least fairly opaque, it writes the
@@ -13,6 +13,7 @@
 StructuredBuffer<ProjectedSplat> projected;
 StructuredBuffer<float> sortKeys;
 StructuredBuffer<uint> sortValues;
+StructuredBuffer<uint> drawCount; // [0]: how many splats are drawn; the rest of the slots aren't
 uniform float2 viewportSize; // provided by the host
 
 struct VertexOutput
@@ -32,7 +33,7 @@ VertexOutput vertexMain(uint vertexId: SV_VertexID)
 {
     VertexOutput output;
     uint slot = vertexId / 6;
-    if (sortKeys[slot] >= kCulledKey * 0.5)
+    if (slot >= drawCount[0] || sortKeys[slot] >= kCulledKey * 0.5)
     {
         // All six vertices at one point: nothing is rasterized.
         output.position = float4(0, 0, 0, 1);

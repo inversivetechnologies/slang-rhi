@@ -2,6 +2,13 @@
 // the rasterizer needs -- the ellipse it covers on screen, its color as seen from the
 // camera, and a depth to sort by.
 //
+// Levels of detail: the splats include merged ones (built by the host when the file was
+// loaded: splat-lod.h), one per node of a tree over the file's splats. A splat is drawn
+// when it is small enough on screen and its parent isn't -- each decides on its own, and
+// the tree's bounds make sure exactly one splat on every path from the root to a file's
+// splat is drawn. The drawn ones are packed at the front of the sort's buffers (an atomic
+// counter, `drawCount`), so the sort, the lighting and the draw skip the rest.
+//
 // The splats are read and placed by ply.slang. Following "3D Gaussian Splatting for
 // Real-Time Radiance Field Rendering" (Kerbl et al. 2023):
 //
@@ -20,6 +27,51 @@ uniform float2 viewportSize; // provided by the host
 RWStructuredBuffer<ProjectedSplat> projected;
 RWStructuredBuffer<float> sortKeys;
 RWStructuredBuffer<uint> sortValues;
+RWStructuredBuffer<uint> drawCount; // [0]: splats drawn this frame (packed at the front)
+
+// Levels of detail.
+StructuredBuffer<float4> lodBounds; // per splat: its bounds, then its parent's (splat-lod.h)
+StructuredBuffer<uint> lodLevel;    // per splat: 0 for the file's, the height above them for merged ones
+uniform uint lodEnabled;            // 0: no merged splats; draw every one of the file's
+uniform float lodPixels;            // a merged splat stands in for its children once its bounds' radius is this small, in pixels
+uniform uint lodShowLevels;         // 1: tint the splats by level
+
+// A color per level, for lodShowLevels.
+float3 levelColor(uint level)
+{
+    static const float3 kColors[8] = {
+        float3(0.9, 0.9, 0.9), float3(0.2, 0.6, 1.0), float3(0.2, 0.9, 0.4), float3(1.0, 0.85, 0.2),
+        float3(1.0, 0.5, 0.15), float3(1.0, 0.2, 0.3), float3(0.8, 0.3, 1.0), float3(0.4, 1.0, 1.0),
+    };
+    return kColors[min(level, 7u)];
+}
+
+// Resets the count of drawn splats, before preprocessMain.
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void resetCountMain()
+{
+    drawCount[0] = 0;
+}
+
+// After preprocessMain (and the lighting): fills the rest of what the sort will work on
+// with keys that sort last.
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void padMain(uint3 tid: SV_DispatchThreadID)
+{
+    uint count = drawCount[0];
+    uint i = tid.x;
+    bool padding = i >= count && i < sortSizeFor(count) && i < sortCount;
+    // [branch]: D3D11's fxc otherwise flattens the writes, and fails ("flattened side
+    // effect").
+    [branch]
+    if (padding)
+    {
+        sortKeys[i] = kCulledKey;
+        sortValues[i] = 0;
+    }
+}
 
 // Spherical harmonics coefficient `k` (0 = band 0) of all three channels.
 float3 shCoefficient(uint base, uint k)
@@ -71,16 +123,19 @@ float3 evaluateColor(uint base, float3 dir)
 void preprocessMain(uint3 tid: SV_DispatchThreadID)
 {
     uint i = tid.x;
-    if (i >= sortCount)
-    {
-        return;
-    }
-    // Not drawn unless it survives everything below.
-    sortKeys[i] = kCulledKey;
-    sortValues[i] = i;
     if (i >= splatCount)
     {
         return;
+    }
+    float focal = viewportSize.y * 0.5 / tan(camera.fovY * 0.5);
+    if (lodEnabled != 0)
+    {
+        // Drawn if small enough, and its parent isn't (so its parent isn't drawn).
+        if (!lodSmallEnough(lodBounds[2 * i], camera.eye, focal, lodPixels) ||
+            lodSmallEnough(lodBounds[2 * i + 1], camera.eye, focal, lodPixels))
+        {
+            return;
+        }
     }
     uint base = splatBase(i);
 
@@ -111,7 +166,6 @@ void preprocessMain(uint3 tid: SV_DispatchThreadID)
 
     // Project to pixels (y down) and take the Jacobian there. Clamping the point to a bit
     // beyond the frustum keeps splats at the edges from blowing up.
-    float focal = viewportSize.y * 0.5 / tan(camera.fovY * 0.5);
     float2 limit = 1.3 * viewportSize * 0.5 / focal;
     float2 clamped = clamp(t.xy / t.z, -limit, limit) * t.z;
     float invZ = 1.0 / t.z;
@@ -145,12 +199,20 @@ void preprocessMain(uint3 tid: SV_DispatchThreadID)
     // The color as seen from the camera; the harmonics are in the splat's own frame.
     float3 dir = mul(transpose(yaw), normalize(world - camera.eye)) * flip;
     float3 color = evaluateColor(base, dir);
+    if (lodShowLevels != 0)
+    {
+        color = lerp(color, levelColor(lodEnabled != 0 ? lodLevel[i] : 0), 0.7);
+    }
 
     ProjectedSplat splat;
     splat.centerAxis1 = float4(center, axis * radius1);
     splat.axis2 = float4(float2(-axis.y, axis.x) * radius2, t.z, 0);
     splat.color = float4(color, opacity);
     projected[i] = splat;
-    // Sorted ascending, so far splats (large z) come first: drawn back to front.
-    sortKeys[i] = -t.z;
+    // Packed at the front; sorted ascending, so far splats (large z) come first: drawn
+    // back to front.
+    uint slot;
+    InterlockedAdd(drawCount[0], 1, slot);
+    sortKeys[slot] = -t.z;
+    sortValues[slot] = i;
 }

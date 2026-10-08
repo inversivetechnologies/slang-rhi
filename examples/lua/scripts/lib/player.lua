@@ -18,7 +18,8 @@
 --   Y               launcher                      R3  (press the right stick) toggle aim mode
 --   RT              throw (in aim mode: at the crosshair; hold to keep throwing)
 --   LT              camera behind the character
---   gyro            in aim mode: a small extra tilt of the aim, on top of the right stick
+--   gyro            in aim mode: turning the controller from where it was when aim mode
+--                   began turns the aim as much, on top of the right stick
 -- Keyboard and mouse: WASD move, mouse drag camera, Space jump, Shift dodge, F combo,
 -- G launcher, Q aim mode, E throw, C camera behind.
 
@@ -29,18 +30,20 @@ local AXIS_DEADZONE = 0.16
 -- The readings carry a constant offset (one controller read -0.147 on x at rest, about
 -- 5 rad/s), so the player tracks it while not aiming, and subtracts it.
 --
--- In aim mode the gyro doesn't turn the camera: it tilts the aim a little away from where
--- the right stick points it -- at most GYRO_TILT_MAX radians, GYRO_TILT_GAIN of the
--- controller's own turn -- and the tilt eases back to nothing at GYRO_TILT_RETURN per
--- second, so that drift can't pile up.
+-- In aim mode the gyro adds an offset to the aim of the right stick: the controller's
+-- turn since aim mode began (its base pose), times GYRO_AIM_GAIN, without limit. Leaving
+-- aim mode keeps the aim where the offset took it.
+--
+-- The base pose is the controller's orientation (controller.quat) when aim mode begins,
+-- and the turn is the difference between that and its orientation now. Only "Ibex"
+-- firmware reports an orientation; for a controller that doesn't (quat stays the
+-- identity), the turn is the gyro's rates added up since aim mode began instead.
 local GYRO_RATE = 2000 * math.pi / 180
 local GYRO_YAW_AXIS, GYRO_YAW_SIGN = 3, -1
 local GYRO_PITCH_AXIS, GYRO_PITCH_SIGN = 1, -1
 local GYRO_DEADBAND = 0.0015
 local GYRO_BIAS_RATE = 2 -- per second
-local GYRO_TILT_GAIN = 0.5
-local GYRO_TILT_MAX = { 0.14, 0.1 } -- yaw, pitch: about 8 and 6 degrees
-local GYRO_TILT_RETURN = 0.6
+local GYRO_AIM_GAIN = 1
 
 local RUN_SPEED, AIM_SPEED = 6.5, 3.0
 -- Heavier than the scene's gravity, for snappy jumps: about 1.7 m, and 1.3 m more.
@@ -154,7 +157,7 @@ return function(world, options)
     local camera = {
         yaw = 0, pitch = 0.32, distance = 5.2, fovY = math.rad(55),
         pivot = nil, aim = 0, idle = 0, shake = 0, pullIn = 5.2,
-        tilt = { 0, 0 }, -- the gyro's, in aim mode: yaw, pitch
+        tilt = { 0, 0 }, -- the gyro's offset in aim mode, yaw and pitch: the turn from the base pose
         spread = 0, hot = 0,
         eye = { 0, 2, -10 }, forward = { 0, 0, 1 },
     }
@@ -305,7 +308,8 @@ return function(world, options)
         place("chest", torso, { 0, 0.46, 0.01 })
 
         -- The head: looks where the camera aims, in aim mode.
-        local headTurn = state.aiming and qaxis("x", clamp(camera.pitch, -0.6, 0.6) * 0.7) or nil
+        local aimPitch = camera.pitch + camera.tilt[2]
+        local headTurn = state.aiming and qaxis("x", clamp(aimPitch, -0.6, 0.6) * 0.7) or nil
         local head = child(torso, { 0, 0.66, 0 }, headTurn)
         place("head", head, { 0, 0.12, 0 })
         place("visor", head, { 0, 0.13, 0.125 })
@@ -325,7 +329,7 @@ return function(world, options)
         -- The arms. Left: swings, spreads in a glide, points at the crosshair in aim mode.
         local leftQ
         if state.aiming or state.throwAnim > 0 then
-            local raise = math.pi / 2 - (state.aiming and camera.pitch or 0.1)
+            local raise = math.pi / 2 - (state.aiming and aimPitch or 0.1)
             if state.throwAnim > 0 then raise = raise + 0.4 * state.throwAnim / 0.15 end
             leftQ = limb(raise, state.aiming and 0.25 or 0, 0)
         elseif state.gliding then
@@ -515,6 +519,11 @@ return function(world, options)
                 for a = 1, 3 do camera.gyroBias[a] = lerp(camera.gyroBias[a], gyro[a], k) end
             end
             i.gyro = { gyro[1] - camera.gyroBias[1], gyro[2] - camera.gyroBias[2], gyro[3] - camera.gyroBias[3] }
+            -- The orientation, as {x, y, z, w} (the controller gives w first); nil until
+            -- the controller has shown it reports one.
+            local q = controller.quat
+            if q[1] ~= 1 or q[2] ~= 0 or q[3] ~= 0 or q[4] ~= 0 then camera.quatLive = true end
+            if camera.quatLive then i.quat = { q[2], q[3], q[4], q[1] } end
         end
         local kx, ky = keyAxis(keys.A, keys.D), keyAxis(keys.S, keys.W)
         if kx ~= 0 or ky ~= 0 then
@@ -543,21 +552,51 @@ return function(world, options)
         camera.yaw = camera.yaw + keyboardLook[1]
         camera.pitch = camera.pitch + keyboardLook[2]
         keyboardLook = { 0, 0 }
-        -- The gyro's tilt, in aim mode: added to the stick's aim, bounded, easing back.
+        camera.pitch = clamp(camera.pitch, -0.75, 1.15)
+
+        -- The gyro's offset. Entering aim mode takes the controller's pose as the base
+        -- pose, and the offset is the controller's turn from there. Leaving aim mode folds
+        -- the offset into the camera, so the view stays where it was aimed.
         local tilt = camera.tilt
-        if state.aiming and i.gyro then
+        if state.aiming and not camera.wasAiming then
+            tilt[1], tilt[2] = 0, 0
+            camera.baseQuat = i.quat
+        elseif not state.aiming and camera.wasAiming then
+            camera.yaw = camera.yaw + tilt[1]
+            camera.pitch = clamp(camera.pitch + tilt[2], -0.75, 1.15)
+            tilt[1], tilt[2] = 0, 0
+            camera.baseQuat = nil
+        end
+        camera.wasAiming = state.aiming
+        if state.aiming and i.quat then
+            -- The turn from the base pose, in the base pose's frame. The controller's
+            -- forward axis is the one that is neither the yaw nor the pitch axis; where it
+            -- points now gives the yaw (about the yaw axis) and the pitch (toward it).
+            -- Assumes pitch, forward, yaw make a right-handed triple (x, y, z do).
+            if not camera.baseQuat then camera.baseQuat = i.quat end
+            local b = camera.baseQuat
+            local turn = qmul({ -b[1], -b[2], -b[3], b[4] }, i.quat)
+            local forwardAxis = 6 - GYRO_YAW_AXIS - GYRO_PITCH_AXIS
+            local axis = { 0, 0, 0 }
+            axis[forwardAxis] = 1
+            local f = qrotate(turn, axis)
+            local yaw = math.atan(-f[GYRO_PITCH_AXIS], f[forwardAxis])
+            local pitch = math.asin(clamp(f[GYRO_YAW_AXIS], -1, 1))
+            tilt[1] = yaw * GYRO_YAW_SIGN * GYRO_AIM_GAIN
+            tilt[2] = pitch * GYRO_PITCH_SIGN * GYRO_AIM_GAIN
+        elseif state.aiming and i.gyro then
+            -- No orientation: the rates, added up since the base pose.
             local rates = { i.gyro[GYRO_YAW_AXIS] * GYRO_YAW_SIGN, i.gyro[GYRO_PITCH_AXIS] * GYRO_PITCH_SIGN }
             for a = 1, 2 do
                 if math.abs(rates[a]) > GYRO_DEADBAND then
-                    tilt[a] = tilt[a] + rates[a] * GYRO_RATE * GYRO_TILT_GAIN * dt
+                    tilt[a] = tilt[a] + rates[a] * GYRO_RATE * GYRO_AIM_GAIN * dt
                 end
             end
         end
-        local settle = approach(state.aiming and GYRO_TILT_RETURN or 10, dt)
-        for a = 1, 2 do
-            tilt[a] = clamp(tilt[a] * (1 - settle), -GYRO_TILT_MAX[a], GYRO_TILT_MAX[a])
+        if state.aiming then
+            -- Not past straight up or down: the camera's pitch range holds for the sum.
+            tilt[2] = clamp(tilt[2], -0.75 - camera.pitch, 1.15 - camera.pitch)
         end
-        camera.pitch = clamp(camera.pitch, -0.75, 1.15)
 
         -- Swinging behind the character on its own: when the player runs and leaves the
         -- camera alone for a moment, it eases round to look the way the character goes.
@@ -759,7 +798,7 @@ return function(world, options)
         -- Facing: where it runs, or where the camera aims.
         local wantYaw
         if state.aiming then
-            wantYaw = camera.yaw
+            wantYaw = camera.yaw + camera.tilt[1]
         elseif not state.attack and not state.dodge and amount > 0.1 then
             wantYaw = math.atan(wish[1], wish[3])
         end

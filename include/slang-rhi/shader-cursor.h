@@ -4,7 +4,7 @@
 
 namespace rhi {
 
-/// Represents a "pointer" to the storage for a shader parameter of a (dynamically) known type.
+/// Represents a "pointer" to the storage for a shader parameter of a (dynamically) known type  .
 ///
 /// A `ShaderCursor` serves as a pointer-like type for things stored inside a `ShaderObject`.
 ///

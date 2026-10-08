@@ -23,10 +23,15 @@
 // projected onto the plane facing the light, and one triangle covers the resulting
 // ellipse out to 3 sigma. Splats this cube face can't see collapse to nothing in the
 // vertex shader.
+//
+// Which splats: the ones shadow-select.slang picked this frame (the levels of detail, seen
+// from the light), packed in `shadowList`. Triangles past the picked ones draw nothing.
 
 #include "scene/shadow-lookup.slang"
 
 StructuredBuffer<float4> shadowCasters; // see shadow-casters.slang
+StructuredBuffer<uint> shadowList;      // the splats to draw (shadow-select.slang)
+StructuredBuffer<uint> shadowCount;     // [0]: how many
 uniform uint face;                      // which cube face this draw renders
 
 struct VertexOutput
@@ -52,7 +57,12 @@ VertexOutput vertexMain(uint vertexId: SV_VertexID)
     output.offset = float2(0, 0);
     output.opacity = 0;
 
-    uint splat = vertexId / 3;
+    uint slot = vertexId / 3;
+    if (slot >= shadowCount[0])
+    {
+        return output;
+    }
+    uint splat = shadowList[slot];
     float4 centerOpacity = shadowCasters[3 * splat];
     if (centerOpacity.w <= 0)
     {

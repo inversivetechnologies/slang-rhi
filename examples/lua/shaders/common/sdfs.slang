@@ -287,21 +287,4 @@ float SDF (Tetrah obj, float3 p)
 }
 
 
-// Parametric Primitives
-
-float2 LineSegment(float2 a, float2 b, float t)
-{
-    return lerp(a, b, t);
-}
-
-float3 LineSegment(float3 a, float3 b, float t)
-{
-    return lerp(a, b, t);
-}
-
-
-float LineSegmentInv(float3 a, float3 b, float3 p)
-{
-}
-
 

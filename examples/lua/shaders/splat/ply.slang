@@ -68,6 +68,34 @@ float3 splatWorldPosition(uint base)
     return mul(splatYaw(), loadFloat3(base + ply.position) * splatFlip() * model.scale) + model.position;
 }
 
+// Levels of detail (splat-lod.h): whether a splat's bounds (center in the file's frame,
+// radius) look small enough from `viewer`: a radius of at most `threshold` pixels at focal
+// length `focal`. Radius 0: one of the file's splats, always small enough; below 0: the
+// root's parent, never. A splat is drawn when its own bounds are small enough and its
+// parent's aren't.
+bool lodSmallEnough(float4 bounds, float3 viewer, float focal, float threshold)
+{
+    if (bounds.w == 0.0)
+    {
+        return true;
+    }
+    if (bounds.w < 0.0)
+    {
+        return false;
+    }
+    float3 center = mul(splatYaw(), bounds.xyz * splatFlip() * model.scale) + model.position;
+    float radius = bounds.w * model.scale;
+    // The distance to the sphere's nearest point: it only grows from a node to its
+    // children, as the radius only shrinks, so the test never passes for a node and fails
+    // for one of its children.
+    float distance = length(center - viewer) - radius;
+    if (distance <= 0.1)
+    {
+        return false;
+    }
+    return radius * focal / distance <= threshold;
+}
+
 // The splat's scale along its three axes, in world units.
 float3 splatWorldScale(uint base)
 {

@@ -35,6 +35,7 @@
 --   V               combined / mesh only / splats only / SDFs only / depth buffers
 --   L               splats lit by the point light / as captured (only shadowed)
 --   [ / ]           splat size                J / K         SDF blend radii /1.25 / x1.25
+--   , / .           splat LOD threshold       /             tint the splats by LOD level
 --   Tab             show / hide the second camera
 --   other keys      as in the scene
 
@@ -319,7 +320,8 @@ return function(scene, splat, setTitle)
             relight = 1 - relight
             splat.setRelight(relight)
             updateTitle()
-        elseif key == keys.LEFT_BRACKET or key == keys.RIGHT_BRACKET then
+        elseif key == keys.LEFT_BRACKET or key == keys.RIGHT_BRACKET or key == keys.COMMA or key == keys.PERIOD
+            or key == keys.SLASH then
             splat.on_key(key, action, mods)
             updateTitle()
         elseif key ~= keys.F then -- flipping the splats would undo their placement
