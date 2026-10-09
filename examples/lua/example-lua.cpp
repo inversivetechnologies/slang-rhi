@@ -434,6 +434,7 @@ const FormatName kFormats[] = {
     {"rgb32f", Format::RGB32Float, 12},
     {"rgba32f", Format::RGBA32Float, 16},
     {"rgba16f", Format::RGBA16Float, 8},
+    {"r16f", Format::R16Float, 2},
     {"rgba8", Format::RGBA8Unorm, 4},
     {"r32u", Format::R32Uint, 4},
 };
@@ -519,6 +520,12 @@ struct Buffer
 
 // A shader parameter value captured from Lua, so it can be applied without the Lua state:
 // by the render graph every frame, or straight away by frame:draw() and frame:dispatch().
+// A sampler (rhi.sampler), for shaders that filter textures (Sample) rather than Load them.
+struct Sampler
+{
+    ComPtr<ISampler> sampler;
+};
+
 struct ParamValue
 {
     enum class Kind
@@ -528,6 +535,7 @@ struct ParamValue
         Texture,
         Buffer,
         Controller,
+        Sampler,
     };
     Kind kind = Kind::Numbers;
     std::vector<double> numbers; // Numbers
@@ -537,6 +545,7 @@ struct ParamValue
     std::vector<ParamValue> elements;
     std::shared_ptr<Texture> texture;
     std::shared_ptr<Buffer> buffer;
+    std::shared_ptr<Sampler> sampler;
     int controllerSlot = -1;
 };
 
@@ -663,6 +672,11 @@ struct GraphNode
     std::shared_ptr<Texture> threadsTexture;
     // Run once, then again only when asked (rerun()) or when the pipeline is rebuilt.
     bool once = false;
+    // Timed: the host measures the node's GPU time with timestamps (rhi.graph's `timed`),
+    // and reads it back a few frames later: gpuTime, in milliseconds, smoothed; < 0 until
+    // the first measurement arrives.
+    bool timed = false;
+    double gpuTime = -1.0;
     bool pending = true;
     uint32_t ranVersion = 0;
 };
@@ -685,6 +699,7 @@ const char* kPhysicsType = "rhi.PhysicsWorld";
 const char* kBodyGroupType = "rhi.BodyGroup";
 const char* kCharacterType = "rhi.Character";
 const char* kSoundType = "rhi.Sound";
+const char* kSamplerType = "rhi.Sampler";
 
 // Script handles hold a shared_ptr to the host-side object.
 template<typename T>
@@ -1338,6 +1353,25 @@ public:
     // Resources
     // -----------------------------------------------------------------------------------
 
+    // A 3D texture (rhi.texture with a depth): read and written by shaders, sampled with
+    // filtering; not drawn into. Starts out undefined: what uses it writes it first.
+    Result allocateVolume(Texture& texture, uint32_t width, uint32_t height, uint32_t depth)
+    {
+        TextureDesc desc = {};
+        desc.type = TextureType::Texture3D;
+        desc.size.width = std::max<uint32_t>(width, 1);
+        desc.size.height = std::max<uint32_t>(height, 1);
+        desc.size.depth = std::max<uint32_t>(depth, 1);
+        desc.format = texture.format;
+        desc.usage = TextureUsage::UnorderedAccess | TextureUsage::ShaderResource | TextureUsage::CopySource |
+                     TextureUsage::CopyDestination;
+        desc.label = "Volume Texture";
+        ComPtr<ITexture> created;
+        SLANG_RETURN_ON_FAIL(m_device->createTexture(desc, nullptr, created.writeRef()));
+        texture.texture = created;
+        return SLANG_OK;
+    }
+
     Result allocateTexture(Texture& texture, uint32_t width, uint32_t height)
     {
         TextureDesc desc = {};
@@ -1603,6 +1637,12 @@ public:
             value.texture = texture;
             return value;
         }
+        if (auto sampler = testShared<Sampler>(L, index, kSamplerType))
+        {
+            value.kind = ParamValue::Kind::Sampler;
+            value.sampler = sampler;
+            return value;
+        }
         if (auto buffer = testShared<Buffer>(L, index, kBufferType))
         {
             value.kind = ParamValue::Kind::Buffer;
@@ -1678,6 +1718,9 @@ public:
             return {};
         case ParamValue::Kind::Buffer:
             cursor.setBinding(value.buffer->buffer);
+            return {};
+        case ParamValue::Kind::Sampler:
+            cursor.setBinding(Binding(value.sampler->sampler.get()));
             return {};
         case ParamValue::Kind::Controller:
             bindSteamControllerState(cursor, controllerState(value.controllerSlot));
@@ -1931,13 +1974,104 @@ public:
         }
     }
 
+    // GPU timing of graph nodes: timestamps before and after every timed node, in a ring
+    // of kTimingFrames frames of query slots, so that a frame's results are read (without
+    // waiting) when its slots come round again.
+    static constexpr uint32_t kTimingFrames = 3;
+    static constexpr uint32_t kMaxTimedNodes = 32;
+    struct TimedNode
+    {
+        std::weak_ptr<GraphNode> node;
+        uint32_t slot = 0; // its first timestamp: the second is the next slot
+    };
+    ComPtr<IQueryPool> m_timestamps;
+    bool m_timestampsTried = false;
+    double m_timestampFrequency = 0.0;
+    std::vector<TimedNode> m_timedNodes[kTimingFrames];
+
+    IQueryPool* timestampPool()
+    {
+        if (!m_timestampsTried)
+        {
+            m_timestampsTried = true;
+            m_timestampFrequency = double(m_device->getInfo().timestampFrequency);
+            if (m_device->hasFeature(Feature::TimestampQuery) && m_timestampFrequency > 0.0)
+            {
+                QueryPoolDesc desc = {};
+                desc.type = QueryType::Timestamp;
+                desc.count = kTimingFrames * kMaxTimedNodes * 2;
+                desc.label = "Graph node timing";
+                if (SLANG_FAILED(m_device->createQueryPool(desc, m_timestamps.writeRef())))
+                    m_timestamps = nullptr;
+            }
+            if (!m_timestamps)
+            {
+                printf("[lua] this device has no timestamp queries: timed nodes have no gpu_time\n");
+                fflush(stdout);
+            }
+        }
+        return m_timestamps.get();
+    }
+
+    // Reads what the timed nodes of the frame that last used this ring slot measured, if
+    // it is ready; then the slot is free for this frame.
+    void collectTimings(uint32_t ring)
+    {
+        std::vector<TimedNode>& timed = m_timedNodes[ring];
+        for (const TimedNode& t : timed)
+        {
+            std::shared_ptr<GraphNode> node = t.node.lock();
+            if (!node)
+                continue;
+            QueryResultState state;
+            if (SLANG_FAILED(m_timestamps->getResultState(t.slot, 2, &state)) || state != QueryResultState::Resolved)
+                continue;
+            uint64_t ticks[2];
+            if (SLANG_FAILED(m_timestamps->getResult(t.slot, 2, ticks)) || ticks[1] < ticks[0])
+                continue;
+            double ms = double(ticks[1] - ticks[0]) / m_timestampFrequency * 1000.0;
+            // Smoothed; a `once` node's is its last run's.
+            node->gpuTime = node->gpuTime < 0.0 || node->once ? ms : node->gpuTime * 0.9 + ms * 0.1;
+        }
+        timed.clear();
+    }
+
+    // Whether runDispatch will skip the node this frame: no pipeline to run, or a `once`
+    // dispatch that has run already. Timing it would time nothing.
+    static bool dispatchSkips(const GraphNode& node)
+    {
+        const Pipeline* pipeline = node.pipeline.get();
+        return !pipeline || !pipeline->compute || (node.once && !node.pending && node.ranVersion == pipeline->version);
+    }
+
     void runGraph(Graph& graph)
     {
+        IQueryPool* pool = nullptr;
+        uint32_t ring = uint32_t(m_frameIndex % kTimingFrames);
+        for (const std::shared_ptr<GraphNode>& node : graph.nodes)
+        {
+            if (node->timed)
+            {
+                pool = timestampPool();
+                break;
+            }
+        }
+        if (pool)
+            collectTimings(ring);
+
         for (const std::shared_ptr<GraphNode>& node : graph.nodes)
         {
             if (!node->enabled)
             {
                 continue;
+            }
+            uint32_t slot = 0;
+            bool timing = pool && node->timed && m_timedNodes[ring].size() < kMaxTimedNodes &&
+                          !(node->isDispatch && dispatchSkips(*node));
+            if (timing)
+            {
+                slot = (ring * kMaxTimedNodes + uint32_t(m_timedNodes[ring].size())) * 2;
+                m_frame.encoder->writeTimestamp(pool, slot);
             }
             if (node->isDispatch)
             {
@@ -1947,6 +2081,11 @@ public:
             {
                 runRenderPass(*node);
             }
+            if (timing)
+            {
+                m_frame.encoder->writeTimestamp(pool, slot + 1);
+                m_timedNodes[ring].push_back({node, slot});
+            }
         }
     }
 
@@ -1954,8 +2093,6 @@ public:
     // API: rhi.*
     // -----------------------------------------------------------------------------------
 
-    // A shader path from a script: relative to the script if there is such a file there,
-    // else relative to the shared shaders folder.
     // An asset path from a script: relative to the script if there is such a file there,
     // else relative to the shared assets folder.
     fs::path resolveAssetPath(const std::string& name) const
@@ -1969,6 +2106,8 @@ public:
         return fs::path(LUA_ASSETS_DIR) / name;
     }
 
+    // A shader path from a script: relative to the script if there is such a file there,
+    // else relative to the shared shaders folder.
     fs::path resolveShaderPath(const std::string& name) const
     {
         std::error_code ec;
@@ -2181,7 +2320,8 @@ public:
         return 1;
     }
 
-    // rhi.texture{ width = w, height = h, format = "rgba32f" }
+    // rhi.texture{ width = w, height = h, [depth = d,] format = "rgba32f" }: with a depth,
+    // a 3D texture (Texture3D / RWTexture3D in shaders).
     static int apiTexture(lua_State* L)
     {
         LuaApp* app = requireDevice(L);
@@ -2189,12 +2329,17 @@ public:
         lua_getfield(L, 1, "width");
         lua_getfield(L, 1, "height");
         lua_getfield(L, 1, "format");
+        lua_getfield(L, 1, "depth");
         auto texture = std::make_shared<Texture>();
-        texture->format = checkFormat(L, luaL_optstring(L, -1, "rgba32f"))->format;
-        uint32_t width = uint32_t(luaL_checkinteger(L, -3));
-        uint32_t height = uint32_t(luaL_checkinteger(L, -2));
-        lua_pop(L, 3);
-        if (SLANG_FAILED(app->allocateTexture(*texture, width, height)))
+        texture->format = checkFormat(L, luaL_optstring(L, -2, "rgba32f"))->format;
+        uint32_t width = uint32_t(luaL_checkinteger(L, -4));
+        uint32_t height = uint32_t(luaL_checkinteger(L, -3));
+        bool volume = !lua_isnil(L, -1);
+        uint32_t depth = volume ? uint32_t(luaL_checkinteger(L, -1)) : 1;
+        lua_pop(L, 4);
+        Result result = volume ? app->allocateVolume(*texture, width, height, depth)
+                               : app->allocateTexture(*texture, width, height);
+        if (SLANG_FAILED(result))
         {
             luaL_error(L, "could not create texture");
         }
@@ -2474,6 +2619,9 @@ public:
         if (lua_getfield(L, 2, "name") == LUA_TSTRING)
             node->name = lua_tostring(L, -1);
         lua_pop(L, 1);
+        lua_getfield(L, 2, "timed");
+        node->timed = lua_toboolean(L, -1);
+        lua_pop(L, 1);
         lua_getfield(L, 2, "target");
         if (!lua_isnil(L, -1))
             node->target = checkColorTexture(L, -1);
@@ -2541,6 +2689,9 @@ public:
         lua_getfield(L, 2, "once");
         node->once = lua_toboolean(L, -1);
         lua_pop(L, 1);
+        lua_getfield(L, 2, "timed");
+        node->timed = lua_toboolean(L, -1);
+        lua_pop(L, 1);
 
         graph->nodes.push_back(node);
         pushHandle(L, node, kNodeType);
@@ -2598,6 +2749,15 @@ public:
             lua_pushboolean(L, node->enabled);
         else if (strcmp(key, "name") == 0)
             lua_pushstring(L, node->name.c_str());
+        else if (strcmp(key, "timed") == 0)
+            lua_pushboolean(L, node->timed);
+        else if (strcmp(key, "gpu_time") == 0)
+        {
+            if (node->gpuTime >= 0.0)
+                lua_pushnumber(L, node->gpuTime);
+            else
+                lua_pushnil(L);
+        }
         else
         {
             lua_pushvalue(L, lua_upvalueindex(1));
@@ -2614,6 +2774,8 @@ public:
         const char* key = luaL_checkstring(L, 2);
         if (strcmp(key, "enabled") == 0)
             node->enabled = lua_toboolean(L, 3);
+        else if (strcmp(key, "timed") == 0)
+            node->timed = lua_toboolean(L, 3);
         else if (strcmp(key, "threads") == 0)
             readDispatchThreads(L, 3, *node);
         else if (strcmp(key, "clear") == 0)
@@ -3524,8 +3686,46 @@ public:
             lua_pushinteger(L, desc.size.width);
         else if (strcmp(key, "height") == 0)
             lua_pushinteger(L, desc.size.height);
+        else if (strcmp(key, "depth") == 0)
+            lua_pushinteger(L, desc.size.depth);
         else
             lua_pushnil(L);
+        return 1;
+    }
+
+    // rhi.sampler{ filter = "linear" | "point", address = "clamp" | "wrap" }: for shaders
+    // that Sample textures (SamplerState), bound like any other parameter.
+    static int apiSampler(lua_State* L)
+    {
+        LuaApp* app = requireDevice(L);
+        SamplerDesc desc = {};
+        const char* filter = "linear";
+        const char* address = "clamp";
+        if (lua_istable(L, 1))
+        {
+            lua_getfield(L, 1, "filter");
+            filter = luaL_optstring(L, -1, filter);
+            lua_getfield(L, 1, "address");
+            address = luaL_optstring(L, -1, address);
+            lua_pop(L, 2);
+        }
+        TextureFilteringMode mode = TextureFilteringMode::Linear;
+        if (strcmp(filter, "point") == 0)
+            mode = TextureFilteringMode::Point;
+        else if (strcmp(filter, "linear") != 0)
+            luaL_error(L, "unknown sampler filter '%s' (linear, point)", filter);
+        TextureAddressingMode wrap = TextureAddressingMode::ClampToEdge;
+        if (strcmp(address, "wrap") == 0)
+            wrap = TextureAddressingMode::Wrap;
+        else if (strcmp(address, "clamp") != 0)
+            luaL_error(L, "unknown sampler address '%s' (clamp, wrap)", address);
+        desc.minFilter = desc.magFilter = desc.mipFilter = mode;
+        desc.addressU = desc.addressV = desc.addressW = wrap;
+        desc.label = "Lua Sampler";
+        auto sampler = std::make_shared<Sampler>();
+        if (SLANG_FAILED(app->m_device->createSampler(desc, sampler->sampler.writeRef())))
+            luaL_error(L, "could not create a sampler");
+        pushHandle(L, sampler, kSamplerType);
         return 1;
     }
 
@@ -3781,6 +3981,7 @@ public:
             {"set_title", apiSetTitle},
             {"window_size", apiWindowSize},
             {"sound", apiSound},
+            {"sampler", apiSampler},
             {"include", apiInclude},
             {"params", apiParams},
             {"graph", apiGraph},
@@ -3986,6 +4187,7 @@ public:
             {nullptr, nullptr},
         };
         newType(L, kSoundType, soundIndex, kSoundMethods, collectHandle<audio::Sound>);
+        newType(L, kSamplerType, [](lua_State* L) { return lua_pushnil(L), 1; }, nullptr, collectHandle<Sampler>);
         setNewIndex(L, kSoundType, soundNewIndex);
         setNewIndex(L, kDrawType, drawNewIndex);
     }

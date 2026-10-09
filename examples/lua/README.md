@@ -17,6 +17,7 @@ All examples are scripts, in `scripts/`:
 | `shader-toy.lua` | ShaderToy-style compute shaders blitted to the window |
 | `splat.lua` | Gaussian splatting with compute shaders: loads `assets/skull.ply` (1.9 million splats), projects, sorts and draws them every frame |
 | `fusion.lua` | the scene, the splats and a raymarched SDF composition in one picture: each rendered with its own depth buffer, combined per pixel by depth; shadows between all of them |
+| `sdf-cache.lua` | an SDF composition raymarched from its DAG or from a cache baked into 3D textures, with GPU timings of both |
 
 ## Layout
 
@@ -88,14 +89,14 @@ and exits. It doesn't fall back to another API.
 | Input | Action |
 | --- | --- |
 | Left / Right arrow | previous / next mode |
-| `1` .. `5` | jump to a mode |
+| `1` .. `6` | jump to a mode |
 | Steam Controller LB / RB | previous / next mode |
 | Left mouse button | moves `iMouse` in the ShaderToy modes; turns the camera in the physics; orbits it in the splats and the depth composite |
 | Escape | gives the mouse pointer back (click the window to hide it again) |
 | F11 | toggles fullscreen |
 
-The modes are Physics, the ShaderToy shaders 2D SDFs and Controller, Gaussian Splats, and
-Depth Composite. The lit scene (`scene.lua`) has no mode of its own any more, but the Depth
+The modes are Physics, the ShaderToy shaders 2D SDFs and Controller, Gaussian Splats,
+Depth Composite, and SDF Cache. The lit scene (`scene.lua`) has no mode of its own any more, but the Depth
 Composite builds on it. The other ShaderToy shaders (Circle, Ocean) are in
 `example-lua shader-toy`. The current mode is shown in the window title. A
 ShaderToy mode whose shader doesn't compile shows dark red until it does. The splats load
@@ -121,6 +122,24 @@ Gaussian Splats and Depth Composite modes share the loaded file.
 
 How it works is described in [Example: combining passes by
 depth](#example-combining-passes-by-depth).
+
+### The SDF cache
+
+`example-lua sdf-cache`, or mode 6 of the showcase.
+
+| Input | Action |
+| --- | --- |
+| Drag with the left mouse button | orbit the camera |
+| Mouse wheel | zoom |
+| V | raymarch the DAG / the cache / show the cache's error |
+| `-` / `=` | fewer / more shapes in the composition: 4 to 128 (32 to start) |
+| `[` / `]` | cache resolution ÷2 / ×2: 32 to 256 voxels a side (128 to start) |
+| B | benchmark: the raymarching's GPU time with the DAG, then the cache; both shown in the title |
+| Space | stop or start the camera turning |
+
+The title shows the composition's node count, the cache's size and bake time, and the
+raymarching pass's GPU time. How it works is described in [Example: caching an
+SDF](#example-caching-an-sdf).
 
 ### The splats
 
@@ -318,13 +337,22 @@ local small = rhi.render_target("rgba16f", 0.3)   -- always 0.3 times the window
 local square = rhi.render_target("rgba16f", 0.3, "square") -- 0.3 x the window's height, both sides
 local depth = rhi.depth_target()                  -- a depth buffer the size of the window
 local tex = rhi.texture { width = 256, height = 256, format = "rgba32f" }
+local volume = rhi.texture { width = 64, height = 64, depth = 64, format = "r16f" } -- 3D
+local linear = rhi.sampler { filter = "linear", address = "clamp" } -- for Sample()
 local vb = rhi.vertex_buffer { 0, 0, 0,  1, 0, 0,  ... }  -- floats
 local buf = rhi.buffer(1024)                      -- 1024 bytes, zeroed
 local buf2 = rhi.buffer { 1, 2, 3, 4 }            -- floats
 ```
 
 - **Formats**: `r32f`, `rg32f`, `rgb32f` (vertex layouts only), `rgba32f`, `rgba16f`,
-  `rgba8`, `r32u`.
+  `r16f`, `rgba8`, `r32u`.
+- **3D textures:** `depth` makes `rhi.texture` a 3D texture (`Texture3D` and
+  `RWTexture3D` in shaders). It can be read, written and sampled, but not drawn into or
+  blitted, and its contents start out undefined: whatever uses it writes it first.
+  `texture.depth` gives its depth.
+- **Samplers:** `rhi.sampler{ filter = "linear" | "point", address = "clamp" | "wrap" }`
+  is bound like any parameter, to a `SamplerState`, for shaders that filter textures with
+  `Sample` / `SampleLevel` rather than `Load` them.
 - **Textures** can be read and written by shaders, drawn into, and blitted. They start out
   zeroed. `texture.width` and `texture.height` give their size. A render target is
   reallocated when the window resizes, and its old contents are lost.
@@ -569,7 +597,7 @@ end
 | `rhi.graph()` | a new, empty graph |
 | `graph:render_pass{ name, target, depth_target, color, clear, viewport \| viewport_fraction }` | adds a render pass, run in the order added |
 | `pass:draw{ pipeline, count, vertices, params, instances }` | adds a draw to a render pass, run in the order added; `instances` is a number, or a body group (as many as it has bodies, frame by frame) |
-| `graph:dispatch{ name, pipeline, params, threads = {x, y, z} \| "window" \| texture, once }` | adds a compute dispatch; `"window"` runs one thread per window pixel, a texture one per texel, both following resizes |
+| `graph:dispatch{ name, pipeline, params, threads = {x, y, z} \| "window" \| texture, once, timed }` | adds a compute dispatch; `"window"` runs one thread per window pixel, a texture one per texel, both following resizes |
 | `rhi.set_graph(graph)` | makes the host run `graph` every frame, before `draw`; `nil` stops it |
 
 - **`render_pass` options:**
@@ -597,8 +625,16 @@ return can be adjusted later, typically from an input handler:
 
 | Handle | Settable |
 | --- | --- |
-| pass | `enabled`, `clear`, `viewport`, `viewport_fraction` |
-| dispatch | `enabled`, `threads`, and `:rerun()` |
+| pass | `enabled`, `clear`, `viewport`, `viewport_fraction`, `timed` |
+| dispatch | `enabled`, `threads`, `timed`, and `:rerun()` |
+
+**GPU timing.** A render pass or dispatch created with `timed = true` (or set later) is
+timed on the GPU: the host writes a timestamp before and after it, and reads the pair back
+three frames later, without waiting. `node.gpu_time` is then its time in milliseconds,
+smoothed over frames (a `once` dispatch's is its last run's), or `nil` until the first
+measurement arrives. Frame times stop at the display's refresh rate and say nothing below
+it; this measures the work itself. A device without timestamp queries says so once, and
+leaves `gpu_time` `nil`.
 | draw | `count`, `enabled`, `instances` |
 | parameter block | any value: `block.name = value`, or `block:set{ ... }` |
 
@@ -1110,6 +1146,88 @@ carving 16.8 ms, keeping inside 18.4 ms. The depth composite, without a field: 3
 shell: the inside of the far wall, and whatever the training left inside. Splats long
 along the ray are clipped by their densest point only, which is the same approximation a
 hard `clip()` makes on any volume.
+
+## Example: caching an SDF
+
+`scripts/sdf-cache.lua` (and mode 6 of the showcase, in `scripts/lib/sdf-cache-mode.lua`)
+raymarches one SDF composition two ways, and times both on the GPU:
+
+- **The DAG:** evaluated at every sample, node by node (`shaders/sdf/sdf-dag.slang`), as
+  the depth composite does. Its cost grows with the composition.
+- **The cache:** the same DAG baked once into 3D textures, then sampled
+  (`shaders/sdf/sdf-cache.slang`). One trilinear fetch per sample, whatever the
+  composition.
+
+**The composition:** a sculpture of N shapes on a rising spiral around a core, all
+smoothly joined (`lib/sdf.lua`): spheres, boxes and capsules, colored around the color
+wheel. Its DAG has 2N + 1 nodes; `-` and `=` choose N from 4 to 128.
+
+**The graph:**
+
+| Node | |
+| --- | --- |
+| bake (`shaders/sdf/sdf-bake.slang`, `once`, `timed`) | one thread per voxel: evaluates the DAG at the voxel's center and stores the distance (`r16f`) and the color (`rgba8`) |
+| compare (`shaders/sdf/sdf-compare.slang`, `timed`) | one thread per pixel: the sculpture on a floor under a sun, from the DAG or from the cache |
+| present | the image onto the window |
+
+**The cache:**
+
+- **What it covers:** a cube 1.25 to either side of the composition's origin, in the
+  composition's own space, at 32 to 256 voxels a side.
+- **When it is baked:** again whenever the composition or the resolution changes (the
+  bake's `:rerun()`, after new textures for a new resolution).
+- **Reading it:** sampled with a linear, clamped sampler.
+  - **Inside the cube:** filtering gives back a blend of the eight nearest voxels'
+    distances. That smooths corners and edges finer than a voxel, and can come out a
+    little larger than the true distance near them, so marches step 0.9 of it.
+  - **Outside the cube:** nothing is cached. The distance to the cube, or the cached
+    distance at the cube's nearest point less the way there, are both lower bounds, so a
+    march steps by the larger.
+
+**The comparison pass:**
+
+- **Same work, two sources:** both sources do the same work. Each pixel marches the
+  field to a hit, takes its normal from four more samples, then marches it again toward
+  the sun for a soft shadow and samples it five times for ambient occlusion. The floor's
+  pixels get the shadow and the occlusion too. A pixel therefore samples the field a few
+  dozen to a couple of hundred times, as a real renderer would.
+- **Bounding:** the DAG gets the cache's cube as a bounding volume, so both start and stop
+  marching in the same places.
+- **The error view** (V): marched with the DAG, and where it hits, the cached distance
+  there, which should be 0. Blue is exact, green an eighth of a voxel off, red a quarter
+  or more. At 128³, most of the surface is green or bluer. Flat faces show trilinear
+  banding, and sharp box edges go red: what the cache rounds off.
+
+**Results** (RTX 3050 Laptop GPU, Release, Vulkan, default window size, the raymarching
+pass's GPU time averaged by the benchmark; single runs vary by tens of percent with the
+view):
+
+| Shapes (nodes) | Cache | Bake | DAG | Cache |
+| --- | --- | --- | --- | --- |
+| 4 (9) | 128³, 12 MB | 2.3 ms | 1.0 ms | 0.31 ms |
+| 8 (17) | 128³ | 12.7 ms | 2.5 ms | 0.34 ms |
+| 16 (33) | 128³ | 15.7 ms | 2.8 ms | 0.16 ms |
+| 32 (65) | 128³ | 12.5 ms | 8.3 ms | 0.12 ms |
+| 64 (129) | 128³ | 22.9 ms | 14.6 ms | 0.13 ms |
+| 128 (257) | 128³ | 46.4 ms | 28.3 ms | 0.14 ms |
+| 32 (65) | 32³, 0.2 MB | 0.2 ms | 8.5 ms | 0.09 ms |
+| 32 (65) | 64³, 1.5 MB | 1.5 ms | 8.0 ms | 0.10 ms |
+| 32 (65) | 256³, 96 MB | 92.7 ms | 8.6 ms | 0.27 ms |
+
+- **The DAG** costs in proportion to its nodes.
+- **The cache** costs about the same whatever the composition: from 3 times faster
+  than the DAG at 4 shapes to 200 times at 128. Only at 256³, whose 96 MB no longer fit
+  the GPU's caches, does it slow down noticeably.
+- **Baking** 128³ voxels (two million evaluations of the DAG) costs about one and a half
+  frames of the DAG, and only when something changes.
+- **Other APIs:** a check at 32 shapes and 128³ gave the same pattern on D3D12 (DAG 15.5
+  ms, cache 0.26 ms) and D3D11 (4.0 ms, 0.12 ms); the DAG's cost varies most between them.
+
+**When to cache:** an SDF that changes rarely, and is sampled many times per frame (by
+many pixels, by shadows, by occlusion), is worth baking. The price is memory (resolution³
+× 6 bytes) and detail finer than a voxel. An SDF that changes every frame would pay
+for a bake every frame. The depth composite's spinning composition doesn't change shape,
+and could be cached the same way.
 
 ## Example: combining passes by depth
 

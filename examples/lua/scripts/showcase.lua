@@ -1,9 +1,10 @@
 -- The examples in one script: rigid body physics, the ShaderToy shaders, Gaussian
--- splatting, and a lit scene combined with the splats and SDF shapes by depth, one after
--- another in the same window.
+-- splatting, a lit scene combined with the splats and SDF shapes by depth, and an SDF
+-- composition raymarched from its DAG or from a baked cache, one after another in the
+-- same window.
 --
 --   Left / Right arrows     previous / next mode
---   1 .. 5                  jump to a mode
+--   1 .. 6                  jump to a mode
 --   Steam Controller LB/RB  previous / next mode
 --   Left mouse button       moves iMouse in the ShaderToy modes, orbits the camera in the
 --                           physics, the splats and the depth composite
@@ -107,12 +108,17 @@ end
 -- Rigid body physics on Jolt, shared with physics.lua.
 local physics = rhi.include("lib/physics-mode.lua")(modeDetails)
 
+-- An SDF composition raymarched from its DAG or from a baked cache, shared with
+-- sdf-cache.lua.
+local sdfCache = rhi.include("lib/sdf-cache-mode.lua")(modeDetails)
+
 modes = {
     physics,
     shaderToyMode("2D SDFs", "sdfs2d.slang"),
     shaderToyMode("Controller", "controller.slang"),
     splat,
     fusion,
+    sdfCache,
 }
 
 -- Shows mode `index`, wrapping around at either end.
