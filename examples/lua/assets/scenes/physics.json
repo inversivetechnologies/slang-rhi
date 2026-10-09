@@ -1,6 +1,7 @@
 // The physics playground (showcase mode 1) as a scene: a ball rolls down a ramp into a row
 // of dominoes, the last topples into a box pyramid; a tower stands beside them. The player
-// runs through it all (behaviors/player.lua); B drops boxes and balls from the sky.
+// runs through it all (behaviors/player.lua); B drops boxes and balls from the sky; P
+// pauses, T slows down, R resets (behaviors/physics-controls.lua).
 {
     "name": "Physics",
     "settings": { "background": [0.015, 0.018, 0.025] },
@@ -51,6 +52,7 @@
 
         { "id": "player", "transform": { "position": [0, 0.05, -5] }, "script": { "file": "player.lua" } },
         { "id": "sky", "transform": { "position": [0, 0, 0] }, "script": { "file": "burst.lua", "params": { "key": "B" } } },
+        { "id": "controls", "script": { "file": "physics-controls.lua" } },
 
         { "id": "camera", "camera": { "controller": "player", "fov": 55 } },
     ],

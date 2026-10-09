@@ -1,6 +1,7 @@
 // The depth composite (showcase mode 5) as a scene: meshes, the skull's splats and an SDF
 // sculpture, each rendered on its own and merged by depth, lit and shadowed by one light
-// that orbits them; a second camera in the corner.
+// that orbits them; a second camera in the corner. Keys: the splats' (splat-controls.lua:
+// L lighting, , . budget, / LOD tint, [ ] size) and the SDFs' (sdf-controls.lua: J K blend).
 {
     "name": "Depth composite",
     "settings": { "background": [0.015, 0.018, 0.025] },
@@ -18,6 +19,9 @@
 
         { "id": "skull", "prefab": "skull", "transform": { "position": [-0.2, -0.4, 1.5], "rotation": [0, -60, 0] } },
         { "id": "sculpture", "prefab": "sculpture", "transform": { "position": [1.85, -0.38, 1.25] } },
+
+        { "id": "splat controls", "script": { "file": "splat-controls.lua" } },
+        { "id": "sdf controls", "script": { "file": "sdf-controls.lua" } },
 
         { "id": "camera", "camera": { "controller": "orbit", "target": [0, -0.3, 0.5], "distance": 6.5,
                                        "yaw": 149, "pitch": 18, "fov": 50 } },

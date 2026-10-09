@@ -23,6 +23,16 @@ struct RaymarchCamera
 };
 
 uniform RaymarchCamera camera;
+// 1: march the DAG, and show how far the cache (sdf-cache.slang) is from the surface where
+// it hits: blue exact, green an eighth of a voxel off, red a quarter or more.
+uniform uint sdfShowCacheError;
+
+float3 cacheErrorColor(float x)
+{
+    x = saturate(x);
+    return x < 0.5 ? lerp(float3(0.1, 0.25, 1.0), float3(0.1, 0.9, 0.2), x * 2.0)
+                   : lerp(float3(0.1, 0.9, 0.2), float3(1.0, 0.15, 0.1), x * 2.0 - 1.0);
+}
 uniform float2 viewportSize; // provided by the host: the window's size
 Texture2D<float> meshDepth;
 RWTexture2D<float4> sdfColor; // linear, tone mapped like the meshes; 0 where nothing is hit
@@ -102,6 +112,14 @@ void raymarchMain(uint3 tid: SV_DispatchThreadID)
     float3 world = camera.eye + dir * t;
     float3 albedo = sdfFieldColor(toSdfSpace(world));
     float3 normal = sdfNormal(world);
+    if (sdfShowCacheError != 0)
+    {
+        float voxels = abs(sampleSdfCache(toSdfSpace(world))) / sdfCacheVoxelSize();
+        float3 error = cacheErrorColor(voxels * 4.0) * (0.4 + 0.6 * saturate(dot(fromSdfSpaceDirection(normal), normalize(float3(0.4, 1, -0.3)))));
+        sdfColor[tid.xy] = float4(error, 1);
+        sdfDepth[tid.xy] = depthFromViewZ(t * forwardness);
+        return;
+    }
     // The normal is in the composition's space; turn it back into the world's.
     normal = fromSdfSpaceDirection(normal);
 

@@ -12,9 +12,10 @@
 --
 --   "script": { "file": "spin.lua", "params": { ... } }
 --
--- Constructors run after the meshes and bodies exist (ctx.mesh) and before the graph is
--- built, so a behavior can add bodies, groups to draw (ctx.mesh.addGroup) and cameras
--- (ctx.cameraProviders).
+-- Constructors run after the meshes and bodies (ctx.mesh), the SDFs (ctx.sdf) and the
+-- splats (ctx.splats) are loaded, and before the cameras and the graph, so a behavior can
+-- add bodies, groups to draw (ctx.mesh.addGroup) and cameras (ctx.cameraProviders). It can
+-- ask the viewer to load the scene again by setting ctx.requestReload.
 
 local system = {
     name = "behavior",

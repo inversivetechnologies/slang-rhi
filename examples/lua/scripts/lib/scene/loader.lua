@@ -22,7 +22,8 @@
 --   "repeat"     { "count": n or [nx, ny, nz], "step": [dx, dy, dz],
 --                  "rotationStep": [pitch, yaw, roll],
 --                  "vary": { "component": { "field": [value, value, ...] } } }
---                  -- copies, each moved by `step` per index along each axis, turned by
+--                  -- copies, each moved by `step` per index along each axis (a plain
+--                  n is a row along x; [1, n, 1] a column up y), turned by
 --                  `rotationStep` per copy, and given the values of `vary` in turn
 --   "_..."       anything starting with an underscore is a comment, and ignored
 --

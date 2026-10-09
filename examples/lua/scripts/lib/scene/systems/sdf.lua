@@ -5,7 +5,14 @@
 -- sampled from them (sdf/sdf-cache.slang): see "Example: caching an SDF" in the README.
 --
 --   "sdf": { "shape": { ...a node... }, "cache": 0 (the DAG) or 32..256 (voxels a side),
---            "sharpness": 8 (of the soft shadows' edges) }
+--            "sharpness": 8 (of the soft shadows' edges),
+--            "blend": 0 (how smoothly the entities' shapes join one another: the union of
+--                        all of them is smooth over the largest entity's blend) }
+--
+-- The raymarching is timed on the GPU (its graph node's gpu_time). For behaviors,
+-- ctx.sdf has setSource (0 the DAG, 1 the cache, 2 the cache's error, where the DAG hits),
+-- setResolution (a new cache, baked again), setSmoothScale (every blend radius times this)
+-- and gpuTime() (the main view's raymarching, in milliseconds).
 --
 -- A node is one primitive or one operation, with optional modifiers:
 --
@@ -28,6 +35,7 @@ local system = {
             shape = { "object", nil, true },
             cache = { "number", 0 },
             sharpness = { "number", 8 },
+            blend = { "number", 0 },
         },
     },
 }
@@ -134,21 +142,23 @@ end
 
 function system.load(ctx)
     local shapes, spheres = {}, {}
-    local cache, sharpness = 0, 8
+    local cache, sharpness, blend = 0, 8, 0
     for id, component, transform in ctx.world:query("sdf", "transform") do
         local shape, bounds = build(component.shape, ctx.world:name(id) .. ".sdf.shape")
         shapes[#shapes + 1] = shape:place(matrixOf(transform.rotation), transform.position, transform.scale)
         spheres[#spheres + 1] = { center = T.apply(transform, bounds.center), radius = bounds.radius * transform.scale }
         cache = math.max(cache, component.cache)
         sharpness = component.sharpness
+        blend = math.max(blend, component.blend)
     end
     if #shapes == 0 then return end
 
     -- One composition, centered on its bounds: its space is the world's, moved there.
     local bounds = enclose(spheres)
-    local radius = bounds.radius * 1.05 + 0.02
+    local radius = bounds.radius * 1.05 + 0.02 + blend
     local c = bounds.center
-    local program = sdf.compile(sdf.union(table.unpack(shapes)):translate(-c[1], -c[2], -c[3]))
+    local all = blend > 0 and sdf.smoothUnion(blend, table.unpack(shapes)) or sdf.union(table.unpack(shapes))
+    local program = sdf.compile(all:translate(-c[1], -c[2], -c[3]))
     local s = {
         program = program,
         nodes = rhi.buffer(program.floats),
@@ -157,11 +167,46 @@ function system.load(ctx)
         cache = cache,
         sharpness = sharpness,
         raymarch = rhi.compute_pipeline("sdf/raymarch.slang", "raymarchMain"),
+        source = cache > 0 and 1 or 0,
+        raymarchNodes = {},
     }
     if cache > 0 then
         s.distance = rhi.texture { width = cache, height = cache, depth = cache, format = "r16f" }
         s.color = rhi.texture { width = cache, height = cache, depth = cache, format = "rgba8" }
     end
+
+    -- At run time (for behaviors).
+    function s.setSource(source)
+        if s.cache == 0 then return end
+        s.source = source
+        ctx.shadowBlock:set { sdfUseCache = source == 1 and 1 or 0, sdfShowCacheError = source == 2 and 1 or 0 }
+    end
+
+    function s.setResolution(n)
+        if s.cache == 0 then return end
+        s.cache = n
+        s.distance = rhi.texture { width = n, height = n, depth = n, format = "r16f" }
+        s.color = rhi.texture { width = n, height = n, depth = n, format = "rgba8" }
+        ctx.shadowBlock:set { sdfCacheDistance = s.distance, sdfCacheColor = s.color, sdfCacheResolution = n }
+        s.bakeBlock:set { sdfCacheDistanceOut = s.distance, sdfCacheColorOut = s.color, sdfCacheResolution = n }
+        s.bakeNode.threads = { n, n, n }
+        s.bakeNode:rerun()
+    end
+
+    function s.setSmoothScale(scale)
+        ctx.shadowBlock.smoothScale = scale
+        if s.bakeNode then s.bakeNode:rerun() end
+    end
+
+    function s.gpuTime()
+        local node = s.raymarchNodes[1]
+        return node and node.gpu_time
+    end
+
+    function s.bakeTime()
+        return s.bakeNode and s.bakeNode.gpu_time
+    end
+
     ctx.sdf = s
 end
 
@@ -182,6 +227,7 @@ function system.shadowFields(ctx)
     }
     if s.cache > 0 then
         fields.sdfUseCache = 1
+        fields.sdfShowCacheError = 0
         fields.sdfCacheDistance = s.distance
         fields.sdfCacheColor = s.color
         fields.sdfCacheExtent = s.radius
@@ -194,15 +240,16 @@ end
 function system.addPrepasses(ctx, graph)
     local s = ctx.sdf
     if not s or s.cache == 0 then return end
-    graph:dispatch {
+    s.bakeBlock = rhi.params {
+        sdfCacheDistanceOut = s.distance, sdfCacheColorOut = s.color, sdfCacheExtent = s.radius, sdfCacheResolution = s.cache,
+    }
+    s.bakeNode = graph:dispatch {
         name = "sdf bake",
         pipeline = rhi.compute_pipeline("sdf/sdf-bake.slang", "bakeMain"),
-        params = {
-            ctx.shadowBlock,
-            { sdfCacheDistanceOut = s.distance, sdfCacheColorOut = s.color, sdfCacheExtent = s.radius, sdfCacheResolution = s.cache },
-        },
+        params = { ctx.shadowBlock, s.bakeBlock },
         threads = { s.cache, s.cache, s.cache },
         once = true,
+        timed = true,
     }
 end
 
@@ -211,18 +258,21 @@ function system.addSurfaces(ctx, graph, view)
     local s = ctx.sdf
     if not s then return end
     local t = view.targets
-    graph:dispatch {
+    s.raymarchNodes[#s.raymarchNodes + 1] = graph:dispatch {
         name = view.name .. ": raymarch",
         pipeline = s.raymarch,
         params = { ctx.light, ctx.shadowBlock, view.block, { meshDepth = t.meshDepth, sdfColor = t.sdfColor, sdfDepth = t.sdfDepth } },
         threads = t.sdfColor,
+        timed = true,
     }
 end
 
 function system.describe(ctx)
     local s = ctx.sdf
     if not s then return nil end
-    return string.format("SDF %d nodes%s", s.program.nodeCount, s.cache > 0 and string.format(", cached %d^3", s.cache) or "")
+    local time = s.gpuTime()
+    return string.format("SDF %d nodes%s%s", s.program.nodeCount, s.cache > 0 and string.format(", cache %d^3", s.cache) or "",
+        time and string.format(", raymarched in %.2f ms", time) or "")
 end
 
 return system

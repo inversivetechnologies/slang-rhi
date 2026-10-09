@@ -1935,9 +1935,10 @@ public:
             viewport[3] = node.viewport[3] * destination.height;
         }
 
-        // A depth-only pass always has its depth buffer (so that its clear clears it, even
-        // with nothing drawn); others when a draw tests depth.
-        bool depth = node.depthOnly;
+        // A depth-only pass always has its depth buffer, and so does a pass that clears a
+        // depth target of the script's (so that the clear happens even with nothing drawn);
+        // others when a draw tests depth.
+        bool depth = node.depthOnly || (node.depthTarget && node.clear);
         for (const std::shared_ptr<GraphDraw>& draw : node.draws)
         {
             depth = depth || (draw->enabled && draw->pipeline->depth);

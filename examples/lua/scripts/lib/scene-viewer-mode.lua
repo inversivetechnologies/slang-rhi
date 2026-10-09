@@ -84,7 +84,13 @@ return function(setTitle, first)
     end
 
     function mode.update(_, dt)
-        if current then current:update(dt) end
+        if current then
+            current:update(dt)
+            if current.ctx.requestReload then
+                load(index)
+                return
+            end
+        end
         titleTimer = titleTimer + dt
         if titleTimer > 0.5 then
             titleTimer = 0
@@ -108,8 +114,8 @@ return function(setTitle, first)
             updateTitle()
         elseif action == input.PRESS and key == keys.TAB then
             current:toggleInsets()
-        else
-            current:on_key(key, action, mods)
+        elseif current:on_key(key, action, mods) then
+            updateTitle() -- what the key changed, at once
         end
     end
 

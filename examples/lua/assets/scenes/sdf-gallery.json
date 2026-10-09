@@ -1,5 +1,6 @@
 // SDF sculptures on a floor: one composition for the scene, baked into a 3D texture cache
 // (sdf/sdf-cache.slang) and sampled -- by the raymarching and by every soft shadow.
+// sdf-controls.lua: C the DAG / the cache / its error, [ ] resolution, B benchmark, J K blend.
 {
     "name": "SDF gallery",
     "settings": { "background": [0.03, 0.035, 0.045] },
@@ -23,6 +24,7 @@
               "smooth": 0.05,
           } } },
 
+        { "id": "controls", "script": { "file": "sdf-controls.lua" } },
         { "id": "camera", "camera": { "controller": "orbit", "target": [0, -0.2, -0.3], "distance": 5.5, "yaw": 10, "pitch": 20 } },
     ],
 }

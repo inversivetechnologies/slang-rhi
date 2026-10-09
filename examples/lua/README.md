@@ -138,14 +138,25 @@ at a time, built by the [scene system](#the-scene-system).
 | Page Up / Page Down | previous / next scene |
 | V | show everything / the meshes / the splats / the SDFs / the depth buffers |
 | Tab | hide or show the insets |
-| everything else | the scene's: its behaviors (the player's controls in `physics.json`, B to drop boxes), its orbit camera (drag, wheel), M to mute its sounds |
+| everything else | the scene's: its behaviors (below), its orbit camera (drag, wheel), M to mute its sounds |
 
-| Scene | |
-| --- | --- |
-| `composite.json` | the depth composite (mode 5): meshes, the skull's splats and an SDF sculpture merged by depth, a second camera in the corner |
-| `physics.json` | the physics playground (mode 1) with the player |
-| `sdf-gallery.json` | three SDF sculptures and an arch, baked into one cache |
-| `splats.json` | a grid of skulls carved per pixel by moving shapes, with music |
+Every showcase mode has a scene; their keys come from behaviors in the scene.
+
+| Scene | Showcase mode | | Keys |
+| --- | --- | --- | --- |
+| `physics.json` | 1, Physics | the ramp, the dominoes, the pyramid, the tower, the player | the player's; B drop boxes; P pause, T slow motion, R reset |
+| `shadertoy-sdfs2d.json` | 2, ShaderToy: 2D SDFs | `shader-toy/sdfs2d.slang` | the mouse |
+| `shadertoy-controller.json` | 3, ShaderToy: Controller | `shader-toy/controller.slang` | the Steam Controller |
+| `splats.json` | 4, Gaussian Splats | a grid of skulls carved per pixel by moving shapes, with music | `,` `.` budget, `/` LOD tint, `[` `]` size, L lighting, C clip mode, M mute |
+| `composite.json` | 5, Depth Composite | meshes, the skull's splats and an SDF sculpture merged by depth, a second camera in the corner | the splats' (as above, but C), J K blend |
+| `sdf-benchmark.json` | 6, SDF Cache | a turning spiral of 64 shapes around a core, 129 nodes, cached | C DAG / cache / cache error, `[` `]` resolution, B benchmark, J K blend, Space stop the camera |
+| `sdf-gallery.json` | | three SDF sculptures and an arch, baked into one cache | as `sdf-benchmark.json` |
+
+Some details differ from the modes, which stay in the showcase:
+
+- **SDF benchmark:** its shape count is fixed by the file, not changed by keys.
+- **Splat grid:** so is its grid's size.
+- **Physics:** R loads the whole scene again rather than only the bodies.
 
 Saving a scene or prefab file reloads it. A scene that fails to load (bad JSON, an unknown
 component or field) says why in the window title, and the viewer goes on.
@@ -637,7 +648,8 @@ end
   - `color = false`: a depth-only pass. It has no color target, only its
     `depth_target`, and its draws use pipelines with `format = "none"`.
   - `clear`: clears the target first (and its depth buffer). For a depth-only pass, any
-    `clear` table clears the depth buffer.
+    `clear` table clears the depth buffer. A pass's `depth_target` is cleared by its
+    `clear` even if nothing in the pass is drawn with depth.
   - `viewport` is in pixels. `viewport_fraction` is in fractions of the target's size, so
     it follows window resizes.
 - **Depth:** a pass uses its target's depth buffer when any of its draws' pipelines has
@@ -1190,7 +1202,7 @@ on each other.
 | `lib/scene/ecs.lua` | the entities and components |
 | `lib/scene/transform.lua` | transforms: position, rotation (a quaternion), uniform scale |
 | `lib/scene/loader.lua` | scene files to a world: prefabs, children, repeats, schema checks |
-| `lib/scene/systems/*.lua` | one per kind of component: light, mesh (and body), behavior, sdf, splat, camera, sound |
+| `lib/scene/systems/*.lua` | one per kind of component: light, mesh (and body), sdf, splat, behavior, camera, sound, shadertoy |
 | `lib/scene/renderer.lua` | the render graph, from what the systems contribute |
 | `lib/scene/scene.lua` | a loaded scene: load, enter, leave, update, input |
 | `lib/scene-viewer-mode.lua` | the viewer (mode 7 of the showcase; `scenes.lua`) |
@@ -1236,7 +1248,7 @@ An entity's keys are component types, plus:
 | `prefab` | the entity starts as this prefab (`assets/prefabs/<name>.json`, or the scene's inline `prefabs`); its own keys override it: objects merge key by key, other values replace, children add up. Prefabs can start from prefabs |
 | `transform` | `position`, `rotation` ([pitch, yaw, roll] in degrees: roll first, then pitch, then yaw), `scale` (uniform); for children, in the parent's frame |
 | `children` | entities placed in this one's frame |
-| `repeat` | copies: `count` (n, or [nx, ny, nz]), each moved by `step` per index along each axis, turned by `rotationStep` per copy, and given the values of `vary` (component, field, a list of values) in turn |
+| `repeat` | copies: `count` (n, or [nx, ny, nz]), each moved by `step` per index along each axis (so a plain n is a row along x; [1, n, 1] a column up y), turned by `rotationStep` per copy, and given the values of `vary` (component, field, a list of values) in turn |
 | `_...` | a comment, ignored |
 
 **Checks.** Every component is checked against its system's schema (each field's type, a
@@ -1252,8 +1264,9 @@ missing required field stops the load, with the entity and the field in the mess
 | `mesh` | `shape` ("box" or "sphere"), `size` (a box's, whole: [1, 1, 1]), `radius` (0.5), `color`, `pattern` (0 plain, 1 stripes, 2 checker) | instanced, lit and shadowed boxes and spheres |
 | `body` | `motion` ("dynamic", "static", "kinematic"), `density` (1000), `friction` (0.5), `restitution` (0), `velocity`, `angularVelocity` | a Jolt body for the mesh; without it, the mesh is visual (placed by Lua) |
 | `splat` | `file` (required), `fit` (a radius to scale to; 0: as is), `grid` ([nx, nz] copies), `spacing`, `turn` (degrees per copy), `clip` (`mode` "carve" or "keep", `shapes`: spheres and boxes with `position`, `move`, `speed`, `spin`) | Gaussian splats with LOD, lighting, shadows, clipping; one renderer per file, entities as its instances |
-| `sdf` | `shape` (required: a node, below), `cache` (0: the DAG; or voxels a side), `sharpness` (8, of soft shadows) | all entities' shapes as one composition, raymarched, shadowing everything; cached if any asks |
-| `camera` | `fov` (50), `controller` ("orbit", "fixed", "player"), `target`, `distance`, `yaw`, `pitch` (degrees), `inset` (0: the main view; else a square of that fraction of the window's height), `corner` | the views |
+| `sdf` | `shape` (required: a node, below), `cache` (0: the DAG; or voxels a side), `sharpness` (8, of soft shadows), `blend` (0: how smoothly the entities' shapes join one another) | all entities' shapes as one composition, raymarched (timed on the GPU), shadowing everything; cached if any asks |
+| `camera` | `fov` (50), `controller` ("orbit", "fixed", "player"), `target`, `distance`, `yaw`, `pitch` (degrees), `turn` (degrees per second: an orbit that turns by itself), `inset` (0: the main view; else a square of that fraction of the window's height), `corner` | the views |
+| `shadertoy` | `shader` (required: in `shaders/shader-toy/`) | a ShaderToy shader over the whole window, with ShaderToy's inputs (iTime, iMouse, iController...) updated every frame |
 | `sound` | `file` (required), `loop` (true), `volume` (1), `autoplay` (true) | played while the scene shows |
 | `script` | `file` (required: in `scripts/behaviors/`), `params` | a behavior |
 
@@ -1289,6 +1302,9 @@ return true when they handle the event), `addOverlays(graph)`, `enter()`, `leave
 | `spin.lua` | turns a visual mesh about an axis (`speed` in degrees per second, `axis`) |
 | `burst.lua` | drops boxes and balls from above the entity on a key (`key`, `button`, `count`, `area`, `height`) |
 | `player.lua` | the player character (`lib/player.lua`): spawns at the entity, hits and throws at the dynamic bodies, provides the "player" camera, draws the crosshair |
+| `physics-controls.lua` | P pause, T slow motion, R reset (asks the viewer to load the scene again: `ctx.requestReload`) |
+| `splat-controls.lua` | for every splat file: `,` `.` budget, `/` LOD tint, `[` `]` size, L lighting (lit / as captured / light visibility), C clip mode |
+| `sdf-controls.lua` | J K blend radii; with a cache: C DAG / cache / the cache's error, `[` `]` resolution (baked again), B a benchmark of the raymarching's GPU time with both, Space stop turning cameras |
 
 ### The frame
 
@@ -1302,7 +1318,7 @@ return true when they handle the event), `addOverlays(graph)`, `enter()`, `leave
 | per view: opaque | renderer, mesh | color and depth; the meshes draw into it |
 | per view: surfaces | sdf, splat | the raymarching (stopping at the meshes' depth), the splats |
 | per view: depth composite | renderer | the view's surfaces merged by depth (`post/depth-composite.slang`), into the window or the inset's texture |
-| overlays | behaviors | over the main view (the crosshair) |
+| overlays | behaviors, shadertoy | over the main view: the crosshair; a ShaderToy shader over all of it |
 | insets | renderer, camera | each inset framed in its corner, stacked if several share one |
 
 - **One light and one shadow block:** every surface reads the same light block and the same

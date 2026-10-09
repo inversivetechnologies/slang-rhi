@@ -6,6 +6,7 @@
 --               "controller": "orbit" | "fixed" | "player",
 --               "target": [x, y, z]   -- what it looks at; an orbit's center
 --               "distance": 6, "yaw": 0, "pitch": 25 (degrees) -- for "orbit"
+--               "turn": 0 (degrees per second: an orbit that turns by itself)
 --               "inset": 0 (the main view) or a size, e.g. 0.3,
 --               "corner": "bottom-right" | "bottom-left" | "top-right" | "top-left" }
 --
@@ -24,6 +25,7 @@ local system = {
             distance = { "number", 6 },
             yaw = { "number", 0 },
             pitch = { "number", 25 },
+            turn = { "number", 0 },
             inset = { "number", 0 },
             corner = { "string", "bottom-right" },
         },
@@ -68,7 +70,10 @@ function system.load(ctx)
         end
     end
     if not main then
-        main = { name = "camera", camera = { fov = 50, controller = "orbit", target = { 0, 0, 0 }, distance = 8, yaw = 30, pitch = 25 } }
+        main = { name = "camera", camera = {
+            fov = 50, controller = "orbit", target = { 0, 0, 0 }, distance = 8, yaw = 30, pitch = 25, turn = 0, inset = 0,
+            corner = "bottom-right",
+        } }
     end
     ctx.views = { main }
     for _, view in ipairs(insets) do ctx.views[#ctx.views + 1] = view end
@@ -101,9 +106,13 @@ function system.layout(ctx, width, height)
     end
 end
 
-function system.update(ctx)
+function system.update(ctx, dt)
     for _, view in ipairs(ctx.views) do
-        if view.camera.controller == "player" then
+        local c = view.camera
+        if c.controller == "player" then
+            view.block.camera = cameraParams(ctx, view)
+        elseif c.controller == "orbit" and c.turn ~= 0 and not ctx.cameraStill then
+            c.yaw = c.yaw + c.turn * dt
             view.block.camera = cameraParams(ctx, view)
         end
     end

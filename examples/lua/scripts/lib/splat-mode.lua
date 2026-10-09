@@ -606,6 +606,22 @@ return function(setTitle, file)
         blocks.lighting.showVisibility = show and 1 or 0
     end
 
+    -- Tints the splats by their level of detail (as / does).
+    function splat.setShowLevels(show)
+        splat.createResources()
+        blocks.lod.lodShowLevels = show and 1 or 0
+    end
+
+    -- Multiplies every splat's size (as [ and ] do); 1 is as trained.
+    function splat.setSplatScale(scale)
+        splat.createResources()
+        splatScale = scale
+        blocks.view.splatScale = scale
+        for _, node in ipairs(casterNodes) do node:rerun() end
+    end
+
+    function splat.budget() return budget end
+
     -- The splats' own graph: drawn on a dark background, composited onto the window.
     local instanceNodes = {} -- this graph's dispatches over every instance
 

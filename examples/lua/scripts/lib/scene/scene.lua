@@ -8,8 +8,9 @@
 --   scene:on_key(...)        -- input goes to the systems, the first to want it takes it
 --   scene:leave()
 --
--- The systems, in the order they load and contribute: the light, meshes and bodies,
--- behaviors (which may add bodies, groups and cameras), SDFs, splats, cameras, sounds.
+-- The systems, in the order they load and contribute: the light, meshes and bodies, SDFs,
+-- splats, behaviors (which see all of those, and may add bodies, groups and cameras),
+-- cameras, sounds, ShaderToy shaders.
 
 local loader = rhi.include("lib/scene/loader.lua")
 local renderer = rhi.include("lib/scene/renderer.lua")
@@ -17,11 +18,12 @@ local renderer = rhi.include("lib/scene/renderer.lua")
 local SYSTEMS = {
     rhi.include("lib/scene/systems/light.lua"),
     rhi.include("lib/scene/systems/mesh.lua"),
-    rhi.include("lib/scene/systems/behavior.lua"),
     rhi.include("lib/scene/systems/sdf.lua"),
     rhi.include("lib/scene/systems/splat.lua"),
+    rhi.include("lib/scene/systems/behavior.lua"),
     rhi.include("lib/scene/systems/camera.lua"),
     rhi.include("lib/scene/systems/sound.lua"),
+    rhi.include("lib/scene/systems/shadertoy.lua"),
 }
 
 local scenes = { systems = SYSTEMS, renderer = renderer }

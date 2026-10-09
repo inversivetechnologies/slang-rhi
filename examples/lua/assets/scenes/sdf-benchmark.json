@@ -1,0 +1,37 @@
+// The showcase's "SDF Cache" mode as a scene: a sculpture of 64 shapes on a spiral around
+// a core, smoothly joined into one composition of 129 nodes, raymarched from its DAG or
+// from its cache; the camera turns around it. sdf-controls.lua has the keys: C the DAG /
+// the cache / the cache's error, [ ] the cache's resolution, B a benchmark of both
+// (GPU time), J K the blend, Space stops the camera.
+{
+    "name": "SDF benchmark",
+    "settings": { "background": [0.16, 0.19, 0.25] },
+    "entities": [
+        { "id": "light", "transform": { "position": [2.5, 4.5, -2.5] },
+          "light": { "color": [1.0, 0.92, 0.8], "intensity": 45, "range": 30 } },
+        { "id": "floor", "prefab": "floor", "transform": { "position": [0, -1.2, 0] } },
+
+        { "id": "core", "sdf": { "cache": 128, "blend": 0.06, "shape": { "sphere": 0.3, "color": [0.92, 0.88, 0.8] } } },
+
+        // The spiral: one entity, repeated -- each copy a little higher, and turned by the
+        // golden angle about the vertical, which carries its shape (0.6 out) round; its
+        // shape cycles through six, each its own color.
+        { "id": "spiral", "transform": { "position": [0, -0.75, 0] },
+          "sdf": { "cache": 128, "blend": 0.06, "shape": { "sphere": 0.13, "position": [0.6, 0, 0] } },
+          "repeat": { "count": [1, 64, 1], "step": [0, 0.023, 0], "rotationStep": [0, 137.5, 0],
+                      "vary": { "sdf": { "shape": [
+                          { "sphere": 0.13, "position": [0.6, 0, 0], "color": [0.9, 0.4, 0.3] },
+                          { "box": [0.24, 0.15, 0.24], "rotation": [30, 0, 0], "position": [0.6, 0, 0], "color": [0.9, 0.75, 0.3] },
+                          { "capsule": { "radius": 0.06, "a": [0, -0.13, 0], "b": [0, 0.13, 0] }, "rotation": [0, 0, 40],
+                            "position": [0.6, 0, 0], "color": [0.45, 0.85, 0.35] },
+                          { "sphere": 0.11, "position": [0.6, 0, 0], "color": [0.3, 0.8, 0.8] },
+                          { "box": [0.2, 0.12, 0.2], "rotation": [0, 45, 30], "position": [0.6, 0, 0], "color": [0.35, 0.5, 0.95] },
+                          { "capsule": { "radius": 0.05, "a": [0, -0.11, 0], "b": [0, 0.11, 0] }, "rotation": [40, 0, 0],
+                            "position": [0.6, 0, 0], "color": [0.8, 0.4, 0.9] },
+                      ] } } } },
+
+        { "id": "controls", "script": { "file": "sdf-controls.lua" } },
+        { "id": "camera", "camera": { "controller": "orbit", "target": [0, -0.1, 0], "distance": 4.2,
+                                       "yaw": 35, "pitch": 18, "fov": 45, "turn": 14 } },
+    ],
+}
