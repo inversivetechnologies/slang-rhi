@@ -7,6 +7,7 @@
 // See examples/lua/README.md for the script API.
 
 #include "example-base.h"
+#include "audio.h"
 #include "physics.h"
 #include "splat-lod.h"
 
@@ -683,6 +684,7 @@ const char* kDrawType = "rhi.Draw";
 const char* kPhysicsType = "rhi.PhysicsWorld";
 const char* kBodyGroupType = "rhi.BodyGroup";
 const char* kCharacterType = "rhi.Character";
+const char* kSoundType = "rhi.Sound";
 
 // Script handles hold a shared_ptr to the host-side object.
 template<typename T>
@@ -3269,6 +3271,102 @@ public:
         return 1;
     }
 
+    // rhi.sound(path [, { loop = false, volume = 1, play = false }]): a sound from a file
+    // (WAV, FLAC or MP3, by its contents), looked up as rhi.load_ply's files are, and
+    // streamed from disk as it plays (audio.h). Without an audio device it still works,
+    // silently. The sound stops when its handle is collected (or the script reloads).
+    static int apiSound(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        fs::path path = app->resolveAssetPath(luaL_checkstring(L, 1));
+        std::string error;
+        bool silent = false;
+        std::unique_ptr<audio::Sound> sound = audio::Sound::load(path, error, silent);
+        if (!sound)
+            luaL_error(L, "%s: %s", path.generic_string().c_str(), error.c_str());
+        static bool warned = false;
+        if (silent && !warned)
+        {
+            printf("[lua] no audio device could be started: sounds are silent\n");
+            fflush(stdout);
+            warned = true;
+        }
+        bool play = false;
+        if (lua_istable(L, 2))
+        {
+            sound->setLooping(lua_getfield(L, 2, "loop") != LUA_TNIL && lua_toboolean(L, -1));
+            lua_pop(L, 1);
+            sound->setVolume(readFloat(L, 2, "volume", 1.0f));
+            play = lua_getfield(L, 2, "play") != LUA_TNIL && lua_toboolean(L, -1);
+            lua_pop(L, 1);
+        }
+        if (play)
+            sound->play();
+        pushHandle(L, std::shared_ptr<audio::Sound>(std::move(sound)), kSoundType);
+        return 1;
+    }
+
+    // sound:play(), sound:pause(), sound:stop() (pause, back to the start), sound:seek(seconds)
+    static int soundPlay(lua_State* L)
+    {
+        checkShared<audio::Sound>(L, 1, kSoundType)->play();
+        return 0;
+    }
+    static int soundPause(lua_State* L)
+    {
+        checkShared<audio::Sound>(L, 1, kSoundType)->pause();
+        return 0;
+    }
+    static int soundStop(lua_State* L)
+    {
+        auto sound = checkShared<audio::Sound>(L, 1, kSoundType);
+        sound->pause();
+        sound->seek(0.0);
+        return 0;
+    }
+    static int soundSeek(lua_State* L)
+    {
+        checkShared<audio::Sound>(L, 1, kSoundType)->seek(luaL_checknumber(L, 2));
+        return 0;
+    }
+
+    // sound.playing, sound.position, sound.length (seconds), sound.volume, sound.loop
+    static int soundIndex(lua_State* L)
+    {
+        auto sound = checkShared<audio::Sound>(L, 1, kSoundType);
+        const char* key = luaL_checkstring(L, 2);
+        if (strcmp(key, "playing") == 0)
+            lua_pushboolean(L, sound->playing());
+        else if (strcmp(key, "position") == 0)
+            lua_pushnumber(L, sound->position());
+        else if (strcmp(key, "length") == 0)
+            lua_pushnumber(L, sound->length());
+        else if (strcmp(key, "volume") == 0)
+            lua_pushnumber(L, sound->volume());
+        else if (strcmp(key, "loop") == 0)
+            lua_pushboolean(L, sound->looping());
+        else
+        {
+            lua_pushvalue(L, lua_upvalueindex(1));
+            lua_getfield(L, -1, key);
+        }
+        return 1;
+    }
+
+    // sound.volume = v, sound.loop = bool
+    static int soundNewIndex(lua_State* L)
+    {
+        auto sound = checkShared<audio::Sound>(L, 1, kSoundType);
+        const char* key = luaL_checkstring(L, 2);
+        if (strcmp(key, "volume") == 0)
+            sound->setVolume(float(luaL_checknumber(L, 3)));
+        else if (strcmp(key, "loop") == 0)
+            sound->setLooping(lua_toboolean(L, 3));
+        else
+            luaL_error(L, "can't set '%s' on a sound", key);
+        return 0;
+    }
+
     // rhi.window_srgb(): true if the window's format encodes sRGB itself.
     static int apiWindowSrgb(lua_State* L)
     {
@@ -3682,6 +3780,7 @@ public:
             {"time", apiTime},
             {"set_title", apiSetTitle},
             {"window_size", apiWindowSize},
+            {"sound", apiSound},
             {"include", apiInclude},
             {"params", apiParams},
             {"graph", apiGraph},
@@ -3878,6 +3977,16 @@ public:
         };
         newType(L, kCharacterType, characterIndex, kCharacterMethods, collectHandle<CharacterHandle>);
         setNewIndex(L, kCharacterType, characterNewIndex);
+
+        static const luaL_Reg kSoundMethods[] = {
+            {"play", soundPlay},
+            {"pause", soundPause},
+            {"stop", soundStop},
+            {"seek", soundSeek},
+            {nullptr, nullptr},
+        };
+        newType(L, kSoundType, soundIndex, kSoundMethods, collectHandle<audio::Sound>);
+        setNewIndex(L, kSoundType, soundNewIndex);
         setNewIndex(L, kDrawType, drawNewIndex);
     }
 

@@ -1261,6 +1261,23 @@ if(SLANG_RHI_BUILD_EXAMPLES)
         FetchContent_MakeAvailable(JoltPhysics)
         target_sources(example-lua PRIVATE examples/lua/physics.cpp examples/lua/splat-lod.cpp)
         target_link_libraries(example-lua PRIVATE Jolt)
+
+        # miniaudio, for the example host's sounds (examples/lua/audio.cpp): one header,
+        # compiled into audio.cpp. Its own CMake project isn't needed, so SOURCE_SUBDIR
+        # points where there is none, and FetchContent only downloads it.
+        FetchContent_Declare(
+            miniaudio
+            GIT_REPOSITORY https://github.com/mackron/miniaudio.git
+            GIT_TAG 0.11.25
+            GIT_SHALLOW TRUE
+            SOURCE_SUBDIR no-cmake-build
+        )
+        FetchContent_MakeAvailable(miniaudio)
+        target_sources(example-lua PRIVATE examples/lua/audio.cpp)
+        target_include_directories(example-lua PRIVATE ${miniaudio_SOURCE_DIR})
+        if(UNIX AND NOT APPLE)
+            target_link_libraries(example-lua PRIVATE dl pthread m)
+        endif()
         if(SLANG_RHI_MASTER_PROJECT AND CMAKE_GENERATOR MATCHES "Visual Studio")
             set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT example-lua)
             set_property(TARGET example-lua PROPERTY VS_DEBUGGER_COMMAND_ARGUMENTS "showcase")

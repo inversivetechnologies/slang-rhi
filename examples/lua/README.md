@@ -25,6 +25,7 @@ examples/lua/
   example-lua.cpp      the host
   physics.h/.cpp       rigid body physics for the host, on Jolt Physics
   splat-lod.h/.cpp     levels of detail for Gaussian splats, built when a PLY is loaded
+  audio.h/.cpp         sound for the host, on miniaudio
   README.md
   scripts/             runnable scripts, one per example
     lib/               Lua modules used by scripts (rhi.include), not run on their own
@@ -42,7 +43,7 @@ examples/lua/
                        raymarching pass (raymarch)
     post/              full-screen passes (composite, depth-composite, crosshair)
     shader-toy/        the ShaderToy framework (shader-toy.slang) and the toys
-  assets/              data files the scripts load (skull.ply)
+  assets/              data files the scripts load (skull.ply, audio/timelapse.mpeg)
 ```
 
 **How paths resolve:**
@@ -133,6 +134,7 @@ depth](#example-combining-passes-by-depth).
 | `,` / `.` | splat budget ÷1.25 / ×1.25: the most splats drawn per frame, over all instances (1 million to start, 50,000 to 2,097,152) |
 | `-` / `=` | fewer / more instances: a grid of 1 × 1 up to 5 × 5 skulls (3 × 3 to start); the camera backs off to fit them |
 | C | clip the splats per pixel by spheres and boxes moving through the grid: carve them out (to start) / keep only what is inside them / off |
+| M | mute / unmute the music (`assets/audio/timelapse.mpeg`, looped while this mode shows) |
 | `/` | tint the splats by level of detail: grey for the file's own, then blue, green, yellow, orange, red, ... for each level of merged ones |
 | F | flip the scene upside down (for captures that aren't y-down) |
 
@@ -357,7 +359,9 @@ pass's shader, to combine images by depth, or for any screen-space effect.
 | `rhi.include(path)` | runs a Lua file (relative to the script) and returns its result; saving that file reloads the script |
 | `rhi.window_srgb()` | `true` if the window's format encodes sRGB itself (as `frame.srgb`, but usable in `init`) |
 | `rhi.window_size()` | the window's size in pixels, `width, height` (usable in `init`) |
+| `rhi.params{...}`, `rhi.graph()`, `rhi.set_graph(graph)` | see [Render graphs](#render-graphs) |
 | `rhi.load_ply(path [, { lod = true }])` | loads a PLY file's vertices into a buffer; see below |
+| `rhi.sound(path [, { loop, volume, play }])` | a sound from a file; see [Sound](#sound) |
 
 `rhi.load_ply(path)` reads the vertex element of a binary little-endian PLY file whose
 vertex properties are all floats, which is the format Gaussian splatting scenes come in. It
@@ -395,7 +399,38 @@ They are built once per file and cached in the temp directory
 modification time. For `skull.ply`, the build takes 1.8 s in Release and 11–16 s in Debug,
 and reading the cache (and reordering the records) takes 0.5–2 s. How they are built and drawn is in [Levels of
 detail](#levels-of-detail).
-| `rhi.params{...}`, `rhi.graph()`, `rhi.set_graph(graph)` | see [Render graphs](#render-graphs) |
+
+#### Sound
+
+`rhi.sound(path [, options])` loads a sound: WAV, FLAC or MP3, recognized by its contents
+whatever the extension. The path is looked up like `rhi.load_ply`'s: next to the script,
+then in `assets/`. It is streamed from disk as it plays, and mixed with any others on the
+default audio device.
+
+| Option | Default | |
+| --- | --- | --- |
+| `loop` | `false` | start over at the end |
+| `volume` | 1 | 1 is as recorded; 0 silent |
+| `play` | `false` | start playing at once |
+
+| On a sound | |
+| --- | --- |
+| `sound:play()`, `sound:pause()` | from where it is; it stays where it is |
+| `sound:stop()` | pauses, back to the start |
+| `sound:seek(seconds)` | from the start |
+| `sound.playing`, `sound.position`, `sound.length` | read only; seconds |
+| `sound.volume`, `sound.loop` | settable |
+
+- **When it stops:** a sound stops when its handle is collected, so a script reload
+  silences the old script's sounds.
+- **No audio device:** without one (or if it fails to start), sounds still load and
+  answer, silently, and the host says so once. A script runs the same everywhere.
+- **Implementation:** `examples/lua/audio.h` and `audio.cpp`, on miniaudio (see
+  [Implementation](#implementation)).
+
+Mode 4 of the showcase (the splats, `scripts/lib/splat-mode.lua`) plays
+`assets/audio/timelapse.mpeg` looped while it shows. It pauses when another mode is shown
+and goes on where it was when mode 4 comes back; M mutes it.
 
 `rhi.include` is for sharing Lua code between scripts in different folders. The showcase
 uses it to run `scripts/lib/scene-mode.lua`, the scene that `scene.lua` runs on its own.
@@ -1629,8 +1664,9 @@ messages appear in the same log. Release builds on Windows have no console.
 
 ## Implementation
 
-Everything is in `examples/lua/example-lua.cpp`, apart from the physics, which is in
-`examples/lua/physics.h` and `physics.cpp`.
+Everything is in `examples/lua/example-lua.cpp`, apart from the physics
+(`examples/lua/physics.h` and `physics.cpp`), the splats' levels of detail
+(`splat-lod.h`, `splat-lod.cpp`) and sound (`audio.h`, `audio.cpp`).
 
 - **Base layer**: the window, input and Steam Controller handling are the shared example
   base (`examples/base/example-base.h`).
@@ -1644,6 +1680,11 @@ Everything is in `examples/lua/example-lua.cpp`, apart from the physics, which i
   - **No link-time optimization:** it would slow every build of the examples.
   - **Isolation:** `physics.h` keeps Jolt's headers out of the host. Jolt is compiled
     without RTTI or exceptions (its defaults), while the host needs exceptions for Lua.
+- **miniaudio build**: CMake clones miniaudio 0.11.25 from GitHub (`FetchContent`) for its
+  one header only; `audio.cpp` compiles the implementation. Its own CMake project isn't
+  built. On Windows it plays through WASAPI, with no extra libraries; on Linux it loads
+  ALSA or PulseAudio at run time (linking `dl`, `pthread` and `m`). `audio.h` keeps its
+  header out of the host.
 - **Adding a function**:
   1. Write a `static int api...(lua_State*)` in `LuaApp`.
   2. Add it to the matching `luaL_Reg` table in `registerApi`.

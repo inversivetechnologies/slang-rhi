@@ -36,6 +36,8 @@
 --   [ / ]           splat size              F               flip the scene upside down
 --   , / .           splat budget /1.25 / x1.25
 --   - / =           fewer / more instances (1 x 1 up to 5 x 5)
+--   M               mute / unmute the music (assets/audio/timelapse.mpeg, looped, while
+--                   this mode shows)
 --   C               clip the splats by moving spheres and boxes: carve them out / keep
 --                   only what is inside them / off (shaders/splat/clip.slang)
 --   /               tint the splats by LOD level
@@ -52,6 +54,8 @@ return function(setTitle, file)
     local flip = true -- 3DGS scenes are usually y-down
 
     local graph
+    local music -- this mode's own graph plays it (rhi.sound)
+    local MUSIC_FILE = "audio/timelapse.mpeg"
     local blocks = {}
     local count = 0   -- the file's splats
     local entries = 0 -- with the merged ones
@@ -107,8 +111,9 @@ return function(setTitle, file)
     end
 
     local function updateTitle()
-        setTitle(string.format("%s x%d (- =), %d splats each, size x%.2f | %s | clip: %s (C)", file, grid * grid, count,
-            splatScale, lodText(), CLIP_MODES[clipMode]))
+        local sound = music and (music.volume > 0 and "music (M)" or "muted (M)") or "no music"
+        setTitle(string.format("%s x%d (- =), %d splats each, size x%.2f | %s | clip: %s (C) | %s", file, grid * grid,
+            count, splatScale, lodText(), CLIP_MODES[clipMode], sound))
     end
 
     -- Where the named properties are in each record. 3DGS files store rot_0..3, scale_0..2,
@@ -618,6 +623,8 @@ return function(setTitle, file)
 
     function splat.init()
         local r = splat.createResources()
+        -- Looped, from the start; on_enter and on_leave play and pause it.
+        music = rhi.sound(MUSIC_FILE, { loop = true })
         local image = rhi.render_target("rgba16f")
         local composite = rhi.render_pipeline { shader = "post/composite.slang" }
         local params = instanceParams(gridInstances(grid))
@@ -652,11 +659,14 @@ return function(setTitle, file)
 
     function splat.on_enter()
         rhi.set_graph(graph)
+        -- The music goes on where it was left.
+        if music then music:play() end
         updateTitle()
     end
 
     function splat.on_leave()
         rhi.set_graph(nil)
+        if music then music:pause() end
     end
 
     -- Input: changes parameter blocks only; the graph itself never changes.
@@ -689,6 +699,11 @@ return function(setTitle, file)
         elseif key == keys.SLASH and action == input.PRESS then
             showLevels = not showLevels
             blocks.lod.lodShowLevels = showLevels and 1 or 0
+            updateTitle()
+            return
+        elseif key == keys.M and action == input.PRESS then
+            if not music then return end
+            music.volume = music.volume > 0 and 0 or 1
             updateTitle()
             return
         elseif key == keys.C and action == input.PRESS then
