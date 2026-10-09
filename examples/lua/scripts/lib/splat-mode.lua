@@ -285,6 +285,37 @@ return function(setTitle, file)
         return { center = r.center, radius = r.radius }
     end
 
+    -- For graphs that place the splats themselves (the scene system, lib/scene/):
+    --
+    -- An instances block for addPasses / addShadowPasses, from a list of placements
+    -- { position = {x, y, z}, yaw = radians, scale = s } (applied to the file's splats
+    -- after the flip, as ply.slang places them); and its instance count.
+    function splat.instanceBlock(list)
+        splat.createResources()
+        local params = instanceParams(list)
+        return rhi.params(params), params.instanceCount
+    end
+
+    -- A clip block for addPasses / addShadowPasses: `mode` 0 none, 1 carve the shapes out,
+    -- 2 keep only what is inside them; `shapes` as shaders/splat/clip.slang lays them out
+    -- (three float4s each: center and kind (0 sphere, 1 box), size and turning speed,
+    -- movement and its speed).
+    function splat.clipBlock(mode, shapes)
+        local floats = {}
+        for _, s in ipairs(shapes) do
+            for _, v in ipairs(s) do floats[#floats + 1] = v end
+        end
+        if #floats == 0 then floats = { 0, 0, 0, 0 } end
+        return rhi.params { clipMode = mode, clipShapes = rhi.buffer(floats), clipShapeCount = #shapes }
+    end
+
+    -- The splat budget (the most splats drawn per view), as , and . set it.
+    function splat.setBudget(splats)
+        splat.createResources()
+        budget = math.max(MIN_BUDGET, math.min(CAPACITY, math.floor(splats)))
+        updateBudgets()
+    end
+
     -- A view option as a list of blocks: one block, a list of them (a plain table with an
     -- array part), or nil.
     local function viewList(views)
@@ -325,6 +356,7 @@ return function(setTitle, file)
     --   target        the rgba16f texture to draw the splats' color into
     --   clear         the color to clear it to first
     --   depthTarget   if given, the splats are also drawn into this depth target
+    --   depthClear    false: keep what is in it (other splats drawn before), not clear it
     -- Returns the dispatches and passes it added, in order (e.g. to switch them off), and
     -- those whose thread counts follow the number of instances.
     function splat.addPasses(g, options)
@@ -435,7 +467,8 @@ return function(setTitle, file)
                 name = name .. ": depth",
                 depth_target = options.depthTarget,
                 color = false,
-                clear = { 0, 0, 0, 0 }, -- clears the depth buffer to the far plane
+                -- Clears the depth buffer to the far plane, unless other splats are in it.
+                clear = options.depthClear ~= false and { 0, 0, 0, 0 } or nil,
             })
             depthPass:draw { pipeline = r.renderDepth, count = r.sortCount * 6, params = drawParams }
         end
@@ -455,12 +488,15 @@ return function(setTitle, file)
     --   atlas      the rgba16f texture to draw the map into, layers the one for its deep
     --              opacity layers, faceSize the size of their cube-face cells
     --   clip       a clip block, as for addPasses (nil: none)
-    -- One instance (the `model`'s).
+    --   instances, instanceCount   as for addPasses (nil: one instance, the `model`'s)
+    --   clearMaps  false: keep what other splats drew into the maps, not clear them
     function splat.addShadowPasses(g, options)
         local r = splat.createResources()
         local name = options.name or "splats"
         local views = viewList(options.view)
-        local instances = blocks.singleInstance
+        local instances = options.instances or blocks.singleInstance
+        local instanceCount = options.instanceCount or 1
+        local clearMaps = options.clearMaps ~= false
         local clip = options.clip or blocks.noClip
 
         -- The splats don't change, so what the shadow passes need of them (center,
@@ -502,9 +538,9 @@ return function(setTitle, file)
         selectParams[#selectParams + 1] = options.light
         selectParams[#selectParams + 1] = clip
         local function ignore(node) return node end
-        addLodPick(g, name .. ": shadow", r.lodHistogramLight, selectParams, 1, blocks.shadowLod, ignore)
+        addLodPick(g, name .. ": shadow", r.lodHistogramLight, selectParams, instanceCount, blocks.shadowLod, ignore)
         g:dispatch { name = name .. ": shadow reset", pipeline = r.resetShadow, params = { shadowCount = r.shadowCount }, threads = { 1, 1, 1 } }
-        g:dispatch { name = name .. ": shadow select", pipeline = r.selectShadow, params = selectParams, threads = { r.entries, 1, 1 } }
+        g:dispatch { name = name .. ": shadow select", pipeline = r.selectShadow, params = selectParams, threads = { r.entries, instanceCount, 1 } }
 
         -- What the shadow passes' vertex shader needs: the picked splats, and how to place
         -- them (the instances and the `model`).
@@ -527,7 +563,7 @@ return function(setTitle, file)
                 name = string.format("%s: shadow face %d", name, face),
                 target = options.atlas,
                 viewport = { (face % 3) * size, (face // 3) * size, size, size },
-                clear = face == 0 and { 0, 0, 0, 60000 } or nil,
+                clear = (face == 0 and clearMaps) and { 0, 0, 0, 60000 } or nil,
             }
             local own = { face = face }
             for key, value in pairs(picked) do own[key] = value end
@@ -545,7 +581,7 @@ return function(setTitle, file)
                 name = string.format("%s: shadow layers face %d", name, face),
                 target = options.layers,
                 viewport = { (face % 3) * size, (face // 3) * size, size, size },
-                clear = face == 0 and { 0, 0, 0, 0 } or nil,
+                clear = (face == 0 and clearMaps) and { 0, 0, 0, 0 } or nil,
             }
             local own = { face = face, splatShadowMap = options.atlas }
             for key, value in pairs(picked) do own[key] = value end

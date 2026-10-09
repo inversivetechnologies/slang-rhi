@@ -219,6 +219,13 @@ return function(setTitle)
             sdfOrigin = { 0, 0, 0 },
             sdfSpin = 0,
             sdfBoundsRadius = 0,
+            -- ...and its cache's (sdf/sdf-cache.slang), unused.
+            sdfUseCache = 0,
+            sdfCacheDistance = rhi.texture { width = 1, height = 1, depth = 1, format = "r16f" },
+            sdfCacheColor = rhi.texture { width = 1, height = 1, depth = 1, format = "rgba8" },
+            sdfCacheSampler = rhi.sampler(),
+            sdfCacheExtent = 1,
+            sdfCacheResolution = 1,
         }
         blocks.generate = rhi.params {
             subdivision = sphere.subdivision,

@@ -18,6 +18,7 @@ All examples are scripts, in `scripts/`:
 | `splat.lua` | Gaussian splatting with compute shaders: loads `assets/skull.ply` (1.9 million splats), projects, sorts and draws them every frame |
 | `fusion.lua` | the scene, the splats and a raymarched SDF composition in one picture: each rendered with its own depth buffer, combined per pixel by depth; shadows between all of them |
 | `sdf-cache.lua` | an SDF composition raymarched from its DAG or from a cache baked into 3D textures, with GPU timings of both |
+| `scenes.lua` | the scene viewer: scenes described in JSON (`assets/scenes/`), built from entities, components and prefabs (`assets/prefabs/`) by the scene system (`lib/scene/`) |
 
 ## Layout
 
@@ -30,6 +31,8 @@ examples/lua/
   README.md
   scripts/             runnable scripts, one per example
     lib/               Lua modules used by scripts (rhi.include), not run on their own
+      scene/           the scene system: JSON, entities, the loader, systems, the renderer
+    behaviors/         Lua behaviors that scene entities run (spin, burst, player)
   shaders/             every shader, shared by all scripts
     common/            Slang libraries: math, quaternions, transforms, SDFs, splines, the
                        `time` builtin (time.slang), ...
@@ -45,6 +48,8 @@ examples/lua/
     post/              full-screen passes (composite, depth-composite, crosshair)
     shader-toy/        the ShaderToy framework (shader-toy.slang) and the toys
   assets/              data files the scripts load (skull.ply, audio/timelapse.mpeg)
+    scenes/            scene files (JSON with comments) for the scene viewer
+    prefabs/           prefabs: entities that scenes use and override
 ```
 
 **How paths resolve:**
@@ -89,14 +94,14 @@ and exits. It doesn't fall back to another API.
 | Input | Action |
 | --- | --- |
 | Left / Right arrow | previous / next mode |
-| `1` .. `6` | jump to a mode |
+| `1` .. `7` | jump to a mode |
 | Steam Controller LB / RB | previous / next mode |
 | Left mouse button | moves `iMouse` in the ShaderToy modes; turns the camera in the physics; orbits it in the splats and the depth composite |
 | Escape | gives the mouse pointer back (click the window to hide it again) |
 | F11 | toggles fullscreen |
 
 The modes are Physics, the ShaderToy shaders 2D SDFs and Controller, Gaussian Splats,
-Depth Composite, and SDF Cache. The lit scene (`scene.lua`) has no mode of its own any more, but the Depth
+Depth Composite, SDF Cache, and Scenes. The lit scene (`scene.lua`) has no mode of its own any more, but the Depth
 Composite builds on it. The other ShaderToy shaders (Circle, Ocean) are in
 `example-lua shader-toy`. The current mode is shown in the window title. A
 ShaderToy mode whose shader doesn't compile shows dark red until it does. The splats load
@@ -122,6 +127,28 @@ Gaussian Splats and Depth Composite modes share the loaded file.
 
 How it works is described in [Example: combining passes by
 depth](#example-combining-passes-by-depth).
+
+### The scenes
+
+`example-lua scenes`, or mode 7 of the showcase: the scene files in `assets/scenes/`, one
+at a time, built by the [scene system](#the-scene-system).
+
+| Input | Action |
+| --- | --- |
+| Page Up / Page Down | previous / next scene |
+| V | show everything / the meshes / the splats / the SDFs / the depth buffers |
+| Tab | hide or show the insets |
+| everything else | the scene's: its behaviors (the player's controls in `physics.json`, B to drop boxes), its orbit camera (drag, wheel), M to mute its sounds |
+
+| Scene | |
+| --- | --- |
+| `composite.json` | the depth composite (mode 5): meshes, the skull's splats and an SDF sculpture merged by depth, a second camera in the corner |
+| `physics.json` | the physics playground (mode 1) with the player |
+| `sdf-gallery.json` | three SDF sculptures and an arch, baked into one cache |
+| `splats.json` | a grid of skulls carved per pixel by moving shapes, with music |
+
+Saving a scene or prefab file reloads it. A scene that fails to load (bad JSON, an unknown
+component or field) says why in the window title, and the viewer goes on.
 
 ### The SDF cache
 
@@ -390,6 +417,8 @@ pass's shader, to combine images by depth, or for any screen-space effect.
 | `rhi.params{...}`, `rhi.graph()`, `rhi.set_graph(graph)` | see [Render graphs](#render-graphs) |
 | `rhi.load_ply(path [, { lod = true }])` | loads a PLY file's vertices into a buffer; see below |
 | `rhi.sound(path [, { loop, volume, play }])` | a sound from a file; see [Sound](#sound) |
+| `rhi.read_asset(path)` | a text file's contents, looked up as `rhi.load_ply`'s are; the file is watched, so saving it reloads the script |
+| `rhi.list_assets(folder [, extension])` | the names of the files in `assets/<folder>` (and in `<folder>` next to the script), sorted |
 
 `rhi.load_ply(path)` reads the vertex element of a binary little-endian PLY file whose
 vertex properties are all floats, which is the format Gaussian splatting scenes come in. It
@@ -1146,6 +1175,157 @@ carving 16.8 ms, keeping inside 18.4 ms. The depth composite, without a field: 3
 shell: the inside of the far wall, and whatever the training left inside. Splats long
 along the ray are clipped by their densest point only, which is the same approximation a
 hard `clip()` makes on any volume.
+
+## The scene system
+
+The examples above build their worlds and render graphs in code, each its own way. The scene
+system (`scripts/lib/scene/`) builds them from data instead. A scene file says what is in
+the world; systems turn that into GPU resources, parameter blocks and one render graph,
+which handles any mix of meshes, splats and SDFs, any number of cameras, and their shadows
+on each other.
+
+| File | |
+| --- | --- |
+| `lib/scene/json.lua` | a JSON reader that also takes `//` and `/* */` comments and trailing commas |
+| `lib/scene/ecs.lua` | the entities and components |
+| `lib/scene/transform.lua` | transforms: position, rotation (a quaternion), uniform scale |
+| `lib/scene/loader.lua` | scene files to a world: prefabs, children, repeats, schema checks |
+| `lib/scene/systems/*.lua` | one per kind of component: light, mesh (and body), behavior, sdf, splat, camera, sound |
+| `lib/scene/renderer.lua` | the render graph, from what the systems contribute |
+| `lib/scene/scene.lua` | a loaded scene: load, enter, leave, update, input |
+| `lib/scene-viewer-mode.lua` | the viewer (mode 7 of the showcase; `scenes.lua`) |
+| `scripts/behaviors/*.lua` | behaviors: Lua that entities run |
+
+### Entities, components and systems
+
+An **entity** is a number with an optional name. A **component** is a plain table of data
+(a mesh, a light, a camera...), at most one of each type per entity. Every entity has a
+`transform`. A **system** holds the behavior for one or more component types: it declares
+their fields, loads what the entities with them need, and contributes to the frame.
+
+This is an entity-component system in its data model, not in its performance model: a
+scene has tens to hundreds of entities, and the per-element work is on the GPU (splats,
+LOD), in Jolt (bodies), or in instanced draws. The store is a small Lua table per component
+type; queries walk the entities in creation order.
+
+### Scene files
+
+```jsonc
+{
+  "name": "Depth composite",
+  "settings": { "background": [0.015, 0.018, 0.025], "splatBudget": 1000000 },
+  "prefabs": { },                        // optional: inline prefabs, before assets/prefabs/
+  "entities": [
+    { "id": "light", "transform": { "position": [0, 0.4, 0] },
+      "light": { "intensity": 9, "range": 14, "orbitRadius": 2.3, "speed": 0.5 } },
+    { "id": "floor", "prefab": "floor", "transform": { "position": [0, -1.25, 0] } },
+    { "id": "skull", "prefab": "skull", "transform": { "position": [-0.2, -0.4, 1.5], "rotation": [0, -60, 0] } },
+    { "id": "domino", "prefab": "domino", "transform": { "position": [3.6, 0.42, 0] },
+      "repeat": { "count": 14, "step": [-0.46, 0, 0],
+                  "vary": { "mesh": { "color": [[0.9, 0.35, 0.28], [0.3, 0.55, 0.9]] } } } },
+    { "id": "camera", "camera": { "controller": "orbit", "target": [0, -0.3, 0.5], "distance": 6.5 } }
+  ]
+}
+```
+
+An entity's keys are component types, plus:
+
+| Key | |
+| --- | --- |
+| `id` | a name, unique in the scene; children's get their parent's in front (`ramp/rail`), repeats a number after (`domino#2`) |
+| `prefab` | the entity starts as this prefab (`assets/prefabs/<name>.json`, or the scene's inline `prefabs`); its own keys override it: objects merge key by key, other values replace, children add up. Prefabs can start from prefabs |
+| `transform` | `position`, `rotation` ([pitch, yaw, roll] in degrees: roll first, then pitch, then yaw), `scale` (uniform); for children, in the parent's frame |
+| `children` | entities placed in this one's frame |
+| `repeat` | copies: `count` (n, or [nx, ny, nz]), each moved by `step` per index along each axis, turned by `rotationStep` per copy, and given the values of `vary` (component, field, a list of values) in turn |
+| `_...` | a comment, ignored |
+
+**Checks.** Every component is checked against its system's schema (each field's type, a
+default, whether it is required). An unknown component or field, a wrong type, or a
+missing required field stops the load, with the entity and the field in the message, e.g.
+`floor.mesh: unknown field 'colour' (known: color, pattern, radius, shape, size)`.
+
+### Components
+
+| Component | Fields (defaults) | System |
+| --- | --- | --- |
+| `light` | `color`, `intensity` (9), `range` (14), `orbitRadius` (0), `speed` (0, radians per second), `phase`, `bob` | one point light, orbiting the entity's position; one per scene |
+| `mesh` | `shape` ("box" or "sphere"), `size` (a box's, whole: [1, 1, 1]), `radius` (0.5), `color`, `pattern` (0 plain, 1 stripes, 2 checker) | instanced, lit and shadowed boxes and spheres |
+| `body` | `motion` ("dynamic", "static", "kinematic"), `density` (1000), `friction` (0.5), `restitution` (0), `velocity`, `angularVelocity` | a Jolt body for the mesh; without it, the mesh is visual (placed by Lua) |
+| `splat` | `file` (required), `fit` (a radius to scale to; 0: as is), `grid` ([nx, nz] copies), `spacing`, `turn` (degrees per copy), `clip` (`mode` "carve" or "keep", `shapes`: spheres and boxes with `position`, `move`, `speed`, `spin`) | Gaussian splats with LOD, lighting, shadows, clipping; one renderer per file, entities as its instances |
+| `sdf` | `shape` (required: a node, below), `cache` (0: the DAG; or voxels a side), `sharpness` (8, of soft shadows) | all entities' shapes as one composition, raymarched, shadowing everything; cached if any asks |
+| `camera` | `fov` (50), `controller` ("orbit", "fixed", "player"), `target`, `distance`, `yaw`, `pitch` (degrees), `inset` (0: the main view; else a square of that fraction of the window's height), `corner` | the views |
+| `sound` | `file` (required), `loop` (true), `volume` (1), `autoplay` (true) | played while the scene shows |
+| `script` | `file` (required: in `scripts/behaviors/`), `params` | a behavior |
+
+**SDF nodes** (the `sdf` component's `shape`): one primitive or operation, with optional
+`position`, `rotation`, `scale` and `color`. Primitives: `{"sphere": r}`,
+`{"box": [w, h, d]}`, `{"cube": s}`, `{"ellipsoid": [rx, ry, rz]}`,
+`{"capsule": {"radius", "a", "b"}}`, `{"cylinder": {"radius", "height"}}`,
+`{"prism": {"sides", "height"}}`. Operations: `{"union": [nodes]}`,
+`{"intersect": [nodes]}`, `{"subtract": [a, b]}`, each with an optional `"smooth": k`. Sizes
+are whole, as for meshes. `assets/prefabs/sculpture.json` is the depth composite's
+sculpture in this form.
+
+**SDF cache everywhere.** With `cache`, the composition is baked once (`sdf/sdf-bake.slang`)
+and sampled not only by the raymarching but by every soft shadow: `sdf-world.slang`'s
+`sdfFieldDistance` and `sdfFieldColor` read the DAG or the cache, by `sdfUseCache`, for all
+of them.
+
+### Behaviors
+
+A behavior is Lua for one entity: a file in `scripts/behaviors/` returning a constructor
+`function(ctx, id, params)`, whose result may have `update(dt)`, input handlers (which
+return true when they handle the event), `addOverlays(graph)`, `enter()`, `leave()` and
+`describe()`.
+
+- **When it runs:** constructors run after the meshes and bodies exist and before the graph
+  is built. A behavior can therefore add bodies, give the renderer groups of its own to
+  draw (`ctx.mesh.addGroup`), and provide a camera (`ctx.cameraProviders`).
+- **What it costs:** only behaviors (and a player-controlled camera) run Lua per frame;
+  everything else is parameter blocks and a graph the host runs.
+
+| Behavior | |
+| --- | --- |
+| `spin.lua` | turns a visual mesh about an axis (`speed` in degrees per second, `axis`) |
+| `burst.lua` | drops boxes and balls from above the entity on a key (`key`, `button`, `count`, `area`, `height`) |
+| `player.lua` | the player character (`lib/player.lua`): spawns at the entity, hits and throws at the dynamic bodies, provides the "player" camera, draws the crosshair |
+
+### The frame
+
+`lib/scene/renderer.lua` builds one graph per scene from what the systems contribute:
+
+| Stage | Who | |
+| --- | --- | --- |
+| prepasses | sdf | the cache's bake, once |
+| shadow faces 0..5 | renderer, mesh | the light's cube shadow map; the meshes draw their casters into it |
+| shadow passes | splat | the splats' translucent shadow maps |
+| per view: opaque | renderer, mesh | color and depth; the meshes draw into it |
+| per view: surfaces | sdf, splat | the raymarching (stopping at the meshes' depth), the splats |
+| per view: depth composite | renderer | the view's surfaces merged by depth (`post/depth-composite.slang`), into the window or the inset's texture |
+| overlays | behaviors | over the main view (the crosshair) |
+| insets | renderer, camera | each inset framed in its corner, stacked if several share one |
+
+- **One light and one shadow block:** every surface reads the same light block and the same
+  shadow block. Systems add their fields to the shadow block: the SDF composition, whether
+  splats cast shadows. So meshes, splats and SDFs light and shadow one another the same way
+  in every scene, whatever is in it.
+- **Missing surfaces:** with no SDFs or no splats, their targets stay empty and the
+  composite passes them over. The splats' depth buffer is cleared every frame, since the
+  composite reads it.
+- **Per frame:** nothing in the renderer runs; systems change parameter blocks, and the
+  host runs the graph.
+- **Cost:** `composite.json` runs at 33–34 ms per frame on the RTX 3050 Laptop GPU (Release),
+  against 31–32 ms for the hand-built mode 5 it reproduces. Some details differ (its SDF
+  doesn't spin; its bounds are larger; a behavior spins the cube from Lua).
+
+### Adding a component
+
+1. Write a system in `lib/scene/systems/`: `components` (the schema) and the functions it
+   needs from `load`, `shadowFields`, `addPrepasses`, `addShadowCasters`,
+   `addShadowPasses`, `addOpaque`, `addSurfaces`, `addOverlays`, `enter`, `leave`,
+   `update`, input handlers and `describe`.
+2. Add it to `SYSTEMS` in `lib/scene/scene.lua`, where its place in the list is its place
+   in loading and in the frame.
 
 ## Example: caching an SDF
 

@@ -38,16 +38,20 @@ static const float kMaxDistance = 40.0;
 // stop marching in the same places.
 float field(float3 p, uint source)
 {
+    float d;
     if (source == 1)
     {
-        return sampleSdfCache(p);
+        d = sampleSdfCache(p);
     }
-    float3 q = abs(p) - sdfCacheExtent;
-    float d = length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
-    // Far from the cube: no need to evaluate what's inside.
-    if (d <= 0.05)
+    else
     {
-        d = evaluateSdf(p).distance;
+        float3 q = abs(p) - sdfCacheExtent;
+        d = length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+        // Far from the cube: no need to evaluate what's inside.
+        if (d <= 0.05)
+        {
+            d = evaluateSdf(p).distance;
+        }
     }
     return d;
 }

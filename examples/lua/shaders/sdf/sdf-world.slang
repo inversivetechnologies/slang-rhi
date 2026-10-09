@@ -4,14 +4,57 @@
 // The composition sits at sdfOrigin and turns about its vertical axis by sdfSpin radians
 // per second. It lies within sdfBoundsRadius of its origin -- whatever it spins to -- so a
 // ray that misses that sphere misses the composition, and needs no marching at all.
+//
+// The field itself comes from the DAG (sdf-dag.slang), or, with sdfUseCache = 1, from its
+// cache baked into 3D textures (sdf-cache.slang), in the composition's own space either
+// way: sdfFieldDistance and sdfFieldColor say which, for everything that samples it.
 
 #pragma once
 
 #include "scene/scene-common.slang"
+#include "sdf-dag.slang"
+#include "sdf-cache.slang"
 
 uniform float3 sdfOrigin;
 uniform float sdfSpin;
 uniform float sdfBoundsRadius;
+uniform uint sdfUseCache; // 1: sample the baked cache instead of evaluating the DAG
+
+// The composition's distance at q (in its own space). (An if, not ?:, which would evaluate
+// both.)
+float sdfFieldDistance(float3 q)
+{
+    float d;
+    if (sdfUseCache != 0)
+    {
+        d = sampleSdfCache(q) * kSdfCacheStep; // filtering can overestimate a little
+    }
+    else
+    {
+        d = evaluateSdf(q).distance;
+    }
+    return d;
+}
+
+float3 sdfFieldColor(float3 q)
+{
+    float3 color;
+    if (sdfUseCache != 0)
+    {
+        color = sampleSdfCacheColor(q);
+    }
+    else
+    {
+        color = evaluateSdf(q).color;
+    }
+    return color;
+}
+
+// The spacing for taking the field's gradient: finer than the cache holds is noise.
+float sdfGradientStep()
+{
+    return sdfUseCache != 0 ? 0.5 * sdfCacheVoxelSize() : 0.0015;
+}
 
 // The world into the composition's own space.
 float3 toSdfSpace(float3 world)

@@ -1,4 +1,5 @@
-// Raymarching pass: one thread per pixel sphere-traces the SDF composition (sdf-dag.slang)
+// Raymarching pass: one thread per pixel sphere-traces the SDF composition (sdf-world.slang:
+// its DAG, or its baked cache)
 // from the camera, and writes what it hits -- lit like the meshes -- with its depth, so the
 // depth composite (post/depth-composite.slang) can merge it with the other passes.
 //
@@ -34,13 +35,13 @@ static const int kMaxSteps = 128;
 float3 sdfNormal(float3 world)
 {
     // The gradient by four samples at the corners of a tetrahedron.
-    const float e = 0.0015;
+    float e = sdfGradientStep();
     const float2 k = float2(1, -1);
     return normalize(
-        k.xyy * evaluateSdf(toSdfSpace(world + k.xyy * e)).distance +
-        k.yyx * evaluateSdf(toSdfSpace(world + k.yyx * e)).distance +
-        k.yxy * evaluateSdf(toSdfSpace(world + k.yxy * e)).distance +
-        k.xxx * evaluateSdf(toSdfSpace(world + k.xxx * e)).distance);
+        k.xyy * sdfFieldDistance(toSdfSpace(world + k.xyy * e)) +
+        k.yyx * sdfFieldDistance(toSdfSpace(world + k.yyx * e)) +
+        k.yxy * sdfFieldDistance(toSdfSpace(world + k.yxy * e)) +
+        k.xxx * sdfFieldDistance(toSdfSpace(world + k.xxx * e)));
 }
 
 float depthFromViewZ(float z)
@@ -82,7 +83,7 @@ void raymarchMain(uint3 tid: SV_DispatchThreadID)
     [loop]
     for (int i = 0; i < kMaxSteps && t < maxT; ++i)
     {
-        float d = evaluateSdf(toSdfSpace(camera.eye + dir * t)).distance;
+        float d = sdfFieldDistance(toSdfSpace(camera.eye + dir * t));
         if (d < 0.0005 * t)
         {
             hit = true;
@@ -99,7 +100,7 @@ void raymarchMain(uint3 tid: SV_DispatchThreadID)
     }
 
     float3 world = camera.eye + dir * t;
-    float3 albedo = evaluateSdf(toSdfSpace(world)).color;
+    float3 albedo = sdfFieldColor(toSdfSpace(world));
     float3 normal = sdfNormal(world);
     // The normal is in the composition's space; turn it back into the world's.
     normal = fromSdfSpaceDirection(normal);

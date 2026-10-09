@@ -1,0 +1,9 @@
+// A layer of the tower: three boards side by side. The entity itself is only a frame:
+// a repeat turns every layer a quarter turn from the one below.
+{
+    "children": [
+        { "prefab": "board", "transform": { "position": [-0.32, 0, 0] } },
+        { "prefab": "board", "transform": { "position": [0, 0, 0] } },
+        { "prefab": "board", "transform": { "position": [0.32, 0, 0] } },
+    ],
+}

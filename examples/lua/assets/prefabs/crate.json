@@ -1,0 +1,5 @@
+// A small crate.
+{
+    "mesh": { "shape": "box", "size": [0.4, 0.4, 0.4], "color": [0.3, 0.55, 0.9] },
+    "body": { "density": 300, "friction": 0.6 },
+}

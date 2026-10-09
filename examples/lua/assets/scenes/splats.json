@@ -1,0 +1,27 @@
+// The Gaussian splats (showcase mode 4) as a scene: a grid of skulls, carved by spheres and
+// boxes moving through them (clipped per pixel), over a floor, with music.
+{
+    "name": "Splat grid",
+    "settings": { "background": [0.02, 0.02, 0.025], "splatBudget": 1000000 },
+    "entities": [
+        { "id": "light", "transform": { "position": [0, 5, 0] },
+          "light": { "color": [1.0, 0.95, 0.85], "intensity": 60, "range": 30, "orbitRadius": 4, "speed": 0.2 } },
+        { "id": "floor", "prefab": "floor", "transform": { "position": [0, -1.75, 0], "scale": 2 } },
+
+        { "id": "skulls", "prefab": "skull", "transform": { "position": [0, 0, 0] },
+          "splat": {
+              "grid": [3, 3], "spacing": 4.5, "turn": 50,
+              "clip": { "mode": "carve", "shapes": [
+                  // Two spheres sweeping across the grid, a turning pillar, and a slab
+                  // slicing the horns, bobbing up and down above the heads.
+                  { "sphere": 1.3, "position": [0, 0.2, 0], "move": [6, 0, 0], "speed": 0.35 },
+                  { "sphere": 1.0, "position": [0, -0.2, 2.2], "move": [0, 0, 6], "speed": 0.5 },
+                  { "box": [1.2, 9, 1.2], "position": [-2.2, 0, 0], "spin": 0.7, "move": [0, 0, 6], "speed": 0.3 },
+                  { "box": [16, 0.35, 16], "position": [0, 1.6, 0], "spin": -0.25, "move": [0, 0.6, 0], "speed": 0.6 },
+              ] },
+          } },
+
+        { "id": "music", "sound": { "file": "audio/timelapse.mpeg", "loop": true } },
+        { "id": "camera", "camera": { "controller": "orbit", "target": [0, 0, 0], "distance": 15, "yaw": 20, "pitch": 28 } },
+    ],
+}

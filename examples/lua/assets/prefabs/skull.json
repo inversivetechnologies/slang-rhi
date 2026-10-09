@@ -1,0 +1,4 @@
+// The skull capture (assets/skull.ply), scaled to a radius of 1.3.
+{
+    "splat": { "file": "skull.ply", "fit": 1.3 },
+}

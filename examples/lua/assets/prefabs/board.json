@@ -1,0 +1,5 @@
+// A board of the tower.
+{
+    "mesh": { "shape": "box", "size": [0.3, 0.2, 0.96], "color": [0.82, 0.68, 0.48] },
+    "body": { "density": 400, "friction": 0.7 },
+}

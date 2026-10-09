@@ -65,7 +65,13 @@ float sdfPrimitive(uint op, float4 a, float4 b, float4 c, float3 q)
 // The composition's distance and color at p (in the composition's own space).
 SdfSample evaluateSdf(float3 p)
 {
+    // Every slot starts empty (as far away as can be), so that no read finds garbage, and
+    // compilers don't warn that one might.
     SdfSample slots[kSdfMaxSlots];
+    for (uint k = 0; k < kSdfMaxSlots; ++k)
+    {
+        slots[k] = sdfSample(1e9, float3(0, 0, 0));
+    }
     [loop]
     for (uint i = 0; i < sdfNodeCount; ++i)
     {

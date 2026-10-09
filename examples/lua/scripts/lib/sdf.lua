@@ -118,6 +118,12 @@ end
 function Shape:scale(s)
     return wrap(self, { rotation = IDENTITY.rotation, scale = s, translation = { 0, 0, 0 } })
 end
+-- Any placement at once: `rotation` a 3x3 row-major table, then a uniform `scale`, then
+-- `translation` (x' = scale * (rotation * x) + translation), as a scene entity's
+-- transform places a composition.
+function Shape:place(rotation, translation, scale)
+    return wrap(self, { rotation = rotation, scale = scale or 1, translation = translation })
+end
 -- Colors every primitive below that has no color of its own nearer to it.
 function Shape:color(r, g, b)
     return setmetatable({ kind = "color", child = self, rgb = { r, g, b } }, Shape)

@@ -168,6 +168,12 @@ return function(setTitle)
             splatShadowLayers = rhi.texture { width = 1, height = 1, format = "rgba16f" },
             sdfShadows = 0, sdfShadowSharpness = 8, sdfNodes = rhi.buffer(128), sdfNodeCount = 0,
             sdfResultSlot = 0, smoothScale = 1, sdfOrigin = { 0, 0, 0 }, sdfSpin = 0, sdfBoundsRadius = 0,
+            sdfUseCache = 0,
+            sdfCacheDistance = rhi.texture { width = 1, height = 1, depth = 1, format = "r16f" },
+            sdfCacheColor = rhi.texture { width = 1, height = 1, depth = 1, format = "rgba8" },
+            sdfCacheSampler = rhi.sampler(),
+            sdfCacheExtent = 1,
+            sdfCacheResolution = 1,
         }
         blocks.camera = rhi.params { camera = player.camera(), encodeGamma = rhi.window_srgb() and 0 or 1 }
         blocks.crosshair = rhi.params {

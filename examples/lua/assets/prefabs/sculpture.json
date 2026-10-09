@@ -1,0 +1,57 @@
+// The depth composite's SDF sculpture (lib/fusion-mode.lua): a sphere melted into a box on
+// its corner, drilled by three rods whose ends stick out, on a stem and a hexagonal
+// pedestal. Its bottom is at the entity's position less 0.62.
+{
+    "sdf": {
+        "shape": {
+            "union": [
+                {
+                    "union": [
+                        {
+                            "subtract": [
+                                {
+                                    "union": [
+                                        { "sphere": 0.34, "color": [0.95, 0.55, 0.15] },
+                                        { "box": [0.48, 0.48, 0.48], "rotation": [45, 45, 0], "color": [0.2, 0.55, 0.95] },
+                                    ],
+                                    "smooth": 0.12,
+                                },
+                                {
+                                    "union": [
+                                        { "cylinder": { "radius": 0.09, "height": 1.4 } },
+                                        { "cylinder": { "radius": 0.09, "height": 1.4 }, "rotation": [90, 0, 0] },
+                                        { "cylinder": { "radius": 0.09, "height": 1.4 }, "rotation": [0, 0, 90] },
+                                    ],
+                                    "color": [0.9, 0.2, 0.35],
+                                },
+                            ],
+                            "smooth": 0.03,
+                        },
+                        { "capsule": { "radius": 0.07, "a": [0, -0.55, 0], "b": [0, -0.3, 0] }, "color": [0.75, 0.75, 0.7] },
+                        { "prism": { "sides": 6, "height": 0.3 }, "scale": 0.4, "position": [0, -0.56, 0], "color": [0.75, 0.75, 0.7] },
+                    ],
+                    "smooth": 0.08,
+                },
+                {
+                    "subtract": [
+                        {
+                            "intersect": [
+                                {
+                                    "union": [
+                                        { "cylinder": { "radius": 0.09, "height": 1.4 } },
+                                        { "cylinder": { "radius": 0.09, "height": 1.4 }, "rotation": [90, 0, 0] },
+                                        { "cylinder": { "radius": 0.09, "height": 1.4 }, "rotation": [0, 0, 90] },
+                                    ],
+                                },
+                                { "sphere": 0.62 },
+                            ],
+                        },
+                        { "sphere": 0.46 },
+                    ],
+                    "smooth": 0.02,
+                    "color": [0.9, 0.2, 0.35],
+                },
+            ],
+        },
+    },
+}

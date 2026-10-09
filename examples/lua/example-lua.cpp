@@ -25,6 +25,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <iterator>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1934,7 +1935,9 @@ public:
             viewport[3] = node.viewport[3] * destination.height;
         }
 
-        bool depth = false;
+        // A depth-only pass always has its depth buffer (so that its clear clears it, even
+        // with nothing drawn); others when a draw tests depth.
+        bool depth = node.depthOnly;
         for (const std::shared_ptr<GraphDraw>& draw : node.draws)
         {
             depth = depth || (draw->enabled && draw->pipeline->depth);
@@ -2438,6 +2441,56 @@ public:
             lua_error(L);
         }
         lua_call(L, 0, 1);
+        return 1;
+    }
+
+    // rhi.read_asset(path): a text file's contents, looked up as rhi.load_ply's files are
+    // (next to the script, then in assets/). The file is watched like an include: saving
+    // it reloads the script. For data the script parses itself (scenes, prefabs).
+    static int apiReadAsset(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        fs::path path = app->resolveAssetPath(luaL_checkstring(L, 1));
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+            luaL_error(L, "%s: no such file", path.generic_string().c_str());
+        std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        std::string key = pathKey(path);
+        app->m_watcher.watch(key);
+        app->m_includedScripts.insert(key);
+        lua_pushlstring(L, text.data(), text.size());
+        return 1;
+    }
+
+    // rhi.list_assets(folder [, extension]): the names of the files in assets/<folder>
+    // (and in <folder> next to the script), sorted, without the folder; only those ending
+    // in `extension` if given.
+    static int apiListAssets(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        std::string folder = luaL_checkstring(L, 1);
+        std::string extension = luaL_optstring(L, 2, "");
+        std::set<std::string> names;
+        for (const fs::path& root : {app->m_scriptDir / folder, fs::path(LUA_ASSETS_DIR) / folder})
+        {
+            std::error_code ec;
+            if (!fs::is_directory(root, ec))
+                continue;
+            for (const fs::directory_entry& entry : fs::directory_iterator(root, ec))
+            {
+                std::string name = entry.path().filename().string();
+                if (entry.is_regular_file(ec) && name.size() >= extension.size() &&
+                    name.compare(name.size() - extension.size(), extension.size(), extension) == 0)
+                    names.insert(name);
+            }
+        }
+        lua_createtable(L, int(names.size()), 0);
+        int i = 1;
+        for (const std::string& name : names)
+        {
+            lua_pushstring(L, name.c_str());
+            lua_rawseti(L, -2, i++);
+        }
         return 1;
     }
 
@@ -3982,6 +4035,8 @@ public:
             {"window_size", apiWindowSize},
             {"sound", apiSound},
             {"sampler", apiSampler},
+            {"read_asset", apiReadAsset},
+            {"list_assets", apiListAssets},
             {"include", apiInclude},
             {"params", apiParams},
             {"graph", apiGraph},

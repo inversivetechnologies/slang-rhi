@@ -4,7 +4,7 @@
 -- same window.
 --
 --   Left / Right arrows     previous / next mode
---   1 .. 6                  jump to a mode
+--   1 .. 7                  jump to a mode
 --   Steam Controller LB/RB  previous / next mode
 --   Left mouse button       moves iMouse in the ShaderToy modes, orbits the camera in the
 --                           physics, the splats and the depth composite
@@ -112,6 +112,10 @@ local physics = rhi.include("lib/physics-mode.lua")(modeDetails)
 -- sdf-cache.lua.
 local sdfCache = rhi.include("lib/sdf-cache-mode.lua")(modeDetails)
 
+-- The scenes in assets/scenes/, built from entities, prefabs and systems (lib/scene/),
+-- shared with scenes.lua.
+local sceneViewer = rhi.include("lib/scene-viewer-mode.lua")(modeDetails)
+
 modes = {
     physics,
     shaderToyMode("2D SDFs", "sdfs2d.slang"),
@@ -119,6 +123,7 @@ modes = {
     splat,
     fusion,
     sdfCache,
+    sceneViewer,
 }
 
 -- Shows mode `index`, wrapping around at either end.

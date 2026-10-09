@@ -89,7 +89,7 @@ float sdfSoftShadow(float3 origin, float3 toLight, float distanceToLight)
     [loop]
     for (int i = 0; i < 64 && t < end; ++i)
     {
-        float d = evaluateSdf(toSdfSpace(origin + toLight * t)).distance;
+        float d = sdfFieldDistance(toSdfSpace(origin + toLight * t));
         if (d < 0.0005)
         {
             return 0.0;
