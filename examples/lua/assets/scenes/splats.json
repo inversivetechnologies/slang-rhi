@@ -1,4 +1,4 @@
-// The Gaussian splats (showcase mode 4) as a scene: a grid of skulls, carved by spheres and
+// The Gaussian splats (`splat.lua`) as a scene: a grid of skulls, carved by spheres and
 // boxes moving through them (clipped per pixel), over a floor, with music. The splat mode's
 // keys are behaviors/splat-controls.lua's: , . budget, / LOD tint, [ ] size, L lighting,
 // C clip.

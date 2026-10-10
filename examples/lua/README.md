@@ -10,7 +10,7 @@ All examples are scripts, in `scripts/`:
 
 | Script | What it shows |
 | --- | --- |
-| `showcase.lua` | the physics, the ShaderToy shaders, the splats and the depth composite in one window, switchable at runtime |
+| `showcase.lua` | every scene in `assets/scenes/` in one window, one after another: the physics with a player, ShaderToy shaders, the splats, the depth composite, cached SDFs (the scene viewer, in the showcase's order and with its keys) |
 | `physics.lua` | rigid body physics on Jolt: a ball, a ramp, dominoes, a box pyramid and a tower, and a player character to smash them, steered with a Steam Controller the way Darksiders is -- the host simulates and draws, instanced |
 | `surface.lua` | clearing the window |
 | `scene.lua` | a lit 3D scene: a GPU-generated spherified cube, a cube and a floor, with a point light, realtime shadow mapping and a second camera composited into the corner -- built as a render graph the host runs without Lua |
@@ -91,26 +91,32 @@ and exits. It doesn't fall back to another API.
 
 ### The showcase
 
+The showcase is the [scene viewer](#the-scenes): the scene files in `assets/scenes/`, one at
+a time, in this order: the physics, the ShaderToy shaders 2D SDFs and Controller, the
+splats, the depth composite, the SDF benchmark, the SDF gallery (and any other scene files
+after them).
+
 | Input | Action |
 | --- | --- |
-| Left / Right arrow | previous / next mode |
-| `1` .. `7` | jump to a mode |
-| Steam Controller LB / RB | previous / next mode |
-| Left mouse button | moves `iMouse` in the ShaderToy modes; turns the camera in the physics; orbits it in the splats and the depth composite |
+| Left / Right arrow, Page Up / Page Down | previous / next scene |
+| `1` .. `9` | jump to a scene |
+| Steam Controller LB / RB | previous / next scene |
+| V | show everything / the meshes / the splats / the SDFs / the depth buffers |
+| Tab | hide or show the insets |
 | Escape | gives the mouse pointer back (click the window to hide it again) |
 | F11 | toggles fullscreen |
+| everything else | the scene's: see [the scenes](#the-scenes) |
 
-The modes are Physics, the ShaderToy shaders 2D SDFs and Controller, Gaussian Splats,
-Depth Composite, SDF Cache, and Scenes. The lit scene (`scene.lua`) has no mode of its own any more, but the Depth
-Composite builds on it. The other ShaderToy shaders (Circle, Ocean) are in
-`example-lua shader-toy`. The current mode is shown in the window title. A
-ShaderToy mode whose shader doesn't compile shows dark red until it does. The splats load
-(about a second for the 454 MB file) the first time a mode showing them is shown. The
-Gaussian Splats and Depth Composite modes share the loaded file.
+- **Title:** the window title shows the scene, its entities and systems, and its keys.
+- **Splats:** a scene with splats loads them (about a second for the 454 MB file, once its
+  levels of detail are cached) each time it is shown.
+- **Other examples:** the lit scene (`scene.lua`), the ShaderToy shaders Circle and Ocean
+  (`shader-toy.lua`), and the examples the scenes started from (`physics.lua`,
+  `splat.lua`, `fusion.lua`, `sdf-cache.lua`) still run on their own.
 
 ### The depth composite
 
-`example-lua fusion`, or mode 5 of the showcase.
+`example-lua fusion`. The showcase shows it as a scene: `composite.json`.
 
 | Input | Action |
 | --- | --- |
@@ -130,8 +136,8 @@ depth](#example-combining-passes-by-depth).
 
 ### The scenes
 
-`example-lua scenes`, or mode 7 of the showcase: the scene files in `assets/scenes/`, one
-at a time, built by the [scene system](#the-scene-system).
+`example-lua scenes`, or the showcase (in its own order): the scene files in
+`assets/scenes/`, one at a time, built by the [scene system](#the-scene-system).
 
 | Input | Action |
 | --- | --- |
@@ -140,19 +146,19 @@ at a time, built by the [scene system](#the-scene-system).
 | Tab | hide or show the insets |
 | everything else | the scene's: its behaviors (below), its orbit camera (drag, wheel), M to mute its sounds |
 
-Every showcase mode has a scene; their keys come from behaviors in the scene.
+Each scene stands for one of the examples; its keys come from behaviors in the scene.
 
-| Scene | Showcase mode | | Keys |
+| Scene | Example | | Keys |
 | --- | --- | --- | --- |
-| `physics.json` | 1, Physics | the ramp, the dominoes, the pyramid, the tower, the player | the player's; B drop boxes; P pause, T slow motion, R reset |
-| `shadertoy-sdfs2d.json` | 2, ShaderToy: 2D SDFs | `shader-toy/sdfs2d.slang` | the mouse |
-| `shadertoy-controller.json` | 3, ShaderToy: Controller | `shader-toy/controller.slang` | the Steam Controller |
-| `splats.json` | 4, Gaussian Splats | a grid of skulls carved per pixel by moving shapes, with music | `,` `.` budget, `/` LOD tint, `[` `]` size, L lighting, C clip mode, M mute |
-| `composite.json` | 5, Depth Composite | meshes, the skull's splats and an SDF sculpture merged by depth, a second camera in the corner | the splats' (as above, but C), J K blend |
-| `sdf-benchmark.json` | 6, SDF Cache | a turning spiral of 64 shapes around a core, 129 nodes, cached | C DAG / cache / cache error, `[` `]` resolution, B benchmark, J K blend, Space stop the camera |
+| `physics.json` | `physics.lua` | the ramp, the dominoes, the pyramid, the tower, the player | the player's; B drop boxes; P pause, T slow motion, R reset |
+| `shadertoy-sdfs2d.json` | `shader-toy.lua` | `shader-toy/sdfs2d.slang` | the mouse |
+| `shadertoy-controller.json` | `shader-toy.lua` | `shader-toy/controller.slang` | the Steam Controller |
+| `splats.json` | `splat.lua` | a grid of skulls carved per pixel by moving shapes, with music | `,` `.` budget, `/` LOD tint, `[` `]` size, L lighting, C clip mode, M mute |
+| `composite.json` | `fusion.lua` | meshes, the skull's splats and an SDF sculpture merged by depth, a second camera in the corner | the splats' (as above, but C), J K blend |
+| `sdf-benchmark.json` | `sdf-cache.lua` | a turning spiral of 64 shapes around a core, 129 nodes, cached | C DAG / cache / cache error, `[` `]` resolution, B benchmark, J K blend, Space stop the camera |
 | `sdf-gallery.json` | | three SDF sculptures and an arch, baked into one cache | as `sdf-benchmark.json` |
 
-Some details differ from the modes, which stay in the showcase:
+Some details differ from the examples, which still run on their own:
 
 - **SDF benchmark:** its shape count is fixed by the file, not changed by keys.
 - **Splat grid:** so is its grid's size.
@@ -163,7 +169,7 @@ component or field) says why in the window title, and the viewer goes on.
 
 ### The SDF cache
 
-`example-lua sdf-cache`, or mode 6 of the showcase.
+`example-lua sdf-cache`. The showcase shows it as a scene: `sdf-benchmark.json`.
 
 | Input | Action |
 | --- | --- |
@@ -181,7 +187,7 @@ SDF](#example-caching-an-sdf).
 
 ### The splats
 
-`example-lua splat`, or mode 4 of the showcase.
+`example-lua splat`. The showcase shows it as a scene: `splats.json`.
 
 | Input | Action |
 | --- | --- |
@@ -199,7 +205,7 @@ How it renders is described in [Example: Gaussian splatting](#example-gaussian-s
 
 ### The physics
 
-`example-lua physics`, or mode 1 of the showcase. You play a horned, caped warrior with
+`example-lua physics`. The showcase shows it as a scene: `physics.json`. You play a horned, caped warrior with
 a big sword, with the camera behind them, in the style of Darksiders.
 
 | Steam Controller | Keyboard and mouse | Action |
@@ -220,15 +226,14 @@ a big sword, with the camera behind them, in the style of Darksiders.
 | | P | pause the simulation |
 | | T | slow motion (a quarter of the speed) |
 
-LB and RB still switch the showcase's modes. The crosshair turns orange over anything
-that can move.
+LB and RB switch the showcase's scenes. The crosshair turns orange over anything that can
+move.
 
 How it works is described in [Example: rigid body physics](#example-rigid-body-physics).
 
 ### The scene
 
-`example-lua scene`. It is no longer a showcase mode, but the depth composite (mode 5)
-builds on it.
+`example-lua scene`. The depth composite (`fusion.lua`) builds on it.
 
 | Input | Action |
 | --- | --- |
@@ -496,11 +501,11 @@ default audio device.
 - **Implementation:** `examples/lua/audio.h` and `audio.cpp`, on miniaudio (see
   [Implementation](#implementation)).
 
-Mode 4 of the showcase (the splats, `scripts/lib/splat-mode.lua`) plays
-`assets/audio/timelapse.mpeg` looped while it shows. It pauses when another mode is shown
-and goes on where it was when mode 4 comes back; M mutes it.
+The splats (`splat.lua`, `scripts/lib/splat-mode.lua`) play `assets/audio/timelapse.mpeg`
+looped while they show, as does the splat scene (`splats.json`, through a `sound`
+component); M mutes it.
 
-`rhi.include` is for sharing Lua code between scripts in different folders. The showcase
+`rhi.include` is for sharing Lua code between scripts in different folders. `fusion.lua`
 uses it to run `scripts/lib/scene-mode.lua`, the scene that `scene.lua` runs on its own.
 `require` works too, but a file loaded with `require` isn't watched for edits.
 
@@ -777,7 +782,7 @@ with an inner rigid body so that the bodies collide with it too.
 
 ## Example: rigid body physics
 
-`scripts/physics.lua` (and mode 1 of the showcase, in `scripts/lib/physics-mode.lua`) is a
+`scripts/physics.lua` (in `scripts/lib/physics-mode.lua`; the showcase's `physics.json`) is a
 test scene for the physics, with a player character in it:
 
 - **The chain reaction:** a ball at the top of a ramp rolls down into a row of 14
@@ -961,7 +966,7 @@ as `rhi.time()`.
 
 ## Example: Gaussian splatting
 
-`scripts/splat.lua` (and mode 4 of the showcase) renders a 3D Gaussian splatting scene.
+`scripts/splat.lua` (the showcase's `splats.json`) renders a 3D Gaussian splatting scene.
 The method is Kerbl et al., "3D Gaussian Splatting for Real-Time Radiance Field Rendering"
 (2023). The scene is `assets/skull.ply`: 1.9 million Gaussians, each with a position,
 rotation, scale, opacity, and degree-3 spherical harmonics for view-dependent color.
@@ -1128,7 +1133,7 @@ The frame time is GPU-bound. The usual next steps, not done here:
 
 ### Clipping
 
-Mode 4 cuts the skulls with a signed distance field, per pixel: the splats' equivalent of
+`splat.lua` (and the showcase's `splats.json`) cuts the skulls with a signed distance field, per pixel: the splats' equivalent of
 `clip()` in a fragment shader (`shaders/splat/clip.slang`). C carves the field's shapes out
 of the splats, keeps only what is inside them, or turns it off.
 
@@ -1162,7 +1167,7 @@ wholly kept or wholly cut (`clipClassify`).
   (one flat value). Those fragments read its center and covariance again, invert the
   covariance and clip. Every other splat draws as before.
 - **Why not hand down the splat's data:** passing the center and inverse covariance down
-  from every vertex (ten values) cost about 2 ms in mode 4 and 6 ms in the depth composite
+  from every vertex (ten values) cost about 2 ms in `splat.lua` and 6 ms in the depth composite
   even with clipping off. Splat quads are many and tiny, so per-vertex outputs are
   expensive.
 
@@ -1171,7 +1176,7 @@ wholly kept or wholly cut (`clipClassify`).
 - **The depth pass** (`depthFragmentMain`), for graphs that composite by depth, clips
   alike.
 - **Shadows:** the shadow maps clip the same way, along rays from the light, so cut-away
-  parts cast no shadow. (Mode 4 has no light; the depth composite uses the same code
+  parts cast no shadow. (`splat.lua` has no light; the depth composite uses the same code
   without a field.)
 - **Levels of detail:** a node wholly cut away counts 64 times smaller, as if off screen,
   so the budget isn't spent on it. A node across the surface counts 4 times larger, so
@@ -1205,7 +1210,7 @@ on each other.
 | `lib/scene/systems/*.lua` | one per kind of component: light, mesh (and body), sdf, splat, behavior, camera, sound, shadertoy |
 | `lib/scene/renderer.lua` | the render graph, from what the systems contribute |
 | `lib/scene/scene.lua` | a loaded scene: load, enter, leave, update, input |
-| `lib/scene-viewer-mode.lua` | the viewer (mode 7 of the showcase; `scenes.lua`) |
+| `lib/scene-viewer-mode.lua` | the viewer (the showcase; `scenes.lua`) |
 | `scripts/behaviors/*.lua` | behaviors: Lua that entities run |
 
 ### Entities, components and systems
@@ -1331,7 +1336,7 @@ return true when they handle the event), `addOverlays(graph)`, `enter()`, `leave
 - **Per frame:** nothing in the renderer runs; systems change parameter blocks, and the
   host runs the graph.
 - **Cost:** `composite.json` runs at 33–34 ms per frame on the RTX 3050 Laptop GPU (Release),
-  against 31–32 ms for the hand-built mode 5 it reproduces. Some details differ (its SDF
+  against 31–32 ms for the hand-built `fusion.lua` it reproduces. Some details differ (its SDF
   doesn't spin; its bounds are larger; a behavior spins the cube from Lua).
 
 ### Adding a component
@@ -1345,7 +1350,7 @@ return true when they handle the event), `addOverlays(graph)`, `enter()`, `leave
 
 ## Example: caching an SDF
 
-`scripts/sdf-cache.lua` (and mode 6 of the showcase, in `scripts/lib/sdf-cache-mode.lua`)
+`scripts/sdf-cache.lua` (in `scripts/lib/sdf-cache-mode.lua`; the showcase's `sdf-benchmark.json`)
 raymarches one SDF composition two ways, and times both on the GPU:
 
 - **The DAG:** evaluated at every sample, node by node (`shaders/sdf/sdf-dag.slang`), as
@@ -1427,7 +1432,7 @@ and could be cached the same way.
 
 ## Example: combining passes by depth
 
-`scripts/fusion.lua` (and mode 5 of the showcase) draws three kinds of surface into one
+`scripts/fusion.lua` (the showcase's `composite.json`) draws three kinds of surface into one
 picture: the mesh scene, the Gaussian splats, and a raymarched composition of SDF shapes
 (see [SDF compositions](#sdf-compositions)). They are rendered completely separately,
 each into its own color texture and its own depth buffer. A last pass then combines the
@@ -1941,7 +1946,7 @@ timestamp has held for one more check, so a half-written save isn't compiled.
 - **The script**: saving the script loads it into a fresh Lua state. If it loads, the old
   script's `shutdown()` runs, then the new one's `init()`.
   - **State resets**: script variables start over (the showcase returns to its first
-    mode).
+    scene).
   - **Kept by the host**: pipelines (from the cache), the window and the device.
   - **Load failure**: if the new version doesn't load, the old one keeps running.
 - **Script errors**: an error in a callback prints the message with a Lua traceback. The
@@ -1964,15 +1969,10 @@ messages appear in the same log. Release builds on Windows have no console.
    anything other examples could use in `common/`, `mesh/` or `post/`.
 3. Start from `config` plus `init` and `draw`. The smallest complete example is
    `surface.lua`. `lib/scene-mode.lua` shows a complete 3D setup as a render graph.
-4. For several modes in one script, follow `showcase.lua`:
-   - **Modes**: each mode is a table with `name`, a lazy `init()` and `draw(frame)`.
-   - **Shared state**: lives in locals.
-   - **Switching**: `switchTo(index)` initializes a mode on first use and updates the
-     title with `rhi.set_title`.
-   - **Forwarding**: `update`, `draw` and the input callbacks are passed on to the current
-     mode.
-   - **Graphs**: a mode with a render graph sets it in `on_enter()` and clears it in
-     `on_leave()`.
+4. For a scene of meshes, splats, SDFs, lights and cameras, write no Lua at all: a scene
+   file in `assets/scenes/` (see [the scene system](#the-scene-system)) shows in the
+   showcase and in `scenes.lua`. Behaviors (`scripts/behaviors/`) add code where a scene
+   needs it.
 5. Shared Lua code goes in `scripts/lib/` and is loaded with `rhi.include("lib/...")`,
    which watches it for edits. `require` works too, but isn't watched.
 

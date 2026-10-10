@@ -1,5 +1,5 @@
--- Gaussian splatting with compute shaders: see lib/splat-mode.lua, which holds it so the
--- showcase can run it too. Shows assets/skull.ply.
+-- Gaussian splatting with compute shaders: see lib/splat-mode.lua, which holds it so other
+-- graphs can use it too. Shows assets/skull.ply.
 --
 -- Like the scene, it is a render graph the host runs every frame: Lua builds it in init()
 -- and afterwards only reacts to input.

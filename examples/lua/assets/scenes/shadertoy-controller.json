@@ -1,4 +1,4 @@
-// The showcase's "ShaderToy: Controller" mode as a scene: shaders/shader-toy/controller.slang
+// The ShaderToy shader "Controller" as a scene: shaders/shader-toy/controller.slang
 // shows the primary Steam Controller's sticks, pads, triggers, buttons and motion sensors,
 // live (iController).
 {

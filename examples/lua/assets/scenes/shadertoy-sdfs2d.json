@@ -1,4 +1,4 @@
-// The showcase's "ShaderToy: 2D SDFs" mode as a scene: shaders/shader-toy/sdfs2d.slang,
+// The ShaderToy shader "2D SDFs" as a scene: shaders/shader-toy/sdfs2d.slang,
 // over the whole window. The left mouse button moves iMouse.
 {
     "name": "ShaderToy: 2D SDFs",

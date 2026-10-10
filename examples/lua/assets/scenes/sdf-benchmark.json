@@ -1,4 +1,4 @@
-// The showcase's "SDF Cache" mode as a scene: a sculpture of 64 shapes on a spiral around
+// The SDF cache benchmark (`sdf-cache.lua`) as a scene: a sculpture of 64 shapes on a spiral around
 // a core, smoothly joined into one composition of 129 nodes, raymarched from its DAG or
 // from its cache; the camera turns around it. sdf-controls.lua has the keys: C the DAG /
 // the cache / the cache's error, [ ] the cache's resolution, B a benchmark of both

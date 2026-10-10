@@ -27,8 +27,8 @@
 -- three use the same vertex format (mesh/mesh-vertex.slang) and are drawn without a vertex
 -- layout: the shaders fetch vertices by SV_VertexID.
 --
--- This file returns a constructor, so the scene can run on its own (scene.lua) or as a
--- mode of the showcase. `setTitle(details)`, if given, shows the scene's parameters; by
+-- This file returns a constructor, so the scene can run on its own (scene.lua) or as part
+-- of another graph (fusion.lua's). `setTitle(details)`, if given, shows the scene's parameters; by
 -- default they go in the window title after "Scene". Shader paths are relative to
 -- examples/lua/shaders.
 --

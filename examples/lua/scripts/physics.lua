@@ -1,5 +1,5 @@
--- Rigid body physics on Jolt: see lib/physics-mode.lua, which holds the scene so the
--- showcase can run it too (as its first mode).
+-- Rigid body physics on Jolt: see lib/physics-mode.lua, which holds the scene. (The
+-- showcase shows it as a scene file: assets/scenes/physics.json.)
 --
 -- The host steps the physics and draws the bodies every frame; Lua builds the scene in
 -- init(), and every frame steers and poses the player character (lib/player.lua).

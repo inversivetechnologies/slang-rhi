@@ -1,4 +1,4 @@
-// The depth composite (showcase mode 5) as a scene: meshes, the skull's splats and an SDF
+// The depth composite (`fusion.lua`) as a scene: meshes, the skull's splats and an SDF
 // sculpture, each rendered on its own and merged by depth, lit and shadowed by one light
 // that orbits them; a second camera in the corner. Keys: the splats' (splat-controls.lua:
 // L lighting, , . budget, / LOD tint, [ ] size) and the SDFs' (sdf-controls.lua: J K blend).

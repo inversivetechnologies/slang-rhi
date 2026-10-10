@@ -1,10 +1,10 @@
 -- ShaderToy shaders (shaders/shader-toy/: mainImage(), with ShaderToy's inputs) as part of
 -- a scene: run over a texture of the window's size every frame, and drawn over the window,
--- after the views. The showcase's ShaderToy modes, as scenes.
+-- after the views. (shader-toy.lua runs them on their own.)
 --
 --   "shadertoy": { "shader": "sdfs2d.slang" (in shaders/shader-toy/) }
 --
--- Inputs, as the showcase gives them: iResolution, iTime, iTimeDelta, iFrameRate, iFrame,
+-- Inputs, as shader-toy.lua gives them: iResolution, iTime, iTimeDelta, iFrameRate, iFrame,
 -- iMouse (xy where the left button was last held, z held, w pressed this frame) and
 -- iController (the primary Steam Controller, live). They change every frame, so this
 -- system updates its parameter block from Lua every frame. A shader that doesn't compile

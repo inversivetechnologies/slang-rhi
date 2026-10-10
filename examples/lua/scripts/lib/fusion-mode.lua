@@ -29,7 +29,7 @@
 -- block of their own after it, with that camera and the square's size.
 --
 -- It uses the scene and splat instances it is given (sharing their meshes, the loaded
--- file and their parameter blocks), so the showcase loads the 454 MB file only once.
+-- file and their parameter blocks), so a script running both loads the 454 MB file once.
 --
 --   Mouse drag      orbit the camera          Mouse wheel   zoom
 --   V               combined / mesh only / splats only / SDFs only / depth buffers

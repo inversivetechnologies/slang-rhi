@@ -14,7 +14,9 @@ local scenes = rhi.include("lib/scene/scene.lua")
 
 local SHOW_MODES = { "everything", "meshes", "splats", "SDFs", "depth buffers" }
 
-return function(setTitle, first)
+-- `setTitle(details)` shows the title (default: "Scenes | ..."); `order`, if given, lists
+-- scene file names to put first, in that order (the rest follow, sorted).
+return function(setTitle, order)
     local mode = { name = "Scenes" }
     setTitle = setTitle or function(details)
         rhi.set_title("Scenes | " .. details)
@@ -65,12 +67,25 @@ return function(setTitle, first)
     end
 
     function mode.init()
-        files = rhi.list_assets("scenes", ".json")
-        for i, f in ipairs(files) do
-            if first and f == first then index = i end
+        local found = {}
+        for _, f in ipairs(rhi.list_assets("scenes", ".json")) do found[f] = true end
+        files = {}
+        for _, f in ipairs(order or {}) do
+            if found[f] then
+                files[#files + 1] = f
+                found[f] = nil
+            end
+        end
+        for _, f in ipairs(rhi.list_assets("scenes", ".json")) do
+            if found[f] then files[#files + 1] = f end
         end
         load(index)
     end
+
+    -- Switching scenes: by `delta` (wrapping round), or to scene `i`.
+    function mode.step(delta) load(index + delta) end
+    function mode.show(i) if i >= 1 and i <= #files then load(i) end end
+    function mode.count() return #files end
 
     function mode.on_enter()
         entered = true

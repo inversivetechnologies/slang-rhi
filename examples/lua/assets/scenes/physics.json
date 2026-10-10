@@ -1,4 +1,4 @@
-// The physics playground (showcase mode 1) as a scene: a ball rolls down a ramp into a row
+// The physics playground (`physics.lua`) as a scene: a ball rolls down a ramp into a row
 // of dominoes, the last topples into a box pyramid; a tower stands beside them. The player
 // runs through it all (behaviors/player.lua); B drops boxes and balls from the sky; P
 // pauses, T slows down, R resets (behaviors/physics-controls.lua).

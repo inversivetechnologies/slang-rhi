@@ -24,7 +24,8 @@
 -- captured photos are), in an rgba16f texture. The composite then converts for the window.
 --
 -- This file returns a constructor, as lib/scene-mode.lua does: splat.lua runs it on its own,
--- the showcase as its sixth mode. `setTitle(details)`, if given, shows the splat count.
+-- fusion.lua and the scene system's splat system (lib/scene/systems/splat.lua) as part of
+-- their graphs. `setTitle(details)`, if given, shows the splat count.
 --
 -- Levels of detail: rhi.load_ply builds them for splat files (merged splats, in a tree
 -- over the file's). Every frame, the GPU picks the finest cut through the tree that fits a
