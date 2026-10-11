@@ -4,6 +4,8 @@
 --   Page Up / Page Down   previous / next scene
 --   V                     show: everything / meshes / splats / SDFs / the depth buffers
 --   Tab                   hide / show the insets (cameras with "inset")
+--   O                     2D overlays (assets/overlays/, lib/scene/overlays.lua): none,
+--                         then each in turn, over whichever scene is shown
 --   other input           the scene's: its behaviors (the player, bursts), its orbit
 --                         camera (drag, wheel), its sounds (M)
 --
@@ -11,6 +13,7 @@
 -- doesn't load shows why in the window title, and the viewer goes on.
 
 local scenes = rhi.include("lib/scene/scene.lua")
+local overlayLayer = rhi.include("lib/scene/overlays.lua")
 
 local SHOW_MODES = { "everything", "meshes", "splats", "SDFs", "depth buffers" }
 
@@ -28,6 +31,7 @@ return function(setTitle, order)
     local showMode = 1
     local entered = false
     local titleTimer = 0
+    local overlays
 
     local function updateTitle()
         local name = files[index] or "no scenes"
@@ -35,7 +39,9 @@ return function(setTitle, order)
         if failure then
             setTitle(head .. " | failed: " .. failure)
         elseif current then
-            setTitle(string.format("%s | %s | V: %s", head, current:describe(), SHOW_MODES[showMode]))
+            local overlay = overlays and overlays:describe()
+            setTitle(string.format("%s | %s | V: %s%s", head, current:describe(), SHOW_MODES[showMode],
+                overlay and " | " .. overlay or ""))
         else
             setTitle(head)
         end
@@ -53,7 +59,7 @@ return function(setTitle, order)
             failure = "no scenes in assets/scenes"
             return
         end
-        local ok, result = pcall(scenes.load, "scenes/" .. files[index])
+        local ok, result = pcall(scenes.load, "scenes/" .. files[index], overlays)
         if ok then
             current = result
             current:setShowMode(showMode - 1)
@@ -67,6 +73,7 @@ return function(setTitle, order)
     end
 
     function mode.init()
+        overlays = overlays or overlayLayer.load()
         local found = {}
         for _, f in ipairs(rhi.list_assets("scenes", ".json")) do found[f] = true end
         files = {}
@@ -99,6 +106,7 @@ return function(setTitle, order)
     end
 
     function mode.update(_, dt)
+        if overlays then overlays:update(dt) end
         if current then
             current:update(dt)
             if current.ctx.requestReload then
@@ -129,12 +137,18 @@ return function(setTitle, order)
             updateTitle()
         elseif action == input.PRESS and key == keys.TAB then
             current:toggleInsets()
+        elseif action == input.PRESS and key == keys.O then
+            overlays:cycle()
+            updateTitle()
         elseif current:on_key(key, action, mods) then
             updateTitle() -- what the key changed, at once
         end
     end
 
-    function mode.on_mouse_button(...) if current then current:on_mouse_button(...) end end
+    function mode.on_mouse_button(...)
+        if overlays and overlays:on_mouse_button(...) then return end -- a click on the overlay
+        if current then current:on_mouse_button(...) end
+    end
     function mode.on_mouse_move(...) if current then current:on_mouse_move(...) end end
     function mode.on_scroll(...) if current then current:on_scroll(...) end end
     function mode.on_controller_button(...)

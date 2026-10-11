@@ -1,5 +1,5 @@
 -- The examples in one window: the scenes in assets/scenes/, one after another -- rigid body
--- physics with a player, ShaderToy shaders, Gaussian splats, a lit scene combined with the
+-- physics with a player, Gaussian splats, a lit scene combined with the
 -- splats and SDF shapes by depth, and SDF compositions raymarched from a cache. Each is a
 -- scene file (built by lib/scene/: entities, prefabs, systems and a render graph), shown by
 -- the scene viewer (lib/scene-viewer-mode.lua).
@@ -9,6 +9,7 @@
 --   Steam Controller LB/RB  previous / next scene
 --   V                       show everything / meshes / splats / SDFs / depth buffers
 --   Tab                     hide / show the insets
+--   O                       2D overlays (ShaderToy shaders in a panel): none, each in turn
 --   everything else         the scene's: see the README's table of scenes
 --
 -- Edit this script, a scene or prefab file, or any of the shaders while it runs; they
@@ -23,8 +24,6 @@ config = {
 -- The scenes in this order; any others in assets/scenes/ follow.
 local ORDER = {
     "physics.json",
-    "shadertoy-sdfs2d.json",
-    "shadertoy-controller.json",
     "splats.json",
     "composite.json",
     "sdf-benchmark.json",

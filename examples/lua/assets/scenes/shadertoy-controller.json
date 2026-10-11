@@ -1,9 +1,0 @@
-// The ShaderToy shader "Controller" as a scene: shaders/shader-toy/controller.slang
-// shows the primary Steam Controller's sticks, pads, triggers, buttons and motion sensors,
-// live (iController).
-{
-    "name": "ShaderToy: Controller",
-    "entities": [
-        { "id": "toy", "shadertoy": { "shader": "controller.slang" } },
-    ],
-}

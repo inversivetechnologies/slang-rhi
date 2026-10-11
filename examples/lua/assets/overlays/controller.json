@@ -1,0 +1,8 @@
+// shaders/shader-toy/controller.slang in a panel in the top left corner: the primary Steam
+// Controller's sticks, pads, triggers, buttons and motion sensors, live (iController).
+{
+    "name": "Controller",
+    "shader": "controller.slang",
+    "size": 0.4,
+    "corner": "top-left",
+}

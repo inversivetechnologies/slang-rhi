@@ -16,6 +16,8 @@
 --                      into a texture for an inset
 --   overlays           systems' passes over the main view (the player's crosshair)
 --   insets             each inset's texture, framed, in its corner of the window
+--   2D overlays        the viewer's (lib/scene/overlays.lua), in their panels, all off but
+--                      the one shown
 --
 -- Every surface reads one light block and one shadow block, which systems add to
 -- (`shadowFields`): the SDFs' composition, whether there are splat shadows. So meshes,
@@ -171,6 +173,8 @@ function renderer.build(ctx, systems)
             }
         end
     end
+
+    if ctx.overlays then ctx.overlays:addPasses(graph) end
     return graph
 end
 

@@ -1,0 +1,8 @@
+// shaders/shader-toy/sdfs2d.slang (2D signed distance fields) in a panel in the top left
+// corner. The left mouse button on the panel moves iMouse.
+{
+    "name": "2D SDFs",
+    "shader": "sdfs2d.slang",
+    "size": 0.4,
+    "corner": "top-left",
+}

@@ -2,7 +2,8 @@
 -- and its render graph (lib/scene/renderer.lua).
 --
 --   local scenes = rhi.include("lib/scene/scene.lua")
---   local scene = scenes.load("scenes/composite.json")
+--   local scene = scenes.load("scenes/composite.json", overlays) -- overlays: optional,
+--                                                    -- lib/scene/overlays.lua
 --   scene:enter()            -- hands the graph (and physics, sounds) to the host
 --   scene:update(dt)         -- behaviors and cameras, every frame
 --   scene:on_key(...)        -- input goes to the systems, the first to want it takes it
@@ -10,7 +11,7 @@
 --
 -- The systems, in the order they load and contribute: the light, meshes and bodies, SDFs,
 -- splats, behaviors (which see all of those, and may add bodies, groups and cameras),
--- cameras, sounds, ShaderToy shaders.
+-- cameras, sounds.
 
 local loader = rhi.include("lib/scene/loader.lua")
 local renderer = rhi.include("lib/scene/renderer.lua")
@@ -23,7 +24,6 @@ local SYSTEMS = {
     rhi.include("lib/scene/systems/behavior.lua"),
     rhi.include("lib/scene/systems/camera.lua"),
     rhi.include("lib/scene/systems/sound.lua"),
-    rhi.include("lib/scene/systems/shadertoy.lua"),
 }
 
 local scenes = { systems = SYSTEMS, renderer = renderer }
@@ -31,9 +31,10 @@ local scenes = { systems = SYSTEMS, renderer = renderer }
 local Scene = {}
 Scene.__index = Scene
 
-function scenes.load(path)
+function scenes.load(path, overlays)
     local world, settings, name = loader.load(path, SYSTEMS)
-    local ctx = { world = world, settings = settings, name = name, path = path, cameraProviders = {} }
+    local ctx = { world = world, settings = settings, name = name, path = path, cameraProviders = {},
+                  overlays = overlays }
     for _, system in ipairs(SYSTEMS) do
         if system.load then system.load(ctx) end
     end
@@ -68,6 +69,7 @@ end
 
 function Scene:layout(width, height)
     each(self, "layout", width, height)
+    if self.ctx.overlays then self.ctx.overlays:layout(width, height) end
 end
 
 function Scene:update(dt)

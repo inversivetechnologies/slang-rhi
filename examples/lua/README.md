@@ -10,7 +10,7 @@ All examples are scripts, in `scripts/`:
 
 | Script | What it shows |
 | --- | --- |
-| `showcase.lua` | every scene in `assets/scenes/` in one window, one after another: the physics with a player, ShaderToy shaders, the splats, the depth composite, cached SDFs (the scene viewer, in the showcase's order and with its keys) |
+| `showcase.lua` | every scene in `assets/scenes/` in one window, one after another: the physics with a player, the splats, the depth composite, cached SDFs; ShaderToy shaders as 2D overlays over any of them (the scene viewer, in the showcase's order and with its keys) |
 | `physics.lua` | rigid body physics on Jolt: a ball, a ramp, dominoes, a box pyramid and a tower, and a player character to smash them, steered with a Steam Controller the way Darksiders is -- the host simulates and draws, instanced |
 | `surface.lua` | clearing the window |
 | `scene.lua` | a lit 3D scene: a GPU-generated spherified cube, a cube and a floor, with a point light, realtime shadow mapping and a second camera composited into the corner -- built as a render graph the host runs without Lua |
@@ -50,6 +50,7 @@ examples/lua/
   assets/              data files the scripts load (skull.ply, audio/timelapse.mpeg)
     scenes/            scene files (JSON with comments) for the scene viewer
     prefabs/           prefabs: entities that scenes use and override
+    overlays/          2D overlays: ShaderToy shaders in a panel, over any scene (O)
 ```
 
 **How paths resolve:**
@@ -92,9 +93,10 @@ and exits. It doesn't fall back to another API.
 ### The showcase
 
 The showcase is the [scene viewer](#the-scenes): the scene files in `assets/scenes/`, one at
-a time, in this order: the physics, the ShaderToy shaders 2D SDFs and Controller, the
-splats, the depth composite, the SDF benchmark, the SDF gallery (and any other scene files
-after them).
+a time, in this order: the physics, the splats, the depth composite, the SDF benchmark,
+the SDF gallery (and any other scene files after them). O puts a
+[2D overlay](#2d-overlays) over whichever scene is shown: the ShaderToy shaders Controller
+and 2D SDFs.
 
 | Input | Action |
 | --- | --- |
@@ -103,6 +105,7 @@ after them).
 | Steam Controller LB / RB | previous / next scene |
 | V | show everything / the meshes / the splats / the SDFs / the depth buffers |
 | Tab | hide or show the insets |
+| O | 2D overlays: none, Controller, 2D SDFs |
 | Escape | gives the mouse pointer back (click the window to hide it again) |
 | F11 | toggles fullscreen |
 | everything else | the scene's: see [the scenes](#the-scenes) |
@@ -144,6 +147,7 @@ depth](#example-combining-passes-by-depth).
 | Page Up / Page Down | previous / next scene |
 | V | show everything / the meshes / the splats / the SDFs / the depth buffers |
 | Tab | hide or show the insets |
+| O | 2D overlays (`assets/overlays/`): none, then each in turn |
 | everything else | the scene's: its behaviors (below), its orbit camera (drag, wheel), M to mute its sounds |
 
 Each scene stands for one of the examples; its keys come from behaviors in the scene.
@@ -151,8 +155,6 @@ Each scene stands for one of the examples; its keys come from behaviors in the s
 | Scene | Example | | Keys |
 | --- | --- | --- | --- |
 | `physics.json` | `physics.lua` | the ramp, the dominoes, the pyramid, the tower, the player | the player's; B drop boxes; P pause, T slow motion, R reset |
-| `shadertoy-sdfs2d.json` | `shader-toy.lua` | `shader-toy/sdfs2d.slang` | the mouse |
-| `shadertoy-controller.json` | `shader-toy.lua` | `shader-toy/controller.slang` | the Steam Controller |
 | `splats.json` | `splat.lua` | a grid of skulls carved per pixel by moving shapes, with music | `,` `.` budget, `/` LOD tint, `[` `]` size, L lighting, C clip mode, M mute |
 | `composite.json` | `fusion.lua` | meshes, the skull's splats and an SDF sculpture merged by depth, a second camera in the corner | the splats' (as above, but C), J K blend |
 | `sdf-benchmark.json` | `sdf-cache.lua` | a turning spiral of 64 shapes around a core, 129 nodes, cached | C DAG / cache / cache error, `[` `]` resolution, B benchmark, J K blend, Space stop the camera |
@@ -163,6 +165,30 @@ Some details differ from the examples, which still run on their own:
 - **SDF benchmark:** its shape count is fixed by the file, not changed by keys.
 - **Splat grid:** so is its grid's size.
 - **Physics:** R loads the whole scene again rather than only the bodies.
+
+#### 2D overlays
+
+The ShaderToy shaders 2D SDFs and Controller (`shader-toy.lua` runs them over the whole
+window) are 2D overlays: O shows one, framed in a panel, over any scene, and goes on to the
+next, then none. Each is a file in `assets/overlays/`, read by `lib/scene/overlays.lua`:
+
+```jsonc
+{
+    "name": "2D SDFs",
+    "shader": "sdfs2d.slang", // required: in shaders/shader-toy/
+    "size": 0.4,              // the panel: this fraction of the window's width and height
+    "corner": "top-left",     // or "top-right", "bottom-left", "bottom-right"
+}
+```
+
+- **Lifetime:** the viewer loads the overlays once; their pipelines, images and time go on
+  across scenes. Each scene's graph gets every overlay's passes, after its insets, all off
+  but the one shown.
+- **Inputs:** ShaderToy's, as `shader-toy.lua` gives them, but for the panel: `iResolution`
+  is its size and `iMouse` is in its pixels (from its top left corner). Clicks on the panel
+  go to the overlay, not to the scene's camera or behaviors.
+- **Errors:** an overlay whose shader doesn't compile shows a dark red panel until it does;
+  a file that doesn't load is reported (`[overlay] ...`) and left out.
 
 Saving a scene or prefab file reloads it. A scene that fails to load (bad JSON, an unknown
 component or field) says why in the window title, and the viewer goes on.
@@ -1207,9 +1233,10 @@ on each other.
 | `lib/scene/ecs.lua` | the entities and components |
 | `lib/scene/transform.lua` | transforms: position, rotation (a quaternion), uniform scale |
 | `lib/scene/loader.lua` | scene files to a world: prefabs, children, repeats, schema checks |
-| `lib/scene/systems/*.lua` | one per kind of component: light, mesh (and body), sdf, splat, behavior, camera, sound, shadertoy |
+| `lib/scene/systems/*.lua` | one per kind of component: light, mesh (and body), sdf, splat, behavior, camera, sound |
 | `lib/scene/renderer.lua` | the render graph, from what the systems contribute |
 | `lib/scene/scene.lua` | a loaded scene: load, enter, leave, update, input |
+| `lib/scene/overlays.lua` | the [2D overlays](#2d-overlays): ShaderToy shaders in a panel, over any scene |
 | `lib/scene-viewer-mode.lua` | the viewer (the showcase; `scenes.lua`) |
 | `scripts/behaviors/*.lua` | behaviors: Lua that entities run |
 
@@ -1271,7 +1298,6 @@ missing required field stops the load, with the entity and the field in the mess
 | `splat` | `file` (required), `fit` (a radius to scale to; 0: as is), `grid` ([nx, nz] copies), `spacing`, `turn` (degrees per copy), `clip` (`mode` "carve" or "keep", `shapes`: spheres and boxes with `position`, `move`, `speed`, `spin`) | Gaussian splats with LOD, lighting, shadows, clipping; one renderer per file, entities as its instances |
 | `sdf` | `shape` (required: a node, below), `cache` (0: the DAG; or voxels a side), `sharpness` (8, of soft shadows), `blend` (0: how smoothly the entities' shapes join one another) | all entities' shapes as one composition, raymarched (timed on the GPU), shadowing everything; cached if any asks |
 | `camera` | `fov` (50), `controller` ("orbit", "fixed", "player"), `target`, `distance`, `yaw`, `pitch` (degrees), `turn` (degrees per second: an orbit that turns by itself), `inset` (0: the main view; else a square of that fraction of the window's height), `corner` | the views |
-| `shadertoy` | `shader` (required: in `shaders/shader-toy/`) | a ShaderToy shader over the whole window, with ShaderToy's inputs (iTime, iMouse, iController...) updated every frame |
 | `sound` | `file` (required), `loop` (true), `volume` (1), `autoplay` (true) | played while the scene shows |
 | `script` | `file` (required: in `scripts/behaviors/`), `params` | a behavior |
 
@@ -1323,8 +1349,9 @@ return true when they handle the event), `addOverlays(graph)`, `enter()`, `leave
 | per view: opaque | renderer, mesh | color and depth; the meshes draw into it |
 | per view: surfaces | sdf, splat | the raymarching (stopping at the meshes' depth), the splats |
 | per view: depth composite | renderer | the view's surfaces merged by depth (`post/depth-composite.slang`), into the window or the inset's texture |
-| overlays | behaviors, shadertoy | over the main view: the crosshair; a ShaderToy shader over all of it |
+| overlays | behaviors | over the main view: the crosshair |
 | insets | renderer, camera | each inset framed in its corner, stacked if several share one |
+| 2D overlays | the viewer's overlays | each overlay's shader and its framed panel, all off but the one shown |
 
 - **One light and one shadow block:** every surface reads the same light block and the same
   shadow block. Systems add their fields to the shadow block: the SDF composition, whether
