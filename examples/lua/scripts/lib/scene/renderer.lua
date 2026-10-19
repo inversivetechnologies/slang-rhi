@@ -69,12 +69,15 @@ end
 -- setting changes it, for the graphs built after.
 renderer.shadowFaceSize = 512
 
--- Screen-space effects on every view (post/ssao.slang): ambient occlusion and indirect
--- light, at a quality: "Half" (both at half resolution), "Mixed" (AO at full, GI at half)
--- or "Full". The settings change them, for the graphs built after.
-renderer.effects = { ao = true, gi = false, quality = "Half" }
+-- Screen-space effects on every view (post/ssao.slang): ambient occlusion (by `aoMethod`,
+-- "GTAO" or "SSAO") and indirect light, at a quality: "Half" (both at half resolution),
+-- "Mixed" (AO at full, GI at half) or "Full". The settings change them, for the graphs
+-- built after.
+renderer.effects = { ao = true, aoMethod = "GTAO", gi = false, quality = "Half" }
 renderer.EFFECT_PARAMS = {
-    aoRadius = 1.0, aoStrength = 1.6, -- world units; 1: black where fully occluded
+    aoRadius = 1.0,   -- world units
+    aoStrength = 1.6, -- SSAO's: 1 black where fully occluded
+    gtaoPower = 1.5,  -- GTAO's: its visibility raised to this
     giRadius = 2.5, giStrength = 2.5,
 }
 
@@ -88,7 +91,8 @@ local function effectChains(fx)
 end
 
 local function chainLabel(chain)
-    return (chain.ao and chain.gi and "SSAO + SSGI" or chain.ao and "SSAO" or "SSGI") ..
+    local ao = renderer.effects.aoMethod == "GTAO" and "GTAO" or "SSAO"
+    return (chain.ao and chain.gi and ao .. " + SSGI" or chain.ao and ao or "SSGI") ..
         (chain.scale < 1 and " (half)" or "")
 end
 
@@ -134,6 +138,7 @@ function renderer.build(ctx, systems)
         ctx.effectsBlock = rhi.params {
             depthNear = 0.1, depthFar = 100,
             aoRadius = p.aoRadius, aoStrength = p.aoStrength, giRadius = p.giRadius,
+            aoMethod = fx.aoMethod == "GTAO" and 1 or 0, gtaoPower = p.gtaoPower,
             frameIndex = 0,
         }
         ctx.effectsNodes = {} -- the main view's, timed

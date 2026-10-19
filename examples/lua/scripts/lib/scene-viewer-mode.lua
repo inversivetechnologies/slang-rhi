@@ -104,7 +104,7 @@ return function(setTitle, order)
         overlays = overlays or overlayLayer.load()
         values = values or settings.load()
         scenes.renderer.shadowFaceSize = settings.SHADOW_FACE_SIZES[values.shadowQuality]
-        scenes.renderer.effects = { ao = values.ssao, gi = values.ssgi, quality = values.effectsQuality }
+        scenes.renderer.effects = { ao = values.ambientOcclusion ~= "Off", aoMethod = values.ambientOcclusion, gi = values.ssgi, quality = values.effectsQuality }
         menu = menu or pauseMenu.new {
             settings = values,
             onPause = function(paused)
@@ -118,9 +118,9 @@ return function(setTitle, order)
                 elseif name == "shadowQuality" then
                     scenes.renderer.shadowFaceSize = settings.SHADOW_FACE_SIZES[values.shadowQuality]
                     load(index) -- the shadow maps are part of the scene's graph
-                elseif name == "ssao" or name == "ssgi" or name == "effectsQuality" then
-                    scenes.renderer.effects = { ao = values.ssao, gi = values.ssgi, quality = values.effectsQuality }
-                    if not (values.ssao or values.ssgi) and showMode > 5 then showMode = 1 end
+                elseif name == "ambientOcclusion" or name == "ssgi" or name == "effectsQuality" then
+                    scenes.renderer.effects = { ao = values.ambientOcclusion ~= "Off", aoMethod = values.ambientOcclusion, gi = values.ssgi, quality = values.effectsQuality }
+                    if values.ambientOcclusion == "Off" and not values.ssgi and showMode > 5 then showMode = 1 end
                     load(index) -- so are the effects' passes
                 end
             end,
@@ -197,7 +197,7 @@ return function(setTitle, order)
         end
         if not current then return end
         if action == input.PRESS and key == keys.V then
-            local count = (values.ssao or values.ssgi) and #SHOW_MODES or 5 -- the effects' only with them
+            local count = (values.ambientOcclusion ~= "Off" or values.ssgi) and #SHOW_MODES or 5 -- the effects' only with them
             showMode = showMode % count + 1
             current:setShowMode(showMode - 1)
             updateTitle()

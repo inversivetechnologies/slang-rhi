@@ -7,9 +7,17 @@
 //   effectsMain   per pixel, its position and normal (rebuilt from depth), and kSamples
 //                 directions over the normal's hemisphere, cosine-weighted (a golden-
 //                 angle spiral, turned per pixel by a 4 x 4 pattern, and per frame).
-//                 AO: a point a short way along each direction, occluded where the
-//                 depth buffer has something in front of it (counted less, the farther
-//                 that is from the pixel's depth: no halos round foreground objects).
+//                 AO, by one of two methods (aoMethod):
+//                   SSAO: a point a short way along each direction, occluded where the
+//                   depth buffer has something in front of it (counted less, the
+//                   farther that is from the pixel's depth: no halos round foreground
+//                   objects).
+//                   GTAO (ground-truth AO, Jimenez et al. 2016): kSlices planes through
+//                   the view direction, turned per pixel and frame; along each, both
+//                   ways, the highest horizon the depth buffer has within aoRadius, and
+//                   the visible arc between the two horizons integrated against the
+//                   normal projected into the plane -- the cosine-weighted visibility,
+//                   in closed form. Smoother than SSAO for its samples, and unbiased.
 //                 GI: a point a longer way along it; where the depth buffer has a
 //                 surface in front of that point (the direction is blocked) and that
 //                 surface faces the pixel, its light, by the cosine at the pixel and a
@@ -29,12 +37,16 @@
 #include "ssao-common.slang"
 
 static const int kSamples = 12;
+static const int kSlices = 3;     // GTAO's planes a pixel
+static const int kSliceSteps = 6; // and its samples each way along each
 static const float kPi = 3.14159265;
 static const float kHistoryWeight = 0.9; // of the frames before, where they agree
 
 Texture2D<float4> litColor; // the view's merged image, linear
 
 uniform uint aoEnabled;
+uniform uint aoMethod;    // 0: SSAO, 1: GTAO
+uniform float gtaoPower;  // GTAO's visibility, raised to this: how dark it gets
 uniform uint giEnabled;
 uniform float aoRadius;   // world units
 uniform float aoStrength; // 1: fully occluded where every sample is
@@ -74,6 +86,77 @@ float3 viewNormal(int2 p, float3 position, uint2 size, float aspect)
         : position - viewPosition(camera, uv - float2(0, texel.y), zu, aspect);
     float3 n = normalize(cross(dx, dy));
     return dot(n, position) > 0 ? -n : n; // facing the camera
+}
+
+// GTAO's visibility (1: open) at a pixel, from its view-space position and normal. `turn`
+// and `jitter` in [0, 1) place its slices and their samples.
+float gtaoVisibility(int2 p, float3 position, float3 normal, uint2 size, float aspect, float turn, float jitter)
+{
+    float3 toEye = normalize(-position);
+    // aoRadius in pixels at this depth (not past a third of the view: near the camera, a
+    // radius of world units covers the screen).
+    float focal = 1.0 / tan(camera.fovY * 0.5);
+    float radiusPixels = min(aoRadius * focal * 0.5 * float(size.y) / position.z, float(size.y) / 3.0);
+    if (radiusPixels < 1.0)
+        return 1.0;
+
+    float visibility = 0;
+    for (int slice = 0; slice < kSlices; ++slice)
+    {
+        float phi = (float(slice) + turn) * kPi / float(kSlices);
+        float2 screenDirection = float2(cos(phi), sin(phi)); // pixels: x right, y down
+        float3 direction = float3(screenDirection.x, -screenDirection.y, 0); // view: y up
+
+        // The slice: the plane through the view direction and `direction`. The normal,
+        // projected into it, and its angle from the view direction (n).
+        float3 axis = normalize(cross(direction, toEye));
+        float3 projected = normal - axis * dot(normal, axis);
+        float projectedLength = length(projected);
+        if (projectedLength < 1e-4)
+        {
+            visibility += 1.0;
+            continue;
+        }
+        float3 ortho = direction - dot(direction, toEye) * toEye;
+        float cosN = saturate(dot(projected, toEye) / projectedLength);
+        float n = (dot(ortho, projected) < 0 ? -1.0 : 1.0) * acos(cosN);
+
+        // The highest horizon each way, as a cosine from the view direction; the tangent
+        // plane's at the least.
+        float horizonCos[2];
+        for (int side = 0; side < 2; ++side)
+        {
+            float way = side == 0 ? -1.0 : 1.0;
+            float lowest = cos(n + way * kPi * 0.5);
+            float best = lowest;
+            for (int k = 0; k < kSliceSteps; ++k)
+            {
+                float t = (float(k) + jitter) / float(kSliceSteps);
+                t = t * t; // more samples near the pixel
+                int2 q = p + int2(round(screenDirection * way * max(t * radiusPixels, 1.0 + float(k))));
+                if (any(q < 0) || q.x >= int(size.x) || q.y >= int(size.y))
+                    break;
+                float qz = sceneZ(q, size);
+                float3 d = viewPosition(camera, (float2(q) + 0.5) / float2(size), qz, aspect) - position;
+                float distanceSquared = dot(d, d);
+                float c = dot(d, toEye) * rsqrt(max(distanceSquared, 1e-8));
+                // Nearer than aoRadius counts fully, fading out to it.
+                float falloff = saturate(1.0 - distanceSquared / (aoRadius * aoRadius));
+                best = max(best, lerp(lowest, c, falloff));
+            }
+            horizonCos[side] = best;
+        }
+
+        // The horizons as angles from the view direction, no farther than the normal's
+        // hemisphere allows; then the visible arc between them, cosine-weighted.
+        float h0 = n + max(-acos(horizonCos[0]) - n, -kPi * 0.5);
+        float h1 = n + min(acos(horizonCos[1]) - n, kPi * 0.5);
+        float sinN = sin(n);
+        float arc0 = 0.25 * (-cos(2.0 * h0 - n) + cosN + 2.0 * h0 * sinN);
+        float arc1 = 0.25 * (-cos(2.0 * h1 - n) + cosN + 2.0 * h1 * sinN);
+        visibility += projectedLength * (arc0 + arc1);
+    }
+    return saturate(visibility / float(kSlices));
 }
 
 // A different turn per pixel, in [0, 1): a 4 x 4 Bayer pattern, which the 5 x 5 blur
@@ -117,7 +200,7 @@ float4 computeEffects(uint2 tid)
         float reach = frac(float(i) * 0.618034 + jitter);
         reach = lerp(0.1, 1.0, reach * reach);
 
-        if (aoEnabled != 0)
+        if (aoEnabled != 0 && aoMethod == 0)
         {
             float3 s = position + direction * aoRadius * reach;
             float2 suv = projectToUv(camera, s, aspect);
@@ -154,7 +237,11 @@ float4 computeEffects(uint2 tid)
             }
         }
     }
-    float visibility = saturate(1.0 - aoStrength * occlusion / float(kSamples));
+    float visibility = 1.0;
+    if (aoEnabled != 0 && aoMethod == 1)
+        visibility = pow(gtaoVisibility(p, position, normal, size, aspect, turn / (2 * kPi), jitter), gtaoPower);
+    else if (aoEnabled != 0)
+        visibility = saturate(1.0 - aoStrength * occlusion / float(kSamples));
     return float4(indirect * (2.0 / float(kSamples)), visibility);
 }
 

@@ -128,7 +128,7 @@ and the shaders' `time` stops, so everything animated by it holds still too.
 | Fullscreen | Off, On | fullscreen on the primary monitor, at the resolution |
 | Max splats | 250,000 .. 2,000,000 | the splats' budget: the levels of detail fit what is drawn to it (a scene's own `splatBudget`, if lower, still holds) |
 | Shadow quality | Low (256), Medium (512), High (1024), Ultra (2048) | the shadow maps' texels per cube face; the scene (or script) is loaded again with them |
-| Ambient occlusion | On, Off | [SSAO](#ambient-occlusion-and-indirect-light): darker where surfaces are close to others |
+| Ambient occlusion | GTAO, Off, SSAO | [GTAO or SSAO](#ambient-occlusion-and-indirect-light): darker where surfaces are close to others; GTAO by default |
 | Indirect light | Off, On | [SSGI](#ambient-occlusion-and-indirect-light): light bounced from the surfaces seen nearby |
 | Effects quality | Half, Mixed, Full | the resolution SSAO and SSGI are computed at: both at half; AO at full and GI at half; both at full |
 
@@ -268,9 +268,9 @@ watched, so the scene reloads when it turns up), with a warning:
 
 #### Ambient occlusion and indirect light
 
-Every view of a scene can have screen-space ambient occlusion (SSAO) and screen-space
-indirect light (SSGI), switched in the [pause menu](#the-pause-menu) (SSAO is on by
-default, SSGI off). They work on whatever the view shows: meshes, SDFs and splats, from
+Every view of a scene can have screen-space ambient occlusion, by GTAO or SSAO, and
+screen-space indirect light (SSGI), switched in the [pause menu](#the-pause-menu) (GTAO
+is on by default, SSGI off). They work on whatever the view shows: meshes, SDFs and splats, from
 the depth buffers the depth composite merges.
 
 | Pass | |
@@ -311,8 +311,15 @@ has two (AO at full resolution, GI at half), the others one.
   upsample), and where none is near, the nearest of them in depth. So the effects don't
   bleed across silhouettes.
 
-- **Occlusion:** a point a short way (1 unit) along each direction is occluded where the
-  depth buffer has a surface in front of it. A surface much nearer the camera than the
+- **Occlusion, GTAO** (ground-truth ambient occlusion, Jimenez et al. 2016; the default):
+  3 slices a pixel, planes through the view direction turned per pixel and frame. Along
+  each, 6 steps each way within 1 unit find the highest horizon the depth buffer has, and
+  the arc of sky between the two horizons is integrated against the normal projected into
+  the plane, in closed form: the cosine-weighted visibility. It shades the objects'
+  own creases and undersides and their contact with the floor, without the halos SSAO
+  leaves round foreground objects, for about 0.35 ms more than SSAO at Half.
+- **Occlusion, SSAO:** a point a short way (1 unit) along each direction is occluded where
+  the depth buffer has a surface in front of it. A surface much nearer the camera than the
   pixel counts less, so that foreground objects don't cast halos on what is behind them.
 - **Indirect light:** a point a longer way (2.5 units) along each direction; where the
   direction is blocked, and the surface blocking it faces the pixel, that surface's light
@@ -320,11 +327,13 @@ has two (AO at full resolution, GI at half), the others one.
   It is what the camera sees of the scene, so a surface off screen, or behind another,
   bounces nothing.
 - **Tuning:** the radii and strengths are `renderer.EFFECT_PARAMS` in
-  `scripts/lib/scene/renderer.lua`.
+  `scripts/lib/scene/renderer.lua` (`gtaoPower`: GTAO's visibility raised to it, 1.5;
+  `aoStrength`: SSAO's).
 - **Seeing them:** V goes on to the ambient visibility and the indirect light alone, when
   they are on. The window title gives the effects' GPU time (all their passes).
-- **Cost**, both on, at 1600 x 900 on an RTX 3050 Laptop GPU (D3D12; Vulkan is similar):
-  about 1.1 ms at Half, 3.1 ms at Mixed and 4.2 ms at Full.
+- **Cost** at 1600 x 900 on an RTX 3050 Laptop GPU, at Half (D3D12, Vulkan, D3D11):
+  GTAO alone 1.0, 1.3, 1.4 ms; SSAO alone 0.7, 0.9, 0.9 ms. With SSGI as well (SSAO), D3D12
+  took about 1.1 ms at Half, 3.1 ms at Mixed and 4.2 ms at Full.
 
 ### The SDF cache
 

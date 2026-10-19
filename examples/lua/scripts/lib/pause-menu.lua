@@ -113,9 +113,13 @@ function Menu:rows()
         { key = "shadowQuality", label = "Shadow quality", choices = settings.SHADOW_QUALITIES, index = shadowIndex,
           format = function(q) return q .. " (" .. settings.SHADOW_FACE_SIZES[q] .. ")" end,
           apply = function(q) v.shadowQuality = q return "shadowQuality", q end },
-        { key = "ssao", label = "Ambient occlusion", choices = { false, true }, index = v.ssao and 2 or 1,
-          format = function(on) return on and "On" or "Off" end,
-          apply = function(on) v.ssao = on return "ssao", on end },
+        { key = "ambientOcclusion", label = "Ambient occlusion", choices = settings.AO_METHODS,
+          index = (function()
+              for i, m in ipairs(settings.AO_METHODS) do if m == v.ambientOcclusion then return i end end
+              return 1
+          end)(),
+          format = function(m) return m end,
+          apply = function(m) v.ambientOcclusion = m return "ambientOcclusion", m end },
         { key = "ssgi", label = "Indirect light", choices = { false, true }, index = v.ssgi and 2 or 1,
           format = function(on) return on and "On" or "Off" end,
           apply = function(on) v.ssgi = on return "ssgi", on end },
