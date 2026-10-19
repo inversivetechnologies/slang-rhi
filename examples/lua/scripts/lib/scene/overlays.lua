@@ -1,6 +1,6 @@
 -- 2D overlays: ShaderToy shaders (shaders/shader-toy/: mainImage(), with ShaderToy's inputs)
 -- drawn in a framed panel over any scene, after its views and insets. Each is a file in
--- assets/overlays/:
+-- assets/overlays/, <name>.overlay (JSON with comments, as scene files are):
 --
 --   { "name": "2D SDFs", "shader": "sdfs2d.slang" (in shaders/shader-toy/),
 --     "size": 0.4 (of the window's width and height), "corner": "top-left" }
@@ -28,11 +28,11 @@ Overlays.__index = Overlays
 
 local overlays = {}
 
--- Reads assets/overlays/*.json; a file that doesn't load is reported and left out.
+-- Reads assets/overlays/*.overlay; a file that doesn't load is reported and left out.
 function overlays.load()
     local self = setmetatable({ list = {}, active = 0, time = 0, frame = 0, frameRate = 0, down = false }, Overlays)
     self.frame_pipeline = rhi.render_pipeline { shader = "post/composite.slang" }
-    for _, file in ipairs(rhi.list_assets("overlays", ".json")) do
+    for _, file in ipairs(rhi.list_assets("overlays", ".overlay")) do
         local path = "overlays/" .. file
         local ok, spec = pcall(function() return json.decode(rhi.read_asset(path), path) end)
         if ok and type(spec.shader) ~= "string" then

@@ -45,9 +45,10 @@ struct Transform
 //
 //   [0] position.xyz    [1] rotation quaternion xyzw    [2] scale.xyz (of the unit mesh)
 //   [3] color.rgb, w: material pattern (as Material.pattern in lit.slang)
+//   [4] the frame before's position.xyz    [5] its rotation (for motion vectors)
 // ---------------------------------------------------------------------------------------
 
-static const uint kBodyStride = 4;
+static const uint kBodyStride = 6;
 StructuredBuffer<float4> bodies;
 
 float3 rotateByQuaternion(float4 q, float3 v)
@@ -60,6 +61,13 @@ float3 bodyPoint(uint body, float3 p)
 {
     uint base = body * kBodyStride;
     return rotateByQuaternion(bodies[base + 1], p * bodies[base + 2].xyz) + bodies[base].xyz;
+}
+
+// Where `p` (of the unit mesh) was the frame before.
+float3 bodyPreviousPoint(uint body, float3 p)
+{
+    uint base = body * kBodyStride;
+    return rotateByQuaternion(bodies[base + 5], p * bodies[base + 2].xyz) + bodies[base + 4].xyz;
 }
 
 float3 bodyNormal(uint body, float3 n)

@@ -55,6 +55,13 @@ local function cameraParams(ctx, view)
     return orbitParams(c)
 end
 
+-- A view's camera, into its block; `view.cameraValue` keeps it for Lua (the renderer's
+-- temporal effects reproject by the last frame's).
+local function setCamera(view, value)
+    view.cameraValue = value
+    view.block.camera = value
+end
+
 function system.load(ctx)
     local main, insets = nil, {}
     for id, camera, transform in ctx.world:query("camera", "transform") do
@@ -81,7 +88,8 @@ function system.load(ctx)
         view.budgetScale = view.budgetScale or 1
         -- What every pass of the view sees the world through; the mesh pass writes linear
         -- color, the composite encodes it.
-        view.block = rhi.params { camera = cameraParams(ctx, view), encodeGamma = 0 }
+        view.cameraValue = cameraParams(ctx, view)
+        view.block = rhi.params { camera = view.cameraValue, encodeGamma = 0 }
     end
 end
 
@@ -110,10 +118,10 @@ function system.update(ctx, dt)
     for _, view in ipairs(ctx.views) do
         local c = view.camera
         if c.controller == "player" then
-            view.block.camera = cameraParams(ctx, view)
+            setCamera(view, cameraParams(ctx, view))
         elseif c.controller == "orbit" and c.turn ~= 0 and not ctx.cameraStill then
             c.yaw = c.yaw + c.turn * dt
-            view.block.camera = cameraParams(ctx, view)
+            setCamera(view, cameraParams(ctx, view))
         end
     end
 end
@@ -136,7 +144,7 @@ function system.on_mouse_move(ctx, x, y)
     c.yaw = c.yaw - (x - drag[1]) * 0.35
     c.pitch = math.max(-80, math.min(85, c.pitch + (y - drag[2]) * 0.35))
     drag = { x, y }
-    main.block.camera = cameraParams(ctx, main)
+    setCamera(main, cameraParams(ctx, main))
     return true
 end
 
@@ -144,7 +152,7 @@ function system.on_scroll(ctx, _, y)
     local main = ctx.views[1]
     if main.camera.controller ~= "orbit" then return false end
     main.camera.distance = math.max(0.5, math.min(200, main.camera.distance * (y > 0 and 0.9 or 1.1)))
-    main.block.camera = cameraParams(ctx, main)
+    setCamera(main, cameraParams(ctx, main))
     return true
 end
 

@@ -1,12 +1,12 @@
--- Loading scene files (assets/scenes/*.json) into a world of entities (lib/scene/ecs.lua),
--- with prefabs (assets/prefabs/*.json).
+-- Loading scene files (assets/scenes/*.scene) into a world of entities (lib/scene/ecs.lua),
+-- with prefabs (assets/prefabs/*.prefab).
 --
 -- A scene file:
 --
 --   {
 --     "name": "...",
 --     "settings": { "background": [r, g, b], "splatBudget": 1000000, ... },
---     "prefabs": { "name": { ...an entity... } },   // optional, inline; else prefabs/name.json
+--     "prefabs": { "name": { ...an entity... } },   // optional, inline; else prefabs/name.prefab
 --     "entities": [ { ...an entity... }, ... ]
 --   }
 --
@@ -141,7 +141,7 @@ function loader.load(path, systems)
         chain[name] = true
         local spec = inline[name]
         if not spec then
-            local file = "prefabs/" .. name .. ".json"
+            local file = "prefabs/" .. name .. ".prefab"
             local ok, text = pcall(rhi.read_asset, file)
             if ok then
                 spec = json.decode(text, file)

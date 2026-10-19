@@ -3,7 +3,8 @@
 --
 --   Page Up / Page Down   previous / next scene
 --   V                     show: everything / meshes / splats / SDFs / the depth buffers /
---                         the ambient occlusion / the indirect light (when they are on)
+--                         the ambient occlusion / the indirect light / the bodies' motion
+--                         vectors (when the effects are on)
 --   Tab                   hide / show the insets (cameras with "inset")
 --   O                     2D overlays (assets/overlays/, lib/scene/overlays.lua): none,
 --                         then each in turn, over whichever scene is shown
@@ -19,7 +20,8 @@ local overlayLayer = rhi.include("lib/scene/overlays.lua")
 local pauseMenu = rhi.include("lib/pause-menu.lua")
 local settings = rhi.include("lib/settings.lua")
 
-local SHOW_MODES = { "everything", "meshes", "splats", "SDFs", "depth buffers", "ambient occlusion", "indirect light" }
+local SHOW_MODES = { "everything", "meshes", "splats", "SDFs", "depth buffers", "ambient occlusion", "indirect light",
+    "motion vectors" }
 
 -- `setTitle(details)` shows the title (default: "Scenes | ..."); `order`, if given, lists
 -- scene file names to put first, in that order (the rest follow, sorted).
@@ -102,7 +104,7 @@ return function(setTitle, order)
         overlays = overlays or overlayLayer.load()
         values = values or settings.load()
         scenes.renderer.shadowFaceSize = settings.SHADOW_FACE_SIZES[values.shadowQuality]
-        scenes.renderer.effects = { ao = values.ssao, gi = values.ssgi }
+        scenes.renderer.effects = { ao = values.ssao, gi = values.ssgi, quality = values.effectsQuality }
         menu = menu or pauseMenu.new {
             settings = values,
             onPause = function(paused)
@@ -116,8 +118,8 @@ return function(setTitle, order)
                 elseif name == "shadowQuality" then
                     scenes.renderer.shadowFaceSize = settings.SHADOW_FACE_SIZES[values.shadowQuality]
                     load(index) -- the shadow maps are part of the scene's graph
-                elseif name == "ssao" or name == "ssgi" then
-                    scenes.renderer.effects = { ao = values.ssao, gi = values.ssgi }
+                elseif name == "ssao" or name == "ssgi" or name == "effectsQuality" then
+                    scenes.renderer.effects = { ao = values.ssao, gi = values.ssgi, quality = values.effectsQuality }
                     if not (values.ssao or values.ssgi) and showMode > 5 then showMode = 1 end
                     load(index) -- so are the effects' passes
                 end
@@ -125,7 +127,7 @@ return function(setTitle, order)
         }
         displayPending = true
         local found = {}
-        for _, f in ipairs(rhi.list_assets("scenes", ".json")) do found[f] = true end
+        for _, f in ipairs(rhi.list_assets("scenes", ".scene")) do found[f] = true end
         files = {}
         for _, f in ipairs(order or {}) do
             if found[f] then
@@ -133,7 +135,7 @@ return function(setTitle, order)
                 found[f] = nil
             end
         end
-        for _, f in ipairs(rhi.list_assets("scenes", ".json")) do
+        for _, f in ipairs(rhi.list_assets("scenes", ".scene")) do
             if found[f] then files[#files + 1] = f end
         end
         load(index)
@@ -169,6 +171,7 @@ return function(setTitle, order)
                 return
             end
         end
+        if current then current:frame() end -- after the cameras moved
         titleTimer = titleTimer + dt
         if titleTimer > 0.5 then
             titleTimer = 0

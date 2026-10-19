@@ -27,7 +27,7 @@
 -- A system contributes through these optional functions, called in the systems' order:
 --   shadowFields(ctx) -> table   addPrepasses(ctx, graph)   addShadowCasters(ctx, passes)
 --   addShadowPasses(ctx, graph)  addOpaque(ctx, view, pass)  addSurfaces(ctx, graph, view)
---   addOverlays(ctx, graph)
+--   addOverlays(ctx, graph)      addMotion(ctx, view, pass)
 
 local renderer = {}
 
@@ -70,12 +70,27 @@ end
 renderer.shadowFaceSize = 512
 
 -- Screen-space effects on every view (post/ssao.slang): ambient occlusion and indirect
--- light. The settings change them, for the graphs built after.
-renderer.effects = { ao = true, gi = false }
+-- light, at a quality: "Half" (both at half resolution), "Mixed" (AO at full, GI at half)
+-- or "Full". The settings change them, for the graphs built after.
+renderer.effects = { ao = true, gi = false, quality = "Half" }
 renderer.EFFECT_PARAMS = {
     aoRadius = 1.0, aoStrength = 1.6, -- world units; 1: black where fully occluded
     giRadius = 2.5, giStrength = 2.5,
 }
+
+-- The effects' chains for a quality: what each computes, and at what scale of the view.
+local function effectChains(fx)
+    if fx.quality == "Mixed" and fx.ao and fx.gi then
+        return { { ao = true, gi = false, scale = 1 }, { ao = false, gi = true, scale = 0.5 } }
+    end
+    local full = fx.quality == "Full" or (fx.quality == "Mixed" and not fx.gi)
+    return { { ao = fx.ao, gi = fx.gi, scale = full and 1 or 0.5 } }
+end
+
+local function chainLabel(chain)
+    return (chain.ao and chain.gi and "SSAO + SSGI" or chain.ao and "SSAO" or "SSGI") ..
+        (chain.scale < 1 and " (half)" or "")
+end
 
 function renderer.build(ctx, systems)
     local FACE = renderer.shadowFaceSize
@@ -111,16 +126,18 @@ function renderer.build(ctx, systems)
     if effectsOn then
         pipelines.effects = rhi.compute_pipeline("post/ssao.slang", "effectsMain")
         pipelines.effectsBlur = rhi.compute_pipeline("post/ssao.slang", "blurMain")
+        pipelines.effectsTemporal = rhi.compute_pipeline("post/ssao.slang", "temporalMain")
+        pipelines.effectsHistory = rhi.compute_pipeline("post/ssao.slang", "historyMain")
         pipelines.applyWindow = rhi.render_pipeline { shader = "post/ssao-apply.slang" }
         pipelines.applyTexture = rhi.render_pipeline { shader = "post/ssao-apply.slang", format = "rgba16f" }
         local p = renderer.EFFECT_PARAMS
         ctx.effectsBlock = rhi.params {
             depthNear = 0.1, depthFar = 100,
-            aoEnabled = fx.ao and 1 or 0, giEnabled = fx.gi and 1 or 0,
             aoRadius = p.aoRadius, aoStrength = p.aoStrength, giRadius = p.giRadius,
+            frameIndex = 0,
         }
-        ctx.effectsSampler = rhi.sampler { filter = "linear", address = "clamp" }
-        ctx.effectsNodes = {}
+        ctx.effectsNodes = {} -- the main view's, timed
+        ctx.effectsLabels = {}
     end
 
     local graph = rhi.graph()
@@ -150,6 +167,20 @@ function renderer.build(ctx, systems)
             clear = { background[1], background[2], background[3], 1 },
         }
         call(systems, "addOpaque", ctx, view, opaque)
+        if effectsOn then
+            -- What moved since the frame before (the bodies; the SDFs' spin is worked out
+            -- from their block), so that the effects' history follows it.
+            local scale, shape = view.inset or 1, view.inset and "square" or nil
+            view.targets.meshMotion = rhi.render_target("rgba16f", scale, shape)
+            view.targets.motionDepth = rhi.depth_target(scale, shape)
+            local motion = graph:render_pass {
+                name = view.name .. ": motion",
+                target = view.targets.meshMotion,
+                depth_target = view.targets.motionDepth,
+                clear = { 0, 0, 0, 0 },
+            }
+            call(systems, "addMotion", ctx, view, motion)
+        end
         call(systems, "addSurfaces", ctx, graph, view)
         if not ctx.splats then
             -- Nothing draws the splats' depth, but the composite reads it: clear it, so it
@@ -160,6 +191,12 @@ function renderer.build(ctx, systems)
                 color = false,
                 clear = { 0, 0, 0, 0 },
             }
+        end
+        if not ctx.sdf then
+            -- Nor do the SDFs' targets get written: no hit, at the far plane (the effects
+            -- read the depth whatever the color says).
+            graph:render_pass { name = view.name .. ": no SDFs", target = view.targets.sdfColor, clear = { 0, 0, 0, 0 } }
+            graph:render_pass { name = view.name .. ": no SDF depth", target = view.targets.sdfDepth, clear = { 1, 0, 0, 0 } }
         end
 
         local t = view.targets
@@ -188,30 +225,43 @@ function renderer.build(ctx, systems)
         }
 
         if effectsOn then
-            -- SSAO and SSGI at half resolution, blurred, then put on the image.
-            local raw = rhi.render_target("rgba16f", scale * 0.5, shape)
-            local blurred = rhi.render_target("rgba16f", scale * 0.5, shape)
+            -- Each chain: the effects, blurred, blended with the frames before (reprojected
+            -- by the last frame's camera, view.temporal), and kept for the next frame.
+            view.temporal = rhi.params { prevCamera = view.cameraValue, historyValid = 0 }
+            view.historyFrames = 0
             local inputs = { meshDepth = t.meshDepth, splatDepth = t.splatDepth, sdfDepth = t.sdfDepth,
-                             litColor = view.litImage }
-            local node = graph:dispatch {
-                name = view.name .. ": " .. (fx.ao and fx.gi and "SSAO + SSGI" or fx.ao and "SSAO" or "SSGI"),
-                pipeline = pipelines.effects,
-                params = { view.block, ctx.effectsBlock, inputs, { effects = raw } },
-                threads = raw,
-                timed = not view.inset,
-            }
-            if not view.inset then
-                ctx.effectsNodes[#ctx.effectsNodes + 1] = node
-                ctx.effectsLabel = fx.ao and fx.gi and "SSAO + SSGI" or fx.ao and "SSAO" or "SSGI"
+                             litColor = view.litImage, meshMotion = t.meshMotion }
+            local results = {}
+            for _, chain in ipairs(effectChains(fx)) do
+                local function target(format) return rhi.render_target(format, scale * chain.scale, shape) end
+                local raw, blurred, resolved = target("rgba16f"), target("rgba16f"), target("rgba16f")
+                local history, historyDepth = target("rgba16f"), target("r32f")
+                local base = { view.block, ctx.shadowBlock, ctx.effectsBlock, view.temporal, inputs,
+                               { aoEnabled = chain.ao and 1 or 0, giEnabled = chain.gi and 1 or 0 } }
+                local function pass(name, pipeline, textures, threads)
+                    local params = { table.unpack(base) }
+                    params[#params + 1] = textures
+                    local node = graph:dispatch {
+                        name = view.name .. ": " .. chainLabel(chain) .. " " .. name,
+                        pipeline = pipeline, params = params, threads = threads, timed = not view.inset,
+                    }
+                    if not view.inset then ctx.effectsNodes[#ctx.effectsNodes + 1] = node end
+                end
+                pass("effects", pipelines.effects, { effects = raw }, raw)
+                pass("blur", pipelines.effectsBlur, { effectsIn = raw, effectsOut = blurred }, blurred)
+                pass("temporal", pipelines.effectsTemporal,
+                    { current = blurred, history = history, historyDepth = historyDepth, resolved = resolved }, resolved)
+                pass("history", pipelines.effectsHistory,
+                    { resolvedIn = resolved, history = history, historyDepth = historyDepth }, history)
+                if chain.ao then results.ao = resolved end
+                if chain.gi then results.gi = resolved end
+                if not view.inset then ctx.effectsLabels[#ctx.effectsLabels + 1] = chainLabel(chain) end
             end
-            graph:dispatch {
-                name = view.name .. ": effects blur",
-                pipeline = pipelines.effectsBlur,
-                params = { view.block, ctx.effectsBlock, inputs, { effectsIn = raw, effectsOut = blurred } },
-                threads = blurred,
-            }
             view.apply = rhi.params {
-                litColor = view.litImage, effects = blurred, effectsSampler = ctx.effectsSampler,
+                meshDepth = t.meshDepth, splatDepth = t.splatDepth, sdfDepth = t.sdfDepth,
+                depthNear = 0.1, depthFar = 100,
+                litColor = view.litImage, meshMotion = t.meshMotion,
+                aoEffects = results.ao or results.gi, giEffects = results.gi or results.ao,
                 giStrength = fx.gi and renderer.EFFECT_PARAMS.giStrength or 0,
                 outputEncodeGamma = view.inset and 0 or (srgb and 0 or 1),
                 showMode = ctx.showMode or 0,
@@ -252,17 +302,45 @@ function renderer.build(ctx, systems)
 end
 
 -- What the depth composites show: 0 everything, 1 the meshes, 2 the splats, 3 the SDFs,
--- 4 the depth buffers; with the effects on, 5 the ambient occlusion, 6 the indirect light.
+-- 4 the depth buffers; with the effects on, 5 the ambient occlusion, 6 the indirect light,
+-- 7 the meshes' motion vectors.
 function renderer.setShowMode(ctx, mode)
     ctx.showMode = mode
     for _, block in ipairs(ctx.composites or {}) do block.showMode = mode end
 end
 
--- The effects' GPU time in the main view, for a title; nil without them.
+-- Every frame (paused too): the effects' noise turns, and each view's temporal block gets
+-- the last frame's camera.
+function renderer.updateFrame(ctx)
+    if not ctx.effectsBlock then return end
+    ctx.effectsFrame = (ctx.effectsFrame or 0) + 1
+    ctx.effectsBlock.frameIndex = ctx.effectsFrame
+    for _, view in ipairs(ctx.views) do
+        if view.temporal then
+            local now = view.cameraValue
+            view.temporal.prevCamera = view.lastCamera or now
+            -- The history holds something once the history pass has run twice.
+            view.temporal.historyValid = view.historyFrames >= 2 and 1 or 0
+            view.historyFrames = view.historyFrames + 1
+            view.lastCamera = now
+        end
+    end
+end
+
+-- After a resize the effects' textures hold nothing: start their history over.
+function renderer.resetHistory(ctx)
+    for _, view in ipairs(ctx.views or {}) do
+        view.historyFrames = 0
+        view.lastCamera = nil
+    end
+end
+
+-- The effects' GPU time in the main view (all their passes), for a title; nil without them.
 function renderer.describeEffects(ctx)
-    local node = ctx.effectsNodes and ctx.effectsNodes[1]
-    if not node then return nil end
-    return string.format("%s %.2f ms", ctx.effectsLabel, node.gpu_time or 0)
+    if not ctx.effectsNodes or #ctx.effectsNodes == 0 then return nil end
+    local total = 0
+    for _, node in ipairs(ctx.effectsNodes) do total = total + (node.gpu_time or 0) end
+    return string.format("%s %.2f ms", table.concat(ctx.effectsLabels, ", "), total)
 end
 
 return renderer

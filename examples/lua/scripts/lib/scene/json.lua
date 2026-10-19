@@ -2,7 +2,7 @@
 -- comments and trailing commas (as JSONC allows), so that scene files can be annotated.
 --
 --   local json = rhi.include("lib/scene/json.lua")
---   local value = json.decode(text, "scenes/composite.json")   -- errors say file:line:column
+--   local value = json.decode(text, "scenes/composite.scene")   -- errors say file:line:column
 --
 -- Objects become Lua tables with string keys; arrays become sequences; null becomes
 -- json.null (a unique value), so that a key set to null is still there.

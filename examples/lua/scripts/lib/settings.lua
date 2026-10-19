@@ -8,6 +8,7 @@
 --   splatBudget     the most splats drawn a frame (the levels of detail fit them to it)
 --   shadowQuality   "Low", "Medium", "High" or "Ultra": the shadow maps' size
 --   ssao, ssgi      screen-space ambient occlusion and indirect light (post/ssao.slang)
+--   effectsQuality  "Half", "Mixed" (AO at full resolution, GI at half) or "Full"
 
 local json = rhi.include("lib/scene/json.lua")
 
@@ -16,6 +17,7 @@ local settings = {}
 settings.SHADOW_QUALITIES = { "Low", "Medium", "High", "Ultra" }
 settings.SHADOW_FACE_SIZES = { Low = 256, Medium = 512, High = 1024, Ultra = 2048 }
 settings.SPLAT_BUDGETS = { 250000, 500000, 1000000, 1500000, 2000000 }
+settings.EFFECT_QUALITIES = { "Half", "Mixed", "Full" }
 
 local DEFAULTS = {
     fullscreen = false,
@@ -23,6 +25,7 @@ local DEFAULTS = {
     shadowQuality = "Medium",
     ssao = true,
     ssgi = false,
+    effectsQuality = "Half",
 }
 
 local function path()
@@ -46,6 +49,9 @@ function settings.load()
         end
     end
     if not settings.SHADOW_FACE_SIZES[values.shadowQuality] then values.shadowQuality = DEFAULTS.shadowQuality end
+    local known = false
+    for _, q in ipairs(settings.EFFECT_QUALITIES) do known = known or q == values.effectsQuality end
+    if not known then values.effectsQuality = DEFAULTS.effectsQuality end
     return values
 end
 

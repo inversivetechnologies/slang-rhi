@@ -1,11 +1,12 @@
 // Screen-space ambient occlusion (SSAO) and screen-space indirect light (SSGI), for a view
 // whose surfaces were merged by depth (post/depth-composite.slang): the meshes', the SDFs'
 // and the splats' depth buffers give the nearest surface in each pixel, and the composite's
-// image (linear, before encoding) the light leaving it.
+// image (linear, before encoding) the light leaving it. Run at half or full resolution
+// (whatever size the effects textures are: lib/scene/renderer.lua), in a chain:
 //
-//   effectsMain   at half resolution: per pixel, its position and normal (rebuilt from
-//                 depth), and kSamples directions over the normal's hemisphere,
-//                 cosine-weighted (a golden-angle spiral, turned per pixel by a noise).
+//   effectsMain   per pixel, its position and normal (rebuilt from depth), and kSamples
+//                 directions over the normal's hemisphere, cosine-weighted (a golden-
+//                 angle spiral, turned per pixel by a 4 x 4 pattern, and per frame).
 //                 AO: a point a short way along each direction, occluded where the
 //                 depth buffer has something in front of it (counted less, the farther
 //                 that is from the pixel's depth: no halos round foreground objects).
@@ -13,75 +14,49 @@
 //                 surface in front of that point (the direction is blocked) and that
 //                 surface faces the pixel, its light, by the cosine at the pixel and a
 //                 falloff with distance, is bounced onto the pixel.
-//                 -> effects: rgb the indirect light, a the ambient visibility (1: open)
-//   blurMain      a 5 x 5 blur that keeps to similar depths, against the noise
+//                 -> rgb the indirect light, a the ambient visibility (1: open)
+//   blurMain      a 5 x 5 blur that keeps to similar depths: the pattern averaged out
+//   temporalMain  blended with the frames before: each pixel's surface is found where it
+//                 was the frame before (moved back by its own motion: the bodies' motion
+//                 vectors, scene/motion.slang, or the SDF composition's spin; the splats
+//                 stand still) and where the last frame's camera saw it there, and that
+//                 frame's result there (if its depth agrees: nothing disoccluded or moved
+//                 in front) taken 90 to 10
+//   historyMain   the result and its depths kept for the next frame
 //
 // post/ssao-apply.slang puts them on the image: color x visibility + indirect light.
 
+#include "ssao-common.slang"
+
 static const int kSamples = 12;
 static const float kPi = 3.14159265;
+static const float kHistoryWeight = 0.9; // of the frames before, where they agree
 
-Texture2D<float> meshDepth;   // z/w, over depthNear .. depthFar
-Texture2D<float> splatDepth;
-Texture2D<float> sdfDepth;
-Texture2D<float4> litColor;   // the view's merged image, linear
-uniform float depthNear;
-uniform float depthFar;
-
-// The view's camera (its view block): only the field of view is needed.
-struct EffectsCamera
-{
-    float3 eye;
-    float fovY;
-    float3 target;
-};
-uniform EffectsCamera camera;
+Texture2D<float4> litColor; // the view's merged image, linear
 
 uniform uint aoEnabled;
 uniform uint giEnabled;
 uniform float aoRadius;   // world units
 uniform float aoStrength; // 1: fully occluded where every sample is
 uniform float giRadius;   // world units
+uniform uint frameIndex;  // turns the samples a little each frame
 
-uniform float2 viewportSize; // provided by the host: the effects texture's size
+// The temporal pass's (the view's temporal block).
+uniform EffectsCamera prevCamera; // the last frame's camera
+uniform uint historyValid;        // 0: no frames before (just built, or resized)
+
+// What moved: the bodies, per pixel (the motion pass: the previous world position minus the
+// current, where a body is the nearest mesh), and the SDF composition, turning about its
+// origin by sdfSpin radians a second (its block; sdf/sdf-world.slang).
+Texture2D<float4> meshMotion;
+uniform float3 sdfOrigin;
+uniform float sdfSpin;
+uniform float timeDelta; // provided by the host: 0 while paused
+
+uniform float2 viewportSize; // provided by the host: the effects textures' size
 
 // Each entry point's own textures are its parameters (bound by name, as the globals are),
-// so that neither has the other's to bind.
-
-float viewDistance(float depth)
-{
-    return depthNear * depthFar / (depthFar - depth * (depthFar - depthNear));
-}
-
-uint2 fullSize()
-{
-    uint w, h;
-    meshDepth.GetDimensions(w, h);
-    return uint2(w, h);
-}
-
-// The nearest surface's view depth at a full-resolution pixel.
-float sceneZ(int2 p, uint2 size)
-{
-    p = clamp(p, int2(0, 0), int2(size) - 1);
-    int3 t = int3(p, 0);
-    return viewDistance(min(meshDepth.Load(t), min(splatDepth.Load(t), sdfDepth.Load(t))));
-}
-
-// View space: x right, y up, z forward (the view depth).
-float3 viewPosition(float2 uv, float z, float aspect)
-{
-    float2 ndc = float2(uv.x * 2 - 1, 1 - uv.y * 2);
-    float t = tan(camera.fovY * 0.5);
-    return float3(ndc.x * t * aspect * z, ndc.y * t * z, z);
-}
-
-float2 projectToUv(float3 p, float aspect)
-{
-    float t = tan(camera.fovY * 0.5);
-    float2 ndc = float2(p.x / (p.z * t * aspect), p.y / (p.z * t));
-    return float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-}
+// so that none has another's to bind.
 
 // The normal, from the neighbors' positions: on each axis the side whose depth is nearer
 // the pixel's, so that edges don't bend it.
@@ -92,11 +67,11 @@ float3 viewNormal(int2 p, float3 position, uint2 size, float aspect)
     float zl = sceneZ(p - int2(1, 0), size), zr = sceneZ(p + int2(1, 0), size);
     float zu = sceneZ(p - int2(0, 1), size), zd = sceneZ(p + int2(0, 1), size);
     float3 dx = abs(zr - position.z) < abs(zl - position.z)
-        ? viewPosition(uv + float2(texel.x, 0), zr, aspect) - position
-        : position - viewPosition(uv - float2(texel.x, 0), zl, aspect);
+        ? viewPosition(camera, uv + float2(texel.x, 0), zr, aspect) - position
+        : position - viewPosition(camera, uv - float2(texel.x, 0), zl, aspect);
     float3 dy = abs(zd - position.z) < abs(zu - position.z)
-        ? viewPosition(uv + float2(0, texel.y), zd, aspect) - position
-        : position - viewPosition(uv - float2(0, texel.y), zu, aspect);
+        ? viewPosition(camera, uv + float2(0, texel.y), zd, aspect) - position
+        : position - viewPosition(camera, uv - float2(0, texel.y), zu, aspect);
     float3 n = normalize(cross(dx, dy));
     return dot(n, position) > 0 ? -n : n; // facing the camera
 }
@@ -109,29 +84,25 @@ float noise(uint2 p)
     return (kBayer[(p.y & 3) * 4 + (p.x & 3)] + 0.5) / 16.0;
 }
 
-[shader("compute")]
-[numthreads(8, 8, 1)]
-void effectsMain(uint3 tid: SV_DispatchThreadID, uniform RWTexture2D<float4> effects)
+// (The entry points write their output once, at the end: fxc, for D3D11, fails on writes
+// in branches it flattens.)
+float4 computeEffects(uint2 tid)
 {
-    if (tid.x >= uint(viewportSize.x) || tid.y >= uint(viewportSize.y))
-        return;
-
     uint2 size = fullSize();
     float aspect = float(size.x) / float(size.y);
-    int2 p = int2((float2(tid.xy) + 0.5) * float2(size) / viewportSize);
+    int2 p = toFull(tid, viewportSize, size);
     float z = sceneZ(p, size);
-    if (z > depthFar * 0.9)
-    {
-        effects[tid.xy] = float4(0, 0, 0, 1); // the background
-        return;
-    }
-    float3 position = viewPosition((float2(p) + 0.5) / float2(size), z, aspect);
+    if (isBackground(z))
+        return float4(0, 0, 0, 1);
+    float3 position = viewPosition(camera, (float2(p) + 0.5) / float2(size), z, aspect);
     float3 normal = viewNormal(p, position, size, aspect);
     float3 tangent = normalize(abs(normal.y) < 0.99 ? cross(normal, float3(0, 1, 0)) : cross(normal, float3(1, 0, 0)));
     float3 bitangent = cross(normal, tangent);
 
-    float turn = noise(tid.xy) * 2 * kPi;
-    float jitter = noise(tid.yx + uint2(1, 2));
+    // Per frame, the golden ratio on: each frame's samples between the last ones'.
+    float frameTurn = frac(float(frameIndex % 64u) * 0.618034);
+    float turn = frac(noise(tid) + frameTurn) * 2 * kPi;
+    float jitter = frac(noise(tid.yx + uint2(1, 2)) + frameTurn * 0.5);
     float occlusion = 0;
     float3 indirect = float3(0, 0, 0);
     for (int i = 0; i < kSamples; ++i)
@@ -149,7 +120,7 @@ void effectsMain(uint3 tid: SV_DispatchThreadID, uniform RWTexture2D<float4> eff
         if (aoEnabled != 0)
         {
             float3 s = position + direction * aoRadius * reach;
-            float2 suv = projectToUv(s, aspect);
+            float2 suv = projectToUv(camera, s, aspect);
             if (all(suv > 0) && all(suv < 1) && s.z > depthNear)
             {
                 float found = sceneZ(int2(suv * float2(size)), size);
@@ -160,7 +131,7 @@ void effectsMain(uint3 tid: SV_DispatchThreadID, uniform RWTexture2D<float4> eff
         if (giEnabled != 0)
         {
             float3 s = position + direction * giRadius * reach;
-            float2 suv = projectToUv(s, aspect);
+            float2 suv = projectToUv(camera, s, aspect);
             if (all(suv > 0) && all(suv < 1) && s.z > depthNear)
             {
                 int2 q = int2(suv * float2(size));
@@ -168,7 +139,7 @@ void effectsMain(uint3 tid: SV_DispatchThreadID, uniform RWTexture2D<float4> eff
                 // Blocked: something in front of the point, not far in front of it.
                 if (qz < s.z - 0.01 * s.z && s.z - qz < 2.0 * giRadius)
                 {
-                    float3 emitter = viewPosition((float2(q) + 0.5) / float2(size), qz, aspect);
+                    float3 emitter = viewPosition(camera, (float2(q) + 0.5) / float2(size), qz, aspect);
                     float3 d = emitter - position;
                     float distance = length(d);
                     float3 toEmitter = d / max(distance, 1e-4);
@@ -184,7 +155,16 @@ void effectsMain(uint3 tid: SV_DispatchThreadID, uniform RWTexture2D<float4> eff
         }
     }
     float visibility = saturate(1.0 - aoStrength * occlusion / float(kSamples));
-    effects[tid.xy] = float4(indirect * (2.0 / float(kSamples)), visibility);
+    return float4(indirect * (2.0 / float(kSamples)), visibility);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void effectsMain(uint3 tid: SV_DispatchThreadID, uniform RWTexture2D<float4> effects)
+{
+    if (tid.x >= uint(viewportSize.x) || tid.y >= uint(viewportSize.y))
+        return;
+    effects[tid.xy] = computeEffects(tid.xy);
 }
 
 [shader("compute")]
@@ -194,8 +174,7 @@ void blurMain(uint3 tid: SV_DispatchThreadID, uniform Texture2D<float4> effectsI
     if (tid.x >= uint(viewportSize.x) || tid.y >= uint(viewportSize.y))
         return;
     uint2 size = fullSize();
-    float2 toFull = float2(size) / viewportSize;
-    float center = sceneZ(int2((float2(tid.xy) + 0.5) * toFull), size);
+    float center = sceneZ(toFull(tid.xy, viewportSize, size), size);
     float4 sum = float4(0, 0, 0, 0);
     float weights = 0;
     for (int y = -2; y <= 2; ++y)
@@ -203,11 +182,99 @@ void blurMain(uint3 tid: SV_DispatchThreadID, uniform Texture2D<float4> effectsI
         for (int x = -2; x <= 2; ++x)
         {
             int2 t = clamp(int2(tid.xy) + int2(x, y), int2(0, 0), int2(viewportSize) - 1);
-            float z = sceneZ(int2((float2(t) + 0.5) * toFull), size);
+            float z = sceneZ(toFull(uint2(t), viewportSize, size), size);
             float w = exp(-abs(z - center) / (0.03 * center + 1e-3)) * (3.0 - 0.4 * float(abs(x) + abs(y)));
             sum += effectsIn.Load(int3(t, 0)) * w;
             weights += w;
         }
     }
-    effectsOut[tid.xy] = weights > 0 ? sum / weights : effectsIn.Load(int3(tid.xy, 0));
+    effectsOut[tid.xy] = sum / max(weights, 1e-6);
+}
+
+float4 computeTemporal(uint2 tid, Texture2D<float4> current, Texture2D<float4> history, Texture2D<float> historyDepth)
+{
+    float4 now = current.Load(int3(tid, 0));
+    uint2 size = fullSize();
+    float aspect = float(size.x) / float(size.y);
+    int2 p = toFull(tid, viewportSize, size);
+    float z = sceneZ(p, size);
+    if (historyValid == 0 || isBackground(z))
+        return now;
+
+    // Where this pixel's surface was the frame before: by the motion of whichever surface
+    // is nearest here.
+    float3 world = viewToWorld(camera, viewPosition(camera, (float2(p) + 0.5) / float2(size), z, aspect));
+    int3 t = int3(p, 0);
+    float meshZ = viewDistance(meshDepth.Load(t));
+    float sdfZ = viewDistance(sdfDepth.Load(t));
+    float3 previous = world;
+    if (meshZ <= z * 1.0001)
+    {
+        previous += meshMotion.Load(t).xyz;
+    }
+    else if (sdfZ <= z * 1.0001)
+    {
+        float a = -sdfSpin * timeDelta, c = cos(a), s = sin(a);
+        float3 d = world - sdfOrigin;
+        previous = sdfOrigin + float3(c * d.x + s * d.z, d.y, -s * d.x + c * d.z);
+    }
+
+    // Where the last frame's camera saw it there.
+    float3 before = worldToView(prevCamera, previous);
+    float2 uv = projectToUv(prevCamera, before, aspect);
+    if (before.z <= depthNear || any(uv < 0) || any(uv > 1))
+        return now;
+
+    // Its history, filtered over the 4 nearest texels that saw the same surface.
+    float2 f = uv * viewportSize - 0.5;
+    int2 base = int2(floor(f));
+    float2 w = f - float2(base);
+    float4 sum = float4(0, 0, 0, 0);
+    float weights = 0;
+    for (int k = 0; k < 4; ++k)
+    {
+        int2 o = int2(k & 1, k >> 1);
+        int2 t = clamp(base + o, int2(0, 0), int2(viewportSize) - 1);
+        float bilinear = (o.x == 1 ? w.x : 1 - w.x) * (o.y == 1 ? w.y : 1 - w.y);
+        float seen = historyDepth.Load(int3(t, 0));
+        if (abs(seen - before.z) < 0.04 * before.z)
+        {
+            sum += history.Load(int3(t, 0)) * bilinear;
+            weights += bilinear;
+        }
+    }
+    if (weights < 0.25)
+        return now; // newly seen: nothing to go on
+    // Where only some of the texels agree, the history counts for less.
+    float keep = kHistoryWeight * saturate(weights);
+    return lerp(now, sum / weights, keep);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void temporalMain(
+    uint3 tid: SV_DispatchThreadID,
+    uniform Texture2D<float4> current,
+    uniform Texture2D<float4> history,
+    uniform Texture2D<float> historyDepth,
+    uniform RWTexture2D<float4> resolved)
+{
+    if (tid.x >= uint(viewportSize.x) || tid.y >= uint(viewportSize.y))
+        return;
+    resolved[tid.xy] = computeTemporal(tid.xy, current, history, historyDepth);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void historyMain(
+    uint3 tid: SV_DispatchThreadID,
+    uniform Texture2D<float4> resolvedIn,
+    uniform RWTexture2D<float4> history,
+    uniform RWTexture2D<float> historyDepth)
+{
+    if (tid.x >= uint(viewportSize.x) || tid.y >= uint(viewportSize.y))
+        return;
+    uint2 size = fullSize();
+    history[tid.xy] = resolvedIn.Load(int3(tid.xy, 0));
+    historyDepth[tid.xy] = sceneZ(toFull(tid.xy, viewportSize, size), size);
 }

@@ -619,10 +619,11 @@ struct ParamBlock
 // A physics world (physics.h, on Jolt) with groups of bodies. A group is a set of bodies
 // drawn together: the host steps the world every frame and writes each group's transforms
 // into the group's GPU buffer, kBodyFloats floats per body, as scene/scene-common.slang
-// reads them (`bodies`). A draw instanced over the group then draws every body.
+// reads them (`bodies`). A draw instanced over the group then draws every body. Each body
+// also keeps the transform it had the frame before, for motion vectors.
 // ---------------------------------------------------------------------------------------
 
-static constexpr uint32_t kBodyFloats = 16;
+static constexpr uint32_t kBodyFloats = 24;
 
 struct PhysicsWorld;
 
@@ -640,7 +641,8 @@ struct BodyGroup
     // Per body: scale xyz, pattern, color rgb, unused -- what doesn't come from the physics.
     std::vector<float> looks;
     std::shared_ptr<Buffer> buffer;
-    std::vector<float> staging;
+    std::vector<float> staging;   // what was uploaded last: this frame's previous transforms
+    size_t uploadedCount = 0;     // the bodies it holds a transform for
 };
 
 struct PhysicsWorld
@@ -937,6 +939,13 @@ public:
             {
                 float* body = &group->staging[i * kBodyFloats];
                 const float* looks = &group->looks[i * 8];
+                // Last frame's transform becomes the previous one ([4], [5]).
+                bool hadOne = i < group->uploadedCount;
+                if (hadOne)
+                {
+                    std::copy_n(body, 3, body + 16);
+                    std::copy_n(body + 4, 4, body + 20);
+                }
                 if (group->ids[i] == kVisualBody)
                 {
                     std::copy_n(&group->placements[i * 7], 3, body);
@@ -953,7 +962,15 @@ public:
                 body[13] = looks[5];
                 body[14] = looks[6];
                 body[15] = looks[3];
+                if (!hadOne)
+                {
+                    // New: no motion yet.
+                    std::copy_n(body, 3, body + 16);
+                    std::copy_n(body + 4, 4, body + 20);
+                }
+                body[19] = 0;
             }
+            group->uploadedCount = count;
             encoder->uploadBufferData(group->buffer->buffer, 0, count * kBodyFloats * sizeof(float), group->staging.data());
         }
     }
@@ -1861,7 +1878,8 @@ public:
     }
 
     // Values the host provides to every draw and dispatch, if the shader declares them:
-    // `time` (seconds) and `viewportSize` (pixels). Set before the script's parameters,
+    // `time` (seconds), `timeDelta` (the seconds `time` moved since the last frame: 0
+    // while paused) and `viewportSize` (pixels). Set before the script's parameters,
     // which can override them.
     void applyBuiltins(const ShaderCursor& root, float viewportWidth, float viewportHeight)
     {
@@ -1869,6 +1887,11 @@ public:
         if (time.isValid())
         {
             setNumbers(time, {m_shaderTime});
+        }
+        ShaderCursor timeDelta = root["timeDelta"];
+        if (timeDelta.isValid())
+        {
+            setNumbers(timeDelta, {m_paused ? 0.0 : m_timeDelta});
         }
         ShaderCursor viewportSize = root["viewportSize"];
         if (viewportSize.isValid())

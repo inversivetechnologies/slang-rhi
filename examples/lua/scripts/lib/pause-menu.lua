@@ -119,6 +119,15 @@ function Menu:rows()
         { key = "ssgi", label = "Indirect light", choices = { false, true }, index = v.ssgi and 2 or 1,
           format = function(on) return on and "On" or "Off" end,
           apply = function(on) v.ssgi = on return "ssgi", on end },
+        { key = "effectsQuality", label = "Effects quality", choices = settings.EFFECT_QUALITIES,
+          index = (function()
+              for i, q in ipairs(settings.EFFECT_QUALITIES) do if q == v.effectsQuality then return i end end
+              return 1
+          end)(),
+          format = function(q)
+              return q == "Mixed" and "Mixed (AO full)" or q
+          end,
+          apply = function(q) v.effectsQuality = q return "effectsQuality", q end },
         { label = "Back", action = function() self.page, self.selected = "main", 2 end },
     }
     if not self.only then return rows end

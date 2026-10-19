@@ -51,9 +51,11 @@ examples/lua/
     ui/                2D user interface: rectangles and text (ui), the bitmap font (font)
   tools/               make-font.py: generates shaders/ui/font.slang
   assets/              data files the scripts load (gsplats/skull.ply, audio/timelapse.mpeg)
-    scenes/            scene files (JSON with comments) for the scene viewer
-    prefabs/           prefabs: entities that scenes use and override
-    overlays/          2D overlays: ShaderToy shaders in a panel, over any scene (O)
+    scenes/            scene files (*.scene: JSON with comments) for the scene viewer
+    prefabs/           prefabs (*.prefab, the same format): entities that scenes use and
+                       override
+    overlays/          2D overlays (*.overlay, the same format): ShaderToy shaders in a
+                       panel, over any scene (O)
 ```
 
 **How paths resolve:**
@@ -106,7 +108,7 @@ and 2D SDFs.
 | Left / Right arrow, Page Up / Page Down | previous / next scene |
 | `1` .. `9` | jump to a scene |
 | Steam Controller LB / RB | previous / next scene |
-| V | show everything / the meshes / the splats / the SDFs / the depth buffers (/ the ambient occlusion / the indirect light, when on) |
+| V | show everything / the meshes / the splats / the SDFs / the depth buffers (/ the ambient occlusion / the indirect light / the bodies' motion vectors, with the effects on) |
 | Tab | hide or show the insets |
 | O | 2D overlays: none, Controller, 2D SDFs |
 | Escape, Steam Controller Menu | the [pause menu](#the-pause-menu) |
@@ -128,12 +130,13 @@ and the shaders' `time` stops, so everything animated by it holds still too.
 | Shadow quality | Low (256), Medium (512), High (1024), Ultra (2048) | the shadow maps' texels per cube face; the scene (or script) is loaded again with them |
 | Ambient occlusion | On, Off | [SSAO](#ambient-occlusion-and-indirect-light): darker where surfaces are close to others |
 | Indirect light | Off, On | [SSGI](#ambient-occlusion-and-indirect-light): light bounced from the surfaces seen nearby |
+| Effects quality | Half, Mixed, Full | the resolution SSAO and SSGI are computed at: both at half; AO at full and GI at half; both at full |
 
 Each script shows the settings it has:
 
 | Script | Settings |
 | --- | --- |
-| `showcase.lua`, `scenes.lua` | all six |
+| `showcase.lua`, `scenes.lua` | all seven |
 | `fusion.lua` | resolution, fullscreen, max splats, shadow quality |
 | `physics.lua`, `scene.lua` | resolution, fullscreen, shadow quality |
 | `splat.lua` | resolution, fullscreen, max splats |
@@ -178,7 +181,7 @@ Each script shows the settings it has:
 
 ### The depth composite
 
-`example-lua fusion`. The showcase shows it as a scene: `composite.json`.
+`example-lua fusion`. The showcase shows it as a scene: `composite.scene`.
 
 | Input | Action |
 | --- | --- |
@@ -204,7 +207,7 @@ depth](#example-combining-passes-by-depth).
 | Input | Action |
 | --- | --- |
 | Page Up / Page Down | previous / next scene |
-| V | show everything / the meshes / the splats / the SDFs / the depth buffers (/ the ambient occlusion / the indirect light, when on) |
+| V | show everything / the meshes / the splats / the SDFs / the depth buffers (/ the ambient occlusion / the indirect light / the bodies' motion vectors, with the effects on) |
 | Tab | hide or show the insets |
 | O | 2D overlays (`assets/overlays/`): none, then each in turn |
 | everything else | the scene's: its behaviors (below), its orbit camera (drag, wheel), M to mute its sounds |
@@ -213,11 +216,11 @@ Each scene stands for one of the examples; its keys come from behaviors in the s
 
 | Scene | Example | | Keys |
 | --- | --- | --- | --- |
-| `physics.json` | `physics.lua` | the ramp, the dominoes, the pyramid, the tower, the player | the player's; B drop boxes; P pause, T slow motion, R reset |
-| `splats.json` | `splat.lua` | a grid of skulls carved per pixel by moving shapes, with music | `,` `.` budget, `/` LOD tint, `[` `]` size, L lighting, C clip mode, M mute |
-| `composite.json` | `fusion.lua` | meshes, the skull's splats and an SDF sculpture merged by depth, a second camera in the corner | the splats' (as above, but C), J K blend |
-| `sdf-benchmark.json` | `sdf-cache.lua` | a turning spiral of 64 shapes around a core, 129 nodes, cached | C DAG / cache / cache error, `[` `]` resolution, B benchmark, J K blend, Space stop the camera |
-| `sdf-gallery.json` | | three SDF sculptures and an arch, baked into one cache | as `sdf-benchmark.json` |
+| `physics.scene` | `physics.lua` | the ramp, the dominoes, the pyramid, the tower, the player | the player's; B drop boxes; P pause, T slow motion, R reset |
+| `splats.scene` | `splat.lua` | a grid of skulls carved per pixel by moving shapes, with music | `,` `.` budget, `/` LOD tint, `[` `]` size, L lighting, C clip mode, M mute |
+| `composite.scene` | `fusion.lua` | meshes, the skull's splats and an SDF sculpture merged by depth, a second camera in the corner | the splats' (as above, but C), J K blend |
+| `sdf-benchmark.scene` | `sdf-cache.lua` | a turning spiral of 64 shapes around a core, 129 nodes, cached | C DAG / cache / cache error, `[` `]` resolution, B benchmark, J K blend, Space stop the camera |
+| `sdf-gallery.scene` | | three SDF sculptures and an arch, baked into one cache | as `sdf-benchmark.scene` |
 
 Some details differ from the examples, which still run on their own:
 
@@ -229,7 +232,8 @@ Some details differ from the examples, which still run on their own:
 
 The ShaderToy shaders 2D SDFs and Controller (`shader-toy.lua` runs them over the whole
 window) are 2D overlays: O shows one, framed in a panel, over any scene, and goes on to the
-next, then none. Each is a file in `assets/overlays/`, read by `lib/scene/overlays.lua`:
+next, then none. Each is a file in `assets/overlays/`, `<name>.overlay` (JSON with
+comments, as scene files are), read by `lib/scene/overlays.lua`:
 
 ```jsonc
 {
@@ -272,9 +276,40 @@ the depth buffers the depth composite merges.
 | Pass | |
 | --- | --- |
 | depth composite | as before, but into a linear texture of the view's size rather than the window |
-| effects (`post/ssao.slang`, `effectsMain`) | at half resolution, timed: each pixel's position and normal, rebuilt from the nearest depth, and 12 directions over the normal's hemisphere (cosine-weighted, turned per pixel by a 4 x 4 pattern) |
+| effects (`post/ssao.slang`, `effectsMain`) | at the quality's resolution: each pixel's position and normal, rebuilt from the nearest depth, and 12 directions over the normal's hemisphere (cosine-weighted, turned per pixel by a 4 x 4 pattern, and a little more each frame) |
 | blur (`blurMain`) | 5 x 5, weighted to similar depths: the pattern's noise averaged out, edges kept |
-| apply (`post/ssao-apply.slang`) | the image times the visibility, plus the indirect light, into the window (or the inset's texture) |
+| temporal (`temporalMain`) | blended with the frames before: the pixel's surface is found where the last frame's camera saw it, and that frame's result there taken 90 to 10, where its depth agrees |
+| history (`historyMain`) | the result and its depths, kept for the next frame |
+| apply (`post/ssao-apply.slang`) | the image times the visibility, plus the indirect light, into the window (or the inset's texture), filtered up by depth from a smaller resolution |
+
+Each effect at its resolution is a chain of the four effect passes; "Mixed" with both on
+has two (AO at full resolution, GI at half), the others one.
+
+- **Temporal accumulation:** every frame turns the samples (by the golden ratio), and the
+  temporal pass keeps 90% of the frames before, so each pixel averages about the last ten
+  frames, over a hundred samples. To follow the camera, each view keeps its last frame's
+  camera (`view.cameraValue`, from the camera system), and the pass reprojects by it.
+  What the history saw at a different depth (disoccluded, or something moved in front)
+  isn't taken: it starts over from this frame.
+- **Motion vectors:** what moves on its own is followed too, so a falling box takes its
+  own history with it rather than leaving a trail. The pass finds where the pixel's surface
+  was the frame before by the motion of whichever surface is nearest there:
+  - **Bodies** (physics, and the visual ones Lua moves, as `spin.lua` does): the host
+    keeps each body's previous transform in the group's buffer, and a motion pass per view
+    (`scene/motion.slang`, through the mesh system's `addMotion`) draws the bodies again,
+    writing each pixel's world-space motion: where its point was minus where it is.
+  - **SDFs:** the composition's spin, from its block (`sdfOrigin`, `sdfSpin`) and the
+    host's `timeDelta`.
+  - **Splats** don't move (their clip shapes do, which changes what is shown, not where).
+
+  V shows the bodies' motion vectors too ("motion vectors": the motion's size per axis,
+  a body moving 1 cm a frame at 0.3). A resize or a new graph starts the
+  history over too. While the pause menu is open the frames go on accumulating, so a
+  paused image settles to its smoothest.
+- **Depth-aware upsampling:** at half resolution, each pixel takes the 4 nearest effect
+  texels weighted by how near their surface's depth is to its own (a joint bilateral
+  upsample), and where none is near, the nearest of them in depth. So the effects don't
+  bleed across silhouettes.
 
 - **Occlusion:** a point a short way (1 unit) along each direction is occluded where the
   depth buffer has a surface in front of it. A surface much nearer the camera than the
@@ -287,12 +322,13 @@ the depth buffers the depth composite merges.
 - **Tuning:** the radii and strengths are `renderer.EFFECT_PARAMS` in
   `scripts/lib/scene/renderer.lua`.
 - **Seeing them:** V goes on to the ambient visibility and the indirect light alone, when
-  they are on. The window title gives the effects pass's GPU time, about 0.9 ms for both
-  at 1600 x 900 on an RTX 3050 Laptop GPU.
+  they are on. The window title gives the effects' GPU time (all their passes).
+- **Cost**, both on, at 1600 x 900 on an RTX 3050 Laptop GPU (D3D12; Vulkan is similar):
+  about 1.1 ms at Half, 3.1 ms at Mixed and 4.2 ms at Full.
 
 ### The SDF cache
 
-`example-lua sdf-cache`. The showcase shows it as a scene: `sdf-benchmark.json`.
+`example-lua sdf-cache`. The showcase shows it as a scene: `sdf-benchmark.scene`.
 
 | Input | Action |
 | --- | --- |
@@ -310,7 +346,7 @@ SDF](#example-caching-an-sdf).
 
 ### The splats
 
-`example-lua splat`. The showcase shows it as a scene: `splats.json`.
+`example-lua splat`. The showcase shows it as a scene: `splats.scene`.
 
 | Input | Action |
 | --- | --- |
@@ -328,7 +364,7 @@ How it renders is described in [Example: Gaussian splatting](#example-gaussian-s
 
 ### The physics
 
-`example-lua physics`. The showcase shows it as a scene: `physics.json`. You play a horned, caped warrior with
+`example-lua physics`. The showcase shows it as a scene: `physics.scene`. You play a horned, caped warrior with
 a big sword, with the camera behind them, in the style of Darksiders.
 
 | Steam Controller | Keyboard and mouse | Action |
@@ -639,7 +675,7 @@ a warning; the path is watched, and the script reloads once the file is there.
   [Implementation](#implementation)).
 
 The splats (`splat.lua`, `scripts/lib/splat-mode.lua`) play `assets/audio/timelapse.mpeg`
-looped while they show, as does the splat scene (`splats.json`, through a `sound`
+looped while they show, as does the splat scene (`splats.scene`, through a `sound`
 component); M mutes it.
 
 `rhi.include` is for sharing Lua code between scripts in different folders. `fusion.lua`
@@ -867,7 +903,7 @@ which CMake clones and builds with the example host.
 | `group:clear()` | removes every body of the group |
 | `group:set_velocity(i, {x, y, z})`, `group:impulse(i, {x, y, z})` | push body `i` |
 | `group:position(i)` | its current position, `x, y, z` |
-| `group.count`, `group.capacity`, `group.buffer` | bodies in the group; its size; its transforms |
+| `group.count`, `group.capacity`, `group.buffer` | bodies in the group; its size; its transforms (6 `float4`s a body, as `scene/scene-common.slang` reads them: position, rotation, scale, color, and the frame before's position and rotation, for motion vectors) |
 | `rhi.set_physics(world)` | makes the host step `world` every frame; `nil` stops it |
 | `world.paused`, `world.time_scale`, `world.gravity` | settable |
 | `world:character{ ... }` | a character, see below |
@@ -920,7 +956,7 @@ with an inner rigid body so that the bodies collide with it too.
 
 ## Example: rigid body physics
 
-`scripts/physics.lua` (in `scripts/lib/physics-mode.lua`; the showcase's `physics.json`) is a
+`scripts/physics.lua` (in `scripts/lib/physics-mode.lua`; the showcase's `physics.scene`) is a
 test scene for the physics, with a player character in it:
 
 - **The chain reaction:** a ball at the top of a ramp rolls down into a row of 14
@@ -1104,7 +1140,7 @@ as `rhi.time()`.
 
 ## Example: Gaussian splatting
 
-`scripts/splat.lua` (the showcase's `splats.json`) renders a 3D Gaussian splatting scene.
+`scripts/splat.lua` (the showcase's `splats.scene`) renders a 3D Gaussian splatting scene.
 The method is Kerbl et al., "3D Gaussian Splatting for Real-Time Radiance Field Rendering"
 (2023). The scene is `assets/gsplats/skull.ply`: 1.9 million Gaussians, each with a position,
 rotation, scale, opacity, and degree-3 spherical harmonics for view-dependent color.
@@ -1271,7 +1307,7 @@ The frame time is GPU-bound. The usual next steps, not done here:
 
 ### Clipping
 
-`splat.lua` (and the showcase's `splats.json`) cuts the skulls with a signed distance field, per pixel: the splats' equivalent of
+`splat.lua` (and the showcase's `splats.scene`) cuts the skulls with a signed distance field, per pixel: the splats' equivalent of
 `clip()` in a fragment shader (`shaders/splat/clip.slang`). C carves the field's shapes out
 of the splats, keeps only what is inside them, or turns it off.
 
@@ -1367,6 +1403,12 @@ type; queries walk the entities in creation order.
 
 ### Scene files
 
+Scenes are `assets/scenes/<name>.scene` and prefabs `assets/prefabs/<name>.prefab` (and
+the [2D overlays](#2d-overlays) `assets/overlays/<name>.overlay`): all are JSON with
+comments (`//`, `/* */`) and trailing commas allowed. The viewer lists the
+`.scene` files; an entity's `"prefab": "floor"` reads `floor.prefab`. (For an editor's
+syntax colors, associate the three extensions with JSONC.)
+
 ```jsonc
 {
   "name": "Depth composite",
@@ -1390,7 +1432,7 @@ An entity's keys are component types, plus:
 | Key | |
 | --- | --- |
 | `id` | a name, unique in the scene; children's get their parent's in front (`ramp/rail`), repeats a number after (`domino#2`) |
-| `prefab` | the entity starts as this prefab (`assets/prefabs/<name>.json`, or the scene's inline `prefabs`); its own keys override it: objects merge key by key, other values replace, children add up. Prefabs can start from prefabs |
+| `prefab` | the entity starts as this prefab (`assets/prefabs/<name>.prefab`, or the scene's inline `prefabs`); its own keys override it: objects merge key by key, other values replace, children add up. Prefabs can start from prefabs |
 | `transform` | `position`, `rotation` ([pitch, yaw, roll] in degrees: roll first, then pitch, then yaw), `scale` (uniform); for children, in the parent's frame |
 | `children` | entities placed in this one's frame |
 | `repeat` | copies: `count` (n, or [nx, ny, nz]), each moved by `step` per index along each axis (so a plain n is a row along x; [1, n, 1] a column up y), turned by `rotationStep` per copy, and given the values of `vary` (component, field, a list of values) in turn |
@@ -1420,7 +1462,7 @@ missing required field stops the load, with the entity and the field in the mess
 `{"capsule": {"radius", "a", "b"}}`, `{"cylinder": {"radius", "height"}}`,
 `{"prism": {"sides", "height"}}`. Operations: `{"union": [nodes]}`,
 `{"intersect": [nodes]}`, `{"subtract": [a, b]}`, each with an optional `"smooth": k`. Sizes
-are whole, as for meshes. `assets/prefabs/sculpture.json` is the depth composite's
+are whole, as for meshes. `assets/prefabs/sculpture.prefab` is the depth composite's
 sculpture in this form.
 
 **SDF cache everywhere.** With `cache`, the composition is baked once (`sdf/sdf-bake.slang`)
@@ -1462,7 +1504,8 @@ return true when they handle the event), `addOverlays(graph)`, `enter()`, `leave
 | per view: opaque | renderer, mesh | color and depth; the meshes draw into it |
 | per view: surfaces | sdf, splat | the raymarching (stopping at the meshes' depth), the splats |
 | per view: depth composite | renderer | the view's surfaces merged by depth (`post/depth-composite.slang`), into the window or the inset's texture |
-| per view: effects | renderer | with SSAO or SSGI on: the composite goes to a texture, then the effects, their blur, and their application into the window or the inset's texture |
+| per view: motion | renderer, mesh | with SSAO or SSGI on, after the opaque pass: the bodies' motion vectors (`scene/motion.slang`), with a depth buffer of their own |
+| per view: effects | renderer | with SSAO or SSGI on: the composite goes to a texture, then the effects, their blur, their history, and their application into the window or the inset's texture |
 | overlays | behaviors | over the main view: the crosshair |
 | insets | renderer, camera | each inset framed in its corner, stacked if several share one |
 | 2D overlays | the viewer's overlays | each overlay's shader and its framed panel, all off but the one shown |
@@ -1476,7 +1519,7 @@ return true when they handle the event), `addOverlays(graph)`, `enter()`, `leave
   composite reads it.
 - **Per frame:** nothing in the renderer runs; systems change parameter blocks, and the
   host runs the graph.
-- **Cost:** `composite.json` runs at 33–34 ms per frame on the RTX 3050 Laptop GPU (Release),
+- **Cost:** `composite.scene` runs at 33–34 ms per frame on the RTX 3050 Laptop GPU (Release),
   against 31–32 ms for the hand-built `fusion.lua` it reproduces. Some details differ (its SDF
   doesn't spin; its bounds are larger; a behavior spins the cube from Lua).
 
@@ -1491,7 +1534,7 @@ return true when they handle the event), `addOverlays(graph)`, `enter()`, `leave
 
 ## Example: caching an SDF
 
-`scripts/sdf-cache.lua` (in `scripts/lib/sdf-cache-mode.lua`; the showcase's `sdf-benchmark.json`)
+`scripts/sdf-cache.lua` (in `scripts/lib/sdf-cache-mode.lua`; the showcase's `sdf-benchmark.scene`)
 raymarches one SDF composition two ways, and times both on the GPU:
 
 - **The DAG:** evaluated at every sample, node by node (`shaders/sdf/sdf-dag.slang`), as
@@ -1573,7 +1616,7 @@ and could be cached the same way.
 
 ## Example: combining passes by depth
 
-`scripts/fusion.lua` (the showcase's `composite.json`) draws three kinds of surface into one
+`scripts/fusion.lua` (the showcase's `composite.scene`) draws three kinds of surface into one
 picture: the mesh scene, the Gaussian splats, and a raymarched composition of SDF shapes
 (see [SDF compositions](#sdf-compositions)). They are rendered completely separately,
 each into its own color texture and its own depth buffer. A last pass then combines the
@@ -2012,7 +2055,8 @@ to the type the shader declares:
 
   | Name | Value |
   | --- | --- |
-  | `time` | seconds since start, the same clock as `rhi.time()` |
+  | `time` | seconds since start, the same clock as `rhi.time()`; it stops while paused (`rhi.set_paused`) |
+  | `timeDelta` | the seconds `time` moved since the last frame (0 while paused) |
   | `viewportSize` | the size in pixels of the viewport being drawn into (the window's size for dispatches) |
 - **Matrices** are written tightly packed. That is exact for `float4x4`; smaller matrices in
   constant buffers may be padded differently.

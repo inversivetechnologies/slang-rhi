@@ -2,7 +2,7 @@
 -- and its render graph (lib/scene/renderer.lua).
 --
 --   local scenes = rhi.include("lib/scene/scene.lua")
---   local scene = scenes.load("scenes/composite.json", layers) -- layers: optional, drawn
+--   local scene = scenes.load("scenes/composite.scene", layers) -- layers: optional, drawn
 --                       -- over everything (lib/scene/overlays.lua, lib/pause-menu.lua)
 --   scene:enter()            -- hands the graph (and physics, sounds) to the host
 --   scene:update(dt)         -- behaviors and cameras, every frame
@@ -69,11 +69,17 @@ end
 
 function Scene:layout(width, height)
     each(self, "layout", width, height)
+    renderer.resetHistory(self.ctx)
     for _, layer in ipairs(self.ctx.layers) do layer:layout(width, height) end
 end
 
 function Scene:update(dt)
     each(self, "update", dt)
+end
+
+-- Every frame, paused or not (after update): what the renderer's per-frame state needs.
+function Scene:frame()
+    renderer.updateFrame(self.ctx)
 end
 
 function Scene:on_key(...) return first(self, "on_key", ...) end

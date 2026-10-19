@@ -126,6 +126,7 @@ function system.load(ctx)
         lit = rhi.render_pipeline {
             shader = "scene/lit.slang", vertex = "bodyVertexMain", fragment = "bodyFragmentMain", format = "rgba16f", depth = true,
         },
+        motion = rhi.render_pipeline { shader = "scene/motion.slang", vertex = "bodyVertexMain", format = "rgba16f", depth = true },
     }
 end
 
@@ -149,6 +150,19 @@ function system.addOpaque(ctx, view, pass)
         pass:draw {
             pipeline = m.pipelines.lit, count = d.mesh.count, instances = d.group,
             params = { { vertices = d.mesh.buffer, bodies = d.group.buffer }, ctx.light, ctx.shadowBlock, view.block },
+        }
+    end
+end
+
+-- The bodies' motion since the frame before, for the screen-space effects' history
+-- (scene/motion.slang; the renderer's motion pass, with SSAO or SSGI on).
+function system.addMotion(ctx, view, pass)
+    local m = ctx.mesh
+    if not m then return end
+    for _, d in ipairs(m.draws) do
+        pass:draw {
+            pipeline = m.pipelines.motion, count = d.mesh.count, instances = d.group,
+            params = { { vertices = d.mesh.buffer, bodies = d.group.buffer }, view.block },
         }
     end
 end

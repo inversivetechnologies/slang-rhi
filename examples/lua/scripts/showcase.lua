@@ -25,11 +25,11 @@ config = {
 
 -- The scenes in this order; any others in assets/scenes/ follow.
 local ORDER = {
-    "physics.json",
-    "splats.json",
-    "composite.json",
-    "sdf-benchmark.json",
-    "sdf-gallery.json",
+    "physics.scene",
+    "splats.scene",
+    "composite.scene",
+    "sdf-benchmark.scene",
+    "sdf-gallery.scene",
 }
 
 local viewer = rhi.include("lib/scene-viewer-mode.lua")(function(details)
