@@ -125,9 +125,11 @@ function system.addSurfaces(ctx, graph, view)
             instanceCount = f.instanceCount,
             clip = f.clip,
             lighting = { ctx.light, ctx.shadowBlock },
+            gi = view.splatGiParams, -- the renderer's, with SSGI on
             target = view.targets.splatColor,
             clear = i == 1 and { 0, 0, 0, 0 } or nil,
-            depthTarget = view.targets.splatDepth,
+            depthBlend = view.targets.splatDepthBlend, -- blended, resolved into splatDepth
+            depthResolved = view.targets.splatDepth,
             depthClear = i == 1,
             budgetScale = view.budgetScale,
         })

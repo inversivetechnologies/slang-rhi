@@ -1900,7 +1900,8 @@ public:
 
     // Values the host provides to every draw and dispatch, if the shader declares them:
     // `time` (seconds), `timeDelta` (the seconds `time` moved since the last frame: 0
-    // while paused) and `viewportSize` (pixels). Set before the script's parameters,
+    // while paused), `frameCounter` (a uint: frames drawn so far) and `viewportSize`
+    // (pixels). Set before the script's parameters,
     // which can override them.
     void applyBuiltins(const ShaderCursor& root, float viewportWidth, float viewportHeight)
     {
@@ -1908,6 +1909,12 @@ public:
         if (time.isValid())
         {
             setNumbers(time, {m_shaderTime});
+        }
+        ShaderCursor frameCounter = root["frameCounter"];
+        if (frameCounter.isValid())
+        {
+            uint32_t frame = m_frameIndex;
+            frameCounter.setData(&frame, sizeof(frame));
         }
         ShaderCursor timeDelta = root["timeDelta"];
         if (timeDelta.isValid())
@@ -3820,6 +3827,96 @@ public:
         return 0;
     }
 
+    // A half float's value.
+    static float halfToFloat(uint16_t h)
+    {
+        uint32_t sign = uint32_t(h & 0x8000) << 16;
+        uint32_t exponent = (h >> 10) & 0x1F;
+        uint32_t mantissa = h & 0x3FF;
+        uint32_t bits;
+        if (exponent == 0)
+        {
+            if (mantissa == 0)
+                bits = sign;
+            else
+            {
+                // Subnormal: normalize it.
+                exponent = 127 - 15 + 1;
+                while ((mantissa & 0x400) == 0)
+                {
+                    mantissa <<= 1;
+                    --exponent;
+                }
+                bits = sign | (exponent << 23) | ((mantissa & 0x3FF) << 13);
+            }
+        }
+        else if (exponent == 31)
+            bits = sign | 0x7F800000 | (mantissa << 13);
+        else
+            bits = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
+        float f;
+        std::memcpy(&f, &bits, sizeof(f));
+        return f;
+    }
+
+    // rhi.save_texture(texture, path): reads the texture back (as the GPU last left it) and
+    // writes it to `path`, for measuring: "RHIF", width and height (uint32), then RGBA as
+    // float32, row by row. rgba16f, rgba32f, r32f and rgba8 textures. A debugging aid: it
+    // waits for the GPU.
+    static int apiSaveTexture(lua_State* L)
+    {
+        LuaApp* app = requireDevice(L);
+        auto texture = checkShared<Texture>(L, 1, kTextureType);
+        const char* path = luaL_checkstring(L, 2);
+        app->m_queue->waitOnHost();
+        ComPtr<ISlangBlob> blob;
+        SubresourceLayout layout;
+        if (SLANG_FAILED(app->m_device->readTexture(texture->texture, 0, 0, blob.writeRef(), &layout)))
+            luaL_error(L, "could not read the texture back");
+        uint32_t width = uint32_t(layout.size.width), height = uint32_t(layout.size.height);
+        std::vector<float> rgba(size_t(width) * height * 4, 0.0f);
+        const uint8_t* bytes = static_cast<const uint8_t*>(blob->getBufferPointer());
+        for (uint32_t y = 0; y < height; ++y)
+        {
+            const uint8_t* row = bytes + size_t(y) * layout.rowPitch;
+            for (uint32_t x = 0; x < width; ++x)
+            {
+                float* out = &rgba[(size_t(y) * width + x) * 4];
+                switch (texture->format)
+                {
+                case Format::RGBA16Float:
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        uint16_t h;
+                        std::memcpy(&h, row + x * 8 + c * 2, 2);
+                        out[c] = halfToFloat(h);
+                    }
+                    break;
+                case Format::RGBA32Float:
+                    std::memcpy(out, row + x * 16, 16);
+                    break;
+                case Format::R32Float:
+                    std::memcpy(out, row + x * 4, 4);
+                    break;
+                case Format::RGBA8Unorm:
+                    for (int c = 0; c < 4; ++c)
+                        out[c] = row[x * 4 + c] / 255.0f;
+                    break;
+                default:
+                    luaL_error(L, "save_texture: unsupported format");
+                }
+            }
+        }
+        std::ofstream file(path, std::ios::binary);
+        if (!file)
+            luaL_error(L, "could not write %s", path);
+        file.write("RHIF", 4);
+        file.write(reinterpret_cast<const char*>(&width), 4);
+        file.write(reinterpret_cast<const char*>(&height), 4);
+        file.write(reinterpret_cast<const char*>(rgba.data()), std::streamsize(rgba.size() * sizeof(float)));
+        return 0;
+    }
+
     // rhi.quit(): closes the window, ending the program after this frame.
     static int apiQuit(lua_State* L)
     {
@@ -4353,6 +4450,7 @@ public:
             {"paused", apiPaused},
             {"show_pointer", apiShowPointer},
             {"quit", apiQuit},
+            {"save_texture", apiSaveTexture},
             {"reload", apiReload},
             {"display", apiDisplay},
             {"set_display", apiSetDisplay},

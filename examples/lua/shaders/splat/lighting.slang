@@ -40,8 +40,47 @@ uniform float shadowBiasExtent;   // plus this much of its own extent (3 sigma, 
 uniform float shadowBiasTexels;   // plus this many shadow map texels
 uniform uint showVisibility;      // 1: show the light reaching each splat, not its color
 
+// Each splat's shadow visibility, kept from frame to frame (per splat and instance), and
+// blended with the new one: the splats' shadow maps are drawn anew every frame, and the
+// light reaching a splat changes in small steps as the light, the levels of detail or the
+// splats' footprints in the maps move. Smoothed per splat, it doesn't trail the camera at
+// all (nothing is reprojected), only the light, by a few frames. A packed uint each: the
+// frame it was written (16 bits), the visibility (16 bits).
+RWStructuredBuffer<uint> shadowHistory;
+uniform uint shadowHistoryCapacity; // entries it holds (0: no history)
+uniform uint lightingEntries;       // splats an instance has (the file's and merged ones)
+uniform float shadowHistoryBlend;   // the new frame's share (1: no smoothing)
+uniform uint frameCounter;          // provided by the host
+
+// The screen-space indirect light (post/ssao.slang), for the splats cached per splat as the
+// shadows are: each splat takes the last frame's GI where its center is, blends it into its
+// own history (giHistory: rgb, 10 bits each, the square root of a quarter of the light,
+// so that faint light keeps its precision), and adds it to its color, as the effects add it
+// to the meshes'; the effects' apply pass then leaves the splats out. A screen-space estimate on
+// splats is noisy (their depth buffer holds one depth a splat, so the normals rebuilt from
+// it are rough), and a moving light changes it every frame; smoothed per splat, it neither
+// flickers nor trails the camera.
+Texture2D<float4> splatGi;      // the view's GI history (rgb), last frame's
+SamplerState splatGiSampler;
+uniform float splatGiStrength;  // 0: no GI on the splats here
+uniform float splatGiBlend;     // the new frame's share
+RWStructuredBuffer<uint> giHistory;
+uniform float2 viewportSize;    // the view's: the host's (the window's) or the view block's (an inset's)
+
+uint packGi(float3 c)
+{
+    uint3 q = uint3(sqrt(saturate(c * 0.25)) * 1023.0 + 0.5);
+    return q.x | (q.y << 10) | (q.z << 20);
+}
+
+float3 unpackGi(uint v)
+{
+    float3 r = float3(v & 1023u, (v >> 10) & 1023u, (v >> 20) & 1023u) / 1023.0;
+    return r * r * 4.0;
+}
+
 [shader("compute")]
-[numthreads(256, 1, 1)]
+[numthreads(64, 1, 1)]
 void lightSplatsMain(uint3 tid: SV_DispatchThreadID)
 {
     uint slot = tid.x;
@@ -65,32 +104,83 @@ void lightSplatsMain(uint3 tid: SV_DispatchThreadID)
     float spacing = clamp(0.5 * extent / texel, 1.0, 8.0);
     float visibility = shadowVisibilitySpread(fromLight, bias, spacing);
 
+    // Its visibility of the frame before, if it was drawn then (else it starts over: new in
+    // the levels of detail's cut, or back in view). A second view in the same frame finds
+    // this frame's already, and takes it as it is.
     ProjectedSplat splat = projected[slot];
+    float3 indirect = float3(0, 0, 0);
+    if (splatGiStrength > 0)
+        indirect = splatGi.SampleLevel(splatGiSampler, splat.centerAxis1.xy / viewportSize, 0).rgb * splatGiStrength;
+
+    uint historyIndex = drawn.y * lightingEntries + i;
+    [branch]
+    if (historyIndex < shadowHistoryCapacity)
+    {
+        uint old = shadowHistory[historyIndex];
+        uint stamp = old >> 16;
+        float before = float(old & 0xFFFFu) / 65535.0;
+        uint now = frameCounter & 0xFFFFu;
+        bool fresh = stamp == now;
+        bool continuing = stamp == ((now - 1u) & 0xFFFFu);
+        float3 indirectBefore = splatGiStrength > 0 ? unpackGi(giHistory[historyIndex]) : float3(0, 0, 0);
+        if (fresh)
+        {
+            visibility = before;
+            indirect = indirectBefore;
+        }
+        else if (continuing)
+        {
+            visibility = lerp(before, visibility, shadowHistoryBlend);
+            indirect = lerp(indirectBefore, indirect, splatGiBlend);
+        }
+        [branch]
+        if (!fresh)
+        {
+            shadowHistory[historyIndex] = (now << 16) | uint(saturate(visibility) * 65535.0 + 0.5);
+            if (splatGiStrength > 0)
+                giHistory[historyIndex] = packGi(indirect);
+        }
+    }
+
     float3 captured = splat.color.rgb;
     float3 shadowed = captured * lerp(1.0 - shadowStrength, 1.0, visibility);
 
     // Lit like the meshes in scene/lit.slang, in linear color.
+    // A splat's normal (its shortest axis) has no side of its own: the one facing the eye is
+    // taken. Not by a hard flip, which as the camera turned past a splat edge on switched
+    // its light from one side to the other in a frame -- a pop for every splat the view
+    // swept past -- but by blending the two sides' light over a narrow band about edge on.
     float flatness;
     float3 normal = splatWorldNormal(base, flatness);
-    if (dot(normal, camera.eye - world) < 0)
-    {
-        normal = -normal;
-    }
+    float3 toEye = normalize(camera.eye - world);
+    float front = smoothstep(-0.25, 0.25, dot(normal, toEye)); // 1: `normal` faces the eye
     float3 toLight = lightPos - world;
     float distanceToLight = length(toLight);
     toLight /= distanceToLight;
     float window = saturate(1.0 - pow(distanceToLight / light.range, 4.0));
     float attenuation = light.intensity * window * window / (1.0 + distanceToLight * distanceToLight);
-    float diffuse = lerp(0.5, saturate(dot(normal, toLight)), saturate(flatness));
+    float facing = lerp(saturate(-dot(normal, toLight)), saturate(dot(normal, toLight)), front);
+    float diffuse = lerp(0.5, facing, saturate(flatness));
     float3 albedo = pow(max(captured, 0.0), 2.2);
-    // The unshadowed point lights: a diffuse term only, trusted as far as the normal is.
-    float3 toEye = normalize(camera.eye - world);
-    float3 extra = pointLightsRadiance(splat.centerAxis1.xy, world, normal, toEye, albedo, 0.0, saturate(flatness));
+    // The unshadowed point lights: a diffuse term only, trusted as far as the normal is;
+    // both sides' near edge on, as above.
+    float3 extra;
+    [branch]
+    if (front <= 0.0 || front >= 1.0)
+    {
+        extra = pointLightsRadiance(splat.centerAxis1.xy, world, front >= 1.0 ? normal : -normal, toEye, albedo, 0.0, saturate(flatness));
+    }
+    else
+    {
+        extra = lerp(pointLightsRadiance(splat.centerAxis1.xy, world, -normal, toEye, albedo, 0.0, saturate(flatness)),
+                     pointLightsRadiance(splat.centerAxis1.xy, world, normal, toEye, albedo, 0.0, saturate(flatness)), front);
+    }
     float3 lit = albedo * float3(0.05, 0.06, 0.08) + albedo * diffuse * light.color * attenuation * visibility + extra;
     lit = lit / (1.0 + lit);
+    lit += indirect; // the indirect light, after the tone map, as the effects add it
     float3 relit = pow(max(lit, 0.0), 1.0 / 2.2); // max: fxc can't tell lit >= 0
     // As captured, the point lights still add on (in linear light, then back).
-    shadowed = pow(pow(max(shadowed, 0.0), 2.2) + extra, 1.0 / 2.2);
+    shadowed = pow(max(pow(max(shadowed, 0.0), 2.2) + extra + indirect, 0.0), 1.0 / 2.2);
 
     splat.color.rgb = lerp(shadowed, relit, relight);
     if (showVisibility != 0)

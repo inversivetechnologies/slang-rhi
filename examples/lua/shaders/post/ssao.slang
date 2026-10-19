@@ -30,7 +30,8 @@
 //                 stand still) and where the last frame's camera saw it there, and that
 //                 frame's result there (if its depth agrees: nothing disoccluded or moved
 //                 in front) taken 90 to 10
-//   historyMain   the result and its depths kept for the next frame
+//                 (bounded by a fast history: see historyClip, fastHistoryWeight)
+//   historyMain   the results and their depths kept for the next frame
 //
 // post/ssao-apply.slang puts them on the image: color x visibility + indirect light.
 
@@ -61,6 +62,9 @@ uniform uint historyValid;        // 0: no frames before (just built, or resized
 // What stays where it was but changed -- the floor a box slid off, a wall a light moved
 // away from -- passes reprojection and depth, and without it fades out over ~10 frames.
 uniform float historyClip;
+// The fast history's share of the frames before (0.5: about the last two or three); the
+// history is clamped about it rather than about the neighborhood's mean. 0: no fast history.
+uniform float fastHistoryWeight;
 
 // What moved: the bodies, per pixel (the motion pass: the previous world position minus the
 // current, where a body is the nearest mesh), and the SDF composition, turning about its
@@ -283,15 +287,28 @@ void blurMain(uint3 tid: SV_DispatchThreadID, uniform Texture2D<float4> effectsI
     effectsOut[tid.xy] = sum / max(weights, 1e-6);
 }
 
-float4 computeTemporal(uint2 tid, Texture2D<float4> current, Texture2D<float4> history, Texture2D<float> historyDepth)
+// The temporal pass's two results: the history (`slow`, the frames before taken 90 to 10)
+// and the fast history (`fast`, fastHistoryWeight of the frames before: about the last two
+// or three), which bounds it.
+struct Temporal
 {
+    float4 slow;
+    float4 fast;
+};
+
+Temporal computeTemporal(uint2 tid, Texture2D<float4> current, Texture2D<float4> history, Texture2D<float4> fastHistory,
+                         Texture2D<float> historyDepth)
+{
+    Temporal result;
     float4 now = current.Load(int3(tid, 0));
+    result.slow = now;
+    result.fast = now;
     uint2 size = fullSize();
     float aspect = float(size.x) / float(size.y);
     int2 p = toFull(tid, viewportSize, size);
     float z = sceneZ(p, size);
     if (historyValid == 0 || isBackground(z))
-        return now;
+        return result;
 
     // Where this pixel's surface was the frame before: by the motion of whichever surface
     // is nearest here.
@@ -315,13 +332,14 @@ float4 computeTemporal(uint2 tid, Texture2D<float4> current, Texture2D<float4> h
     float3 before = worldToView(prevCamera, previous);
     float2 uv = projectToUv(prevCamera, before, aspect);
     if (before.z <= depthNear || any(uv < 0) || any(uv > 1))
-        return now;
+        return result;
 
-    // Its history, filtered over the 4 nearest texels that saw the same surface.
+    // Both histories, filtered over the 4 nearest texels that saw the same surface.
     float2 f = uv * viewportSize - 0.5;
     int2 base = int2(floor(f));
     float2 w = f - float2(base);
     float4 sum = float4(0, 0, 0, 0);
+    float4 fastSum = float4(0, 0, 0, 0);
     float weights = 0;
     for (int k = 0; k < 4; ++k)
     {
@@ -332,17 +350,19 @@ float4 computeTemporal(uint2 tid, Texture2D<float4> current, Texture2D<float4> h
         if (abs(seen - before.z) < 0.04 * before.z)
         {
             sum += history.Load(int3(t, 0)) * bilinear;
+            fastSum += fastHistory.Load(int3(t, 0)) * bilinear;
             weights += bilinear;
         }
     }
     if (weights < 0.25)
-        return now; // newly seen: nothing to go on
-    // Where only some of the texels agree, the history counts for less.
+        return result; // newly seen: nothing to go on
+    // Where only some of the texels agree, the histories count for less.
+    float trust = saturate(weights);
     float4 kept = sum / weights;
+    result.fast = lerp(now, fastSum / weights, fastHistoryWeight * trust);
     if (historyClip > 0)
     {
-        // The current frame's spread here (it is blurred already, so tight where flat):
-        // a history outside it is out of date, and comes in to its edge.
+        // The current frame's spread here (it is blurred already, so tight where flat).
         float4 mean = float4(0, 0, 0, 0), meanSquares = float4(0, 0, 0, 0);
         for (int y = -1; y <= 1; ++y)
         {
@@ -357,10 +377,13 @@ float4 computeTemporal(uint2 tid, Texture2D<float4> current, Texture2D<float4> h
         mean /= 9.0;
         float4 sigma = sqrt(max(meanSquares / 9.0 - mean * mean, 0.0));
         float4 extent = historyClip * sigma + float4(0.002, 0.002, 0.002, 0.01);
-        kept = clamp(kept, mean - extent, mean + extent);
+        // About the fast history (anti-lag, as NVIDIA's ReLAX): it has seen a change within
+        // a frame or two, without the single frame's noise; without one, about the mean.
+        float4 center = fastHistoryWeight > 0 ? result.fast : mean;
+        kept = clamp(kept, center - extent, center + extent);
     }
-    float keep = kHistoryWeight * saturate(weights);
-    return lerp(now, kept, keep);
+    result.slow = lerp(now, kept, kHistoryWeight * trust);
+    return result;
 }
 
 [shader("compute")]
@@ -369,12 +392,16 @@ void temporalMain(
     uint3 tid: SV_DispatchThreadID,
     uniform Texture2D<float4> current,
     uniform Texture2D<float4> history,
+    uniform Texture2D<float4> fastHistory,
     uniform Texture2D<float> historyDepth,
-    uniform RWTexture2D<float4> resolved)
+    uniform RWTexture2D<float4> resolved,
+    uniform RWTexture2D<float4> resolvedFast)
 {
     if (tid.x >= uint(viewportSize.x) || tid.y >= uint(viewportSize.y))
         return;
-    resolved[tid.xy] = computeTemporal(tid.xy, current, history, historyDepth);
+    Temporal t = computeTemporal(tid.xy, current, history, fastHistory, historyDepth);
+    resolved[tid.xy] = t.slow;
+    resolvedFast[tid.xy] = t.fast;
 }
 
 [shader("compute")]
@@ -382,12 +409,15 @@ void temporalMain(
 void historyMain(
     uint3 tid: SV_DispatchThreadID,
     uniform Texture2D<float4> resolvedIn,
+    uniform Texture2D<float4> resolvedFastIn,
     uniform RWTexture2D<float4> history,
+    uniform RWTexture2D<float4> fastHistory,
     uniform RWTexture2D<float> historyDepth)
 {
     if (tid.x >= uint(viewportSize.x) || tid.y >= uint(viewportSize.y))
         return;
     uint2 size = fullSize();
     history[tid.xy] = resolvedIn.Load(int3(tid.xy, 0));
+    fastHistory[tid.xy] = resolvedFastIn.Load(int3(tid.xy, 0));
     historyDepth[tid.xy] = sceneZ(toFull(tid.xy, viewportSize, size), size);
 }

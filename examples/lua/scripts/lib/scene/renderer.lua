@@ -58,7 +58,9 @@ local function createTargets(inset)
         meshColor = rhi.render_target("rgba16f", scale, shape),
         meshDepth = rhi.depth_target(scale, shape),
         splatColor = rhi.render_target("rgba16f", scale, shape),
-        splatDepth = rhi.depth_target(scale, shape),
+        -- The splats' depth (z/w, as a depth buffer's), resolved from their blended depth.
+        splatDepth = rhi.render_target("r32f", scale, shape),
+        splatDepthBlend = rhi.render_target("rgba16f", scale, shape),
         sdfColor = rhi.render_target("rgba16f", scale, shape),
         sdfDepth = rhi.render_target("r32f", scale, shape),
     }
@@ -68,6 +70,15 @@ end
 -- Shadow map texels per cube face (the atlases are 3 x 2 faces); the shadow quality
 -- setting changes it, for the graphs built after.
 renderer.shadowFaceSize = 512
+
+-- For measuring (rhi.save_texture): the main view's final image goes into a texture,
+-- `ctx.views[1].image`, which is then copied to the window.
+renderer.captureMain = false
+
+-- Temporal stabilization of the main view's final image (post/taa.slang: TAA without
+-- jitter), against the shimmer of detail finer than a pixel, the splats' above all. The
+-- settings change it, for the graphs built after.
+renderer.taa = true
 
 -- Screen-space effects on every view (post/ssao.slang): ambient occlusion (by `aoMethod`,
 -- "GTAO" or "SSAO") and indirect light, at a quality: "Half" (both at half resolution),
@@ -79,7 +90,8 @@ renderer.EFFECT_PARAMS = {
     aoStrength = 1.6, -- SSAO's: 1 black where fully occluded
     gtaoPower = 1.5,  -- GTAO's: its visibility raised to this
     giRadius = 2.5, giStrength = 2.5,
-    historyClip = 1.25, -- the temporal pass's clamp, in standard deviations (0: off)
+    historyClip = 1.25,      -- the temporal pass's clamp, in standard deviations (0: off)
+    fastHistoryWeight = 0.5, -- the fast history's (anti-lag): the clamp's center (0: the mean)
 }
 
 -- Tiled light culling (scene/light-culling.slang): the tiles a main view's buffer holds,
@@ -139,6 +151,13 @@ function renderer.build(ctx, systems)
     ctx.noLightTiles = ctx.noLightTiles or rhi.buffer(16)
     local fx = renderer.effects
     local effectsOn = fx.ao or fx.gi
+    local taaOn = renderer.taa
+    -- What the temporal passes (the effects', TAA's) need: the bodies' motion, the camera's.
+    local temporalOn = effectsOn or taaOn
+    if taaOn then
+        pipelines.taa = rhi.compute_pipeline("post/taa.slang", "taaMain")
+        pipelines.taaKeep = rhi.compute_pipeline("post/taa.slang", "taaKeepMain")
+    end
     if effectsOn then
         pipelines.effects = rhi.compute_pipeline("post/ssao.slang", "effectsMain")
         pipelines.effectsBlur = rhi.compute_pipeline("post/ssao.slang", "blurMain")
@@ -151,7 +170,7 @@ function renderer.build(ctx, systems)
             depthNear = 0.1, depthFar = 100,
             aoRadius = p.aoRadius, aoStrength = p.aoStrength, giRadius = p.giRadius,
             aoMethod = fx.aoMethod == "GTAO" and 1 or 0, gtaoPower = p.gtaoPower,
-            historyClip = p.historyClip,
+            historyClip = p.historyClip, fastHistoryWeight = p.fastHistoryWeight,
             frameIndex = 0,
         }
         ctx.effectsNodes = {} -- the main view's, timed
@@ -174,7 +193,11 @@ function renderer.build(ctx, systems)
     call(systems, "addShadowCasters", ctx, facePasses)
     call(systems, "addShadowPasses", ctx, graph)
 
-    -- The views.
+    -- The views. An inset's image (and with captureMain, the main view's) is a texture;
+    -- the main view's otherwise goes straight to the window.
+    local function toTexture(view)
+        return view.inset ~= nil or ((renderer.captureMain or taaOn) and view == ctx.views[1])
+    end
     ctx.composites = {}
     for _, view in ipairs(ctx.views) do
         view.targets = createTargets(view.inset)
@@ -202,7 +225,9 @@ function renderer.build(ctx, systems)
             clear = { background[1], background[2], background[3], 1 },
         }
         call(systems, "addOpaque", ctx, view, opaque)
-        if effectsOn then
+        if temporalOn then
+            view.temporal = rhi.params { prevCamera = view.cameraValue, historyValid = 0 }
+            view.historyFrames = 0
             -- What moved since the frame before (the bodies; the SDFs' spin is worked out
             -- from their block), so that the effects' history follows it.
             local scale, shape = view.inset or 1, view.inset and "square" or nil
@@ -216,16 +241,24 @@ function renderer.build(ctx, systems)
             }
             call(systems, "addMotion", ctx, view, motion)
         end
+        -- With SSGI, the splats take the indirect light per splat, from the GI chain's history
+        -- (last frame's): made here, before they shade, and given to the chain below.
+        view.splatGi, view.splatGiParams = nil, nil
+        if effectsOn and fx.gi and ctx.splats then
+            local giScale = 0.5
+            for _, chain in ipairs(effectChains(fx)) do
+                if chain.gi then giScale = chain.scale end
+            end
+            view.splatGi = rhi.render_target("rgba16f", (view.inset or 1) * giScale, view.inset and "square" or nil)
+            ctx.splatGiSampler = ctx.splatGiSampler or rhi.sampler { filter = "linear", address = "clamp" }
+            view.splatGiParams = { splatGi = view.splatGi, splatGiSampler = ctx.splatGiSampler,
+                                   splatGiStrength = renderer.EFFECT_PARAMS.giStrength }
+        end
         call(systems, "addSurfaces", ctx, graph, view)
         if not ctx.splats then
             -- Nothing draws the splats' depth, but the composite reads it: clear it, so it
-            -- holds the far plane (and D3D12 never reads a depth buffer nothing wrote).
-            graph:render_pass {
-                name = view.name .. ": no splats",
-                depth_target = view.targets.splatDepth,
-                color = false,
-                clear = { 0, 0, 0, 0 },
-            }
+            -- holds the far plane.
+            graph:render_pass { name = view.name .. ": no splats", target = view.targets.splatDepth, clear = { 1, 0, 0, 0 } }
         end
         if not ctx.sdf then
             -- Nor do the SDFs' targets get written: no hit, at the far plane (the effects
@@ -241,7 +274,7 @@ function renderer.build(ctx, systems)
             sdfColor = t.sdfColor, sdfDepth = t.sdfDepth,
             depthNear = 0.1, depthFar = 100, -- the planes every pass writes depth with
             -- With the effects, linear into a texture of its own; they encode it after.
-            encodeGamma = (view.inset or effectsOn) and 0 or (srgb and 0 or 1),
+            encodeGamma = (toTexture(view) or effectsOn) and 0 or (srgb and 0 or 1),
             showMode = ctx.showMode or 0,
             lightTiles = view.lightTiles or ctx.noLightTiles,
         }
@@ -249,13 +282,15 @@ function renderer.build(ctx, systems)
         local scale, shape = view.inset or 1, view.inset and "square" or nil
         if view.inset then
             view.image = rhi.render_target("rgba16f", view.inset, "square")
+        elseif toTexture(view) then
+            view.image = rhi.render_target("rgba16f")
         end
         if effectsOn then
             view.litImage = rhi.render_target("rgba16f", scale, shape)
         end
         local present = graph:render_pass { name = view.name .. ": depth composite", target = view.litImage or view.image }
         present:draw {
-            pipeline = (view.inset or effectsOn) and pipelines.compositeTexture or pipelines.compositeWindow,
+            pipeline = (toTexture(view) or effectsOn) and pipelines.compositeTexture or pipelines.compositeWindow,
             count = 3,
             params = view.composite,
         }
@@ -263,15 +298,14 @@ function renderer.build(ctx, systems)
         if effectsOn then
             -- Each chain: the effects, blurred, blended with the frames before (reprojected
             -- by the last frame's camera, view.temporal), and kept for the next frame.
-            view.temporal = rhi.params { prevCamera = view.cameraValue, historyValid = 0 }
-            view.historyFrames = 0
             local inputs = { meshDepth = t.meshDepth, splatDepth = t.splatDepth, sdfDepth = t.sdfDepth,
                              litColor = view.litImage, meshMotion = t.meshMotion }
             local results = {}
             for _, chain in ipairs(effectChains(fx)) do
                 local function target(format) return rhi.render_target(format, scale * chain.scale, shape) end
                 local raw, blurred, resolved = target("rgba16f"), target("rgba16f"), target("rgba16f")
-                local history, historyDepth = target("rgba16f"), target("r32f")
+                local history, historyDepth = (chain.gi and view.splatGi) or target("rgba16f"), target("r32f")
+                local resolvedFast, fastHistory = target("rgba16f"), target("rgba16f")
                 local base = { view.block, ctx.shadowBlock, ctx.effectsBlock, view.temporal, inputs,
                                { aoEnabled = chain.ao and 1 or 0, giEnabled = chain.gi and 1 or 0 } }
                 local function pass(name, pipeline, textures, threads)
@@ -286,9 +320,11 @@ function renderer.build(ctx, systems)
                 pass("effects", pipelines.effects, { effects = raw }, raw)
                 pass("blur", pipelines.effectsBlur, { effectsIn = raw, effectsOut = blurred }, blurred)
                 pass("temporal", pipelines.effectsTemporal,
-                    { current = blurred, history = history, historyDepth = historyDepth, resolved = resolved }, resolved)
+                    { current = blurred, history = history, fastHistory = fastHistory, historyDepth = historyDepth,
+                      resolved = resolved, resolvedFast = resolvedFast }, resolved)
                 pass("history", pipelines.effectsHistory,
-                    { resolvedIn = resolved, history = history, historyDepth = historyDepth }, history)
+                    { resolvedIn = resolved, resolvedFastIn = resolvedFast, history = history,
+                      fastHistory = fastHistory, historyDepth = historyDepth }, history)
                 if chain.ao then results.ao = resolved end
                 if chain.gi then results.gi = resolved end
                 if not view.inset then ctx.effectsLabels[#ctx.effectsLabels + 1] = chainLabel(chain) end
@@ -299,17 +335,53 @@ function renderer.build(ctx, systems)
                 litColor = view.litImage, meshMotion = t.meshMotion,
                 aoEffects = results.ao or results.gi, giEffects = results.gi or results.ao,
                 giStrength = fx.gi and renderer.EFFECT_PARAMS.giStrength or 0,
-                outputEncodeGamma = view.inset and 0 or (srgb and 0 or 1),
+                splatGiCached = view.splatGi and 1 or 0, -- the splats have theirs already
+                outputEncodeGamma = toTexture(view) and 0 or (srgb and 0 or 1),
                 showMode = ctx.showMode or 0,
             }
             ctx.composites[#ctx.composites + 1] = view.apply
             local apply = graph:render_pass { name = view.name .. ": effects", target = view.image }
             apply:draw {
-                pipeline = view.inset and pipelines.applyTexture or pipelines.applyWindow,
+                pipeline = toTexture(view) and pipelines.applyTexture or pipelines.applyWindow,
                 count = 3,
                 params = view.apply,
             }
         end
+
+        -- The main view's image, stabilized against the frames before (post/taa.slang).
+        view.taaResolved = nil
+        if taaOn and view == ctx.views[1] then
+            view.taaResolved = rhi.render_target("rgba16f")
+            view.taaHistory = rhi.render_target("rgba16f")
+            local inputs = { meshDepth = t.meshDepth, splatDepth = t.splatDepth, sdfDepth = t.sdfDepth,
+                             depthNear = 0.1, depthFar = 100, meshMotion = t.meshMotion, taaCurrent = view.image }
+            ctx.taaNode = graph:dispatch {
+                name = view.name .. ": temporal AA",
+                pipeline = pipelines.taa,
+                params = { view.block, ctx.shadowBlock, view.temporal, inputs,
+                           { history = view.taaHistory, resolved = view.taaResolved } },
+                threads = view.taaResolved,
+                timed = true,
+            }
+            graph:dispatch {
+                name = view.name .. ": temporal AA history",
+                pipeline = pipelines.taaKeep,
+                params = { view.block, { resolvedIn = view.taaResolved, history = view.taaHistory } },
+                threads = view.taaHistory,
+            }
+        end
+    end
+
+    -- A main view drawn into a texture (TAA's, or captured), onto the window.
+    local main = ctx.views[1]
+    if toTexture(main) and not main.inset then
+        local copy = graph:render_pass { name = main.name .. ": to the window" }
+        copy:draw {
+            pipeline = pipelines.frame,
+            count = 3,
+            params = { source = main.taaResolved or main.image, borderColor = { 0, 0, 0, 1 }, borderWidth = 0,
+                       encodeGamma = srgb and 0 or 1, decodeGamma = 0 },
+        }
     end
 
     call(systems, "addOverlays", ctx, graph)
@@ -348,9 +420,8 @@ end
 -- Every frame (paused too): the effects' noise turns, and each view's temporal block gets
 -- the last frame's camera.
 function renderer.updateFrame(ctx)
-    if not ctx.effectsBlock then return end
     ctx.effectsFrame = (ctx.effectsFrame or 0) + 1
-    ctx.effectsBlock.frameIndex = ctx.effectsFrame
+    if ctx.effectsBlock then ctx.effectsBlock.frameIndex = ctx.effectsFrame end
     for _, view in ipairs(ctx.views) do
         if view.temporal then
             local now = view.cameraValue

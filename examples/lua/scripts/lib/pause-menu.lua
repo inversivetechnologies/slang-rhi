@@ -123,6 +123,9 @@ function Menu:rows()
         { key = "ssgi", label = "Indirect light", choices = { false, true }, index = v.ssgi and 2 or 1,
           format = function(on) return on and "On" or "Off" end,
           apply = function(on) v.ssgi = on return "ssgi", on end },
+        { key = "temporalAA", label = "Temporal AA", choices = { false, true }, index = v.temporalAA and 2 or 1,
+          format = function(on) return on and "On" or "Off" end,
+          apply = function(on) v.temporalAA = on return "temporalAA", on end },
         { key = "effectsQuality", label = "Effects quality", choices = settings.EFFECT_QUALITIES,
           index = (function()
               for i, q in ipairs(settings.EFFECT_QUALITIES) do if q == v.effectsQuality then return i end end

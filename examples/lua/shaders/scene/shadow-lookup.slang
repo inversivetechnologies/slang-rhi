@@ -108,41 +108,54 @@ float shadowTexelSize(float distance)
     return 2.0 * distance / float(shadowFaceSize);
 }
 
-// Fraction of the light reaching a point (0: in shadow, 1: lit), averaged over a 3x3 grid
-// of texels `spacing` texels apart (1: the texel and its neighbors), for soft edges:
+// The light one shadow map texel lets through to a point at `current` from the light:
+// none behind a mesh, else what the splats in front of it leave (their optical depth).
+float shadowTexelLight(int3 p, float current)
+{
+    if (current > shadowMap.Load(p))
+        return 0.0; // behind a mesh
+    if (splatShadows == 0)
+        return 1.0;
+    return exp(-splatOpticalDepth(splatShadowMap.Load(p), splatShadowLayers.Load(p), current));
+}
+
+// Fraction of the light reaching a point (0: in shadow, 1: lit), filtered for soft edges:
 // blocked by the meshes, dimmed by the splats in front of it, and shaded softly by the SDF
 // composition. `d` is the point minus the light's position; `bias` how far the point
 // counts as nearer to the light than it is, so that a surface doesn't shadow itself. A
 // receiver that covers many texels (a merged splat of the levels of detail) samples them
-// that far apart, so it gets the average over its extent rather than over one spot.
+// `spacing` texels apart, so it gets the average over its extent rather than over one spot.
+//
+// Four taps, half `spacing` either way of the point, each filtered bilinearly over the 4
+// texels around it (each texel's comparison made first, then weighted): the footprint is a
+// tent about 2 x spacing texels wide, and the weights follow the point continuously. So a
+// light, a camera or a splat moving a fraction of a texel changes the result by a fraction,
+// rather than flipping taps from one texel to the next -- what made shadows shimmer as the
+// light moved.
 float shadowVisibilitySpread(float3 d, float bias, float spacing)
 {
     float current = length(d) - bias;
     uint face = cubeFaceOf(d);
-    float2 texel = shadowFaceTexel(d, face, shadowFaceSize);
+    float2 texel = shadowFaceTexel(d, face, shadowFaceSize) - 0.5; // texel centers at whole numbers
     int2 origin = int2(shadowFaceOrigin(face, shadowFaceSize));
     int last = int(shadowFaceSize) - 1;
 
     float lit = 0;
-    for (int y = -1; y <= 1; ++y)
+    for (int tap = 0; tap < 4; ++tap)
     {
-        for (int x = -1; x <= 1; ++x)
-        {
-            // Stay inside this face's cell: the next cell over is a different view.
-            int2 offset = int2(round(float2(x, y) * spacing));
-            int3 p = int3(origin + clamp(int2(texel) + offset, int2(0, 0), int2(last, last)), 0);
-            if (current <= shadowMap.Load(p)) // not behind a mesh
-            {
-                float transmittance = 1.0;
-                if (splatShadows != 0)
-                {
-                    transmittance = exp(-splatOpticalDepth(splatShadowMap.Load(p), splatShadowLayers.Load(p), current));
-                }
-                lit += transmittance;
-            }
-        }
+        float2 q = texel + (float2(tap & 1, tap >> 1) - 0.5) * spacing;
+        float2 cell = floor(q);
+        float2 f = q - cell;
+        // Stay inside this face's cell: the next cell over is a different view.
+        int2 i0 = clamp(int2(cell), int2(0, 0), int2(last, last));
+        int2 i1 = clamp(int2(cell) + 1, int2(0, 0), int2(last, last));
+        float a = shadowTexelLight(int3(origin + int2(i0.x, i0.y), 0), current);
+        float b = shadowTexelLight(int3(origin + int2(i1.x, i0.y), 0), current);
+        float c = shadowTexelLight(int3(origin + int2(i0.x, i1.y), 0), current);
+        float e = shadowTexelLight(int3(origin + int2(i1.x, i1.y), 0), current);
+        lit += lerp(lerp(a, b, f.x), lerp(c, e, f.x), f.y);
     }
-    float visibility = lit / 9.0;
+    float visibility = lit / 4.0;
     if (sdfShadows != 0 && visibility > 0)
     {
         float distanceToLight = length(d);

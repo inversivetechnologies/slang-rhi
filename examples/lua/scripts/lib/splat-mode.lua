@@ -52,6 +52,7 @@ return function(setTitle, file)
 
     local camera = { yaw = 0.0, pitch = 0.15, distance = 3, target = { 0, 0, 0 }, fovY = math.rad(50) }
     local splatScale = 1.0
+    local mipFilter = 1.0 -- the 2D Mip filter's strength (splat.setMipFilter): on
     local flip = true -- 3DGS scenes are usually y-down
 
     local graph
@@ -69,6 +70,11 @@ return function(setTitle, file)
     -- budget, seen from the light.
     local CAPACITY = 1 << 21 -- the most splats the buffers hold; the sort's size
     local SHADOW_CAPACITY = 1 << 20 -- the most the shadow maps draw
+    -- The splats' shadow visibility, smoothed per splat across frames (splat/lighting.slang):
+    -- the new frame's share, and the most splat-instances the history holds.
+    local SHADOW_HISTORY_BLEND = 0.25
+    local SPLAT_GI_BLEND = 0.15 -- and of the indirect light, cached the same way
+    local SHADOW_HISTORY_MAX = 32 * 1024 * 1024
     local MIN_BUDGET = 50000
     local CAMERA_FINEST = 0.5 -- pixels
     local SHADOW_FINEST = 1.0 -- shadow map texels
@@ -225,6 +231,8 @@ return function(setTitle, file)
             render = rhi.render_pipeline { shader = "splat/render.slang", format = "rgba16f", blend = "premultiplied" },
             -- The same quads into a depth buffer only: no color target.
             renderDepth = rhi.render_pipeline { shader = "splat/render.slang", fragment = "depthFragmentMain", format = "none", depth = true },
+            renderDepthBlend = rhi.render_pipeline { shader = "splat/render.slang", fragment = "depthBlendFragmentMain", format = "rgba16f", blend = "premultiplied" },
+            depthResolve = rhi.compute_pipeline("splat/depth-resolve.slang", "resolveMain"),
             -- Shadows: the splats' Gaussians drawn into a translucent shadow map, see
             -- shaders/splat/shadow.slang.
             shadowCasters = rhi.compute_pipeline("splat/shadow-casters.slang", "shadowCastersMain"),
@@ -263,10 +271,13 @@ return function(setTitle, file)
         blocks.singleInstance = rhi.params(instanceParams { IDENTITY_MODEL })
         -- No clipping, for graphs that don't ask for it.
         blocks.noClip = rhi.params { clipMode = 0, clipShapeCount = 0, clipShapes = rhi.buffer(48) }
+        blocks.noGi = rhi.texture { width = 1, height = 1, format = "rgba16f" }
+        blocks.giSampler = rhi.sampler { filter = "linear", address = "clamp" }
         blocks.view = rhi.params {
             camera = cameraParams(),
             flipYZ = flip and 1 or 0,
             splatScale = splatScale,
+            splatMipFilter = mipFilter,
             model = IDENTITY_MODEL,
         }
         -- How the splats are lit, where a graph lights them (addPasses' `lighting`).
@@ -354,12 +365,16 @@ return function(setTitle, file)
     --                 view needs fewer splats for the same detail
     --   clip          a clip block (clipMode, clipShapes, clipShapeCount: see
     --                 shaders/splat/clip.slang), or nil for none
+    --   gi            if given, with lighting: { splatGi, splatGiStrength, splatGiSampler },
+    --                 the screen-space GI (last frame's) that the splats cache per splat
     --   lighting      if given, a list of parameter blocks with a light and shadow maps
     --                 (the scene's lightBlock() and shadowBlock()): the splats are then lit
     --                 by that light, and shadowed by the meshes and by each other
     --   target        the rgba16f texture to draw the splats' color into
     --   clear         the color to clear it to first
     --   depthTarget   if given, the splats are also drawn into this depth target
+    --   depthBlend    or if given (an rgba16f target), with depthResolved (an r32f one): their
+    --                 depth blended as their colors are, resolved into depthResolved as z/w
     --   depthClear    false: keep what is in it (other splats drawn before), not clear it
     -- Returns the dispatches and passes it added, in order (e.g. to switch them off), and
     -- those whose thread counts follow the number of instances.
@@ -420,6 +435,23 @@ return function(setTitle, file)
             -- The view after those: it can switch the splat maps on.
             for _, block in ipairs(views) do params[#params + 1] = block end
             params[#params + 1] = blocks.lighting
+            -- Each splat's shadow visibility, kept across frames (and views): one buffer for
+            -- the most instances any graph draws, up to SHADOW_HISTORY_MAX entries.
+            local wanted = math.min(entries * instanceCount, SHADOW_HISTORY_MAX)
+            if not r.shadowHistory or r.shadowHistoryCapacity < wanted then
+                r.shadowHistory = rhi.buffer(wanted * 4)
+                r.giHistory = rhi.buffer(wanted * 4) -- the indirect light, per splat (with options.gi)
+                r.shadowHistoryCapacity = wanted
+            end
+            params[#params + 1] = {
+                shadowHistory = r.shadowHistory, shadowHistoryCapacity = r.shadowHistoryCapacity,
+                giHistory = r.giHistory,
+                lightingEntries = entries, shadowHistoryBlend = SHADOW_HISTORY_BLEND,
+                splatGiBlend = SPLAT_GI_BLEND,
+            }
+            -- The screen-space GI to cache per splat (options.gi: splatGi, splatGiStrength,
+            -- splatGiSampler), or none.
+            params[#params + 1] = options.gi or { splatGiStrength = 0, splatGi = blocks.noGi, splatGiSampler = blocks.giSampler }
             -- One thread per drawn splat at most (preprocess packed them at the front).
             add(g:dispatch { name = name .. ": lighting", pipeline = r.lighting, params = params, threads = { r.sortCount, 1, 1 } })
         end
@@ -475,6 +507,22 @@ return function(setTitle, file)
                 clear = options.depthClear ~= false and { 0, 0, 0, 0 } or nil,
             })
             depthPass:draw { pipeline = r.renderDepth, count = r.sortCount * 6, params = drawParams }
+        end
+        if options.depthBlend then
+            -- Their depth, blended as their colors are, then resolved into a depth texture
+            -- (splat/depth-resolve.slang): smooth, and wherever they cover a pixel together.
+            local blendPass = add(g:render_pass {
+                name = name .. ": blended depth",
+                target = options.depthBlend,
+                clear = options.depthClear ~= false and { 0, 0, 0, 0 } or nil,
+            })
+            blendPass:draw { pipeline = r.renderDepthBlend, count = r.sortCount * 6, params = drawParams }
+            add(g:dispatch {
+                name = name .. ": depth",
+                pipeline = r.depthResolve,
+                params = { depthBlend = options.depthBlend, depthResolved = options.depthResolved },
+                threads = options.depthResolved,
+            })
         end
         return nodes, perInstance
     end
@@ -617,6 +665,13 @@ return function(setTitle, file)
     end
 
     -- Multiplies every splat's size (as [ and ] do); 1 is as trained.
+    -- The 2D Mip filter's strength (shaders/splat/preprocess.slang): 0 off, 1 in full.
+    function splat.setMipFilter(amount)
+        splat.createResources()
+        mipFilter = amount
+        blocks.view.splatMipFilter = amount
+    end
+
     function splat.setSplatScale(scale)
         splat.createResources()
         splatScale = scale

@@ -131,12 +131,13 @@ and the shaders' `time` stops, so everything animated by it holds still too.
 | Ambient occlusion | GTAO, Off, SSAO | [GTAO or SSAO](#ambient-occlusion-and-indirect-light): darker where surfaces are close to others; GTAO by default |
 | Indirect light | Off, On | [SSGI](#ambient-occlusion-and-indirect-light): light bounced from the surfaces seen nearby |
 | Effects quality | Half, Mixed, Full | the resolution SSAO and SSGI are computed at: both at half; AO at full and GI at half; both at full |
+| Temporal AA | On, Off | the main view's image stabilized over frames ([splat stability](#splat-stability)) |
 
 Each script shows the settings it has:
 
 | Script | Settings |
 | --- | --- |
-| `showcase.lua`, `scenes.lua` | all seven |
+| `showcase.lua`, `scenes.lua` | all eight |
 | `fusion.lua` | resolution, fullscreen, max splats, shadow quality |
 | `physics.lua`, `scene.lua` | resolution, fullscreen, shadow quality |
 | `splat.lua` | resolution, fullscreen, max splats |
@@ -312,7 +313,15 @@ has two (AO at full resolution, GI at half), the others one.
   1.25 standard deviations per channel (Salvi 2016; `historyClip` in
   `renderer.EFFECT_PARAMS`, 0 to turn it off). The current frame is already blurred, so the
   window is tight where the result is flat: a change bigger than the noise is taken at
-  once, and the noise is still averaged away. A resize or a new graph starts the
+  once, and the noise is still averaged away.
+- **Fast history (anti-lag):** beside the history, each chain keeps a fast one, which takes
+  the frames before only half (about the last two or three; `fastHistoryWeight`, 0.5). The
+  clamp's window is centered on it rather than on the neighborhood's mean, as NVIDIA's
+  ReLAX does: it has followed a change within a frame or two but without one frame's
+  noise, so the long history is pulled to what is there now, and stays smooth where
+  nothing changed. A box circling over the floor at 5 m/s leaves a smeared trail without
+  the clamp, a tighter one with it about the mean, and none to speak of about the fast
+  history; the effects' GPU time stays the same (1.6 ms with GTAO and SSGI at 1600 x 900). A resize or a new graph starts the
   history over too. While the pause menu is open the frames go on accumulating, so a
   paused image settles to its smoothest.
 - **Depth-aware upsampling:** at half resolution, each pixel takes the 4 nearest effect
@@ -613,6 +622,7 @@ pass's shader, to combine images by depth, or for any screen-space effect.
 | `rhi.set_display{ width, height, fullscreen }` | sizes the window, or with `fullscreen`, switches the primary monitor to that video mode (the nearest it has) with the window covering it; leaving fullscreen puts the window back where it was. Call it from `update`, not from inside an input callback |
 | `rhi.quit()` | closes the window: the program ends after this frame |
 | `rhi.reload()` | runs the script again from the start before the next frame, as saving it does |
+| `rhi.save_texture(texture, path)` | for measuring: reads a texture back (rgba16f, rgba32f, r32f, rgba8) and writes it to `path` as "RHIF", width and height (uint32), then RGBA float32 rows. It waits for the GPU |
 | `rhi.include(path)` | runs a Lua file (relative to the script) and returns its result; saving that file reloads the script |
 | `rhi.window_srgb()` | `true` if the window's format encodes sRGB itself (as `frame.srgb`, but usable in `init`) |
 | `rhi.window_size()` | the window's size in pixels, `width, height` (usable in `init`) |
@@ -1238,6 +1248,41 @@ own center; other graphs (the depth composite) draw one instance, placed by `mod
 
 **Input** only changes parameter blocks (the view, the budget, the instances) and those
 dispatch sizes. The flip is needed because COLMAP-based captures are y-down.
+
+### Splat stability
+
+The splats are the project's priority, and they flickered: with the light moving, the
+camera moving, and the screen-space effects on. What made them flicker was found by
+measuring, not guessing: a test scene (one skull, a floor, a key light and two lamps)
+rendered with the main view into a texture (`renderer.captureMain`), 24 consecutive frames
+saved with `rhi.save_texture`, and per pixel, over the splats (their coverage) and the rest
+apart, how much each frame differs from the line through its neighbors,
+|f(t+1) - 2f(t) + f(t-1)| in display values: near zero for smooth change, large for a
+flicker. One thing changed at a time (the light moving 0.01 rad a frame, the camera
+orbiting, dollying or turning in place), each part switched off in turn.
+
+| Cause | Fix | |
+| --- | --- | --- |
+| shadows looked up texel by texel: as the light moved, taps jumped from texel to texel | bilinear PCF (`scene/shadow-lookup.slang`): 4 taps, each filtered over 4 texels | for the meshes and SDFs too |
+| the splats' shadow maps are drawn anew each frame, so the light reaching a splat changes in steps | the visibility kept per splat (and instance) from frame to frame and blended, a quarter new (`splat/lighting.slang`'s `shadowHistory`) | no reprojection: follows the splat, so it doesn't trail the camera |
+| screen-space GI on splats: rough normals from their depth, and a moving light changes it every frame | the GI cached per splat as the shadows are: each splat takes last frame's GI at its center into its own history (`giHistory`), and the apply pass leaves the splats out | the splats still bounce light onto everything else |
+| splats smaller than a pixel: the low-pass filter widens them without lowering their opacity, so they shimmer as they shrink and grow | the 2D Mip filter (Mip-Splatting, Yu et al. 2024; `preprocess.slang`'s `splatMipFilter`, on): their opacity lowered by as much as they are widened | the skull looks the same (mean brightness 41.5 against 41.1) |
+| the splats' depth: one depth a splat (its center's), and only where a single splat is fairly opaque | their depth blended as their colors are (`render.slang`'s `depthBlendFragmentMain`), then resolved where they cover a pixel 20% (`splat/depth-resolve.slang`) | smooth, and wherever they cover a pixel together: the composite, the effects and TAA all read it |
+| detail finer than a pixel changes from frame to frame | temporal AA (`post/taa.slang`, without jitter): reprojected as the effects' history is, Catmull-Rom, clipped to the neighborhood's color box in YCoCg, 10% new | 0.31 ms at 1600 x 900; image sharpness kept (gradient energy -2%) |
+| (also) a splat's normal flipped to the eye side in one frame as the camera turned past it edge on | both sides' light blended over a narrow band about edge on | |
+| (also) splats sorted by view depth, an order that turning the camera changes | sorted by distance to the eye | |
+
+The measurements, over the splats (mean, the share above 4/255), from first to last:
+
+| Case | Before | After |
+| --- | --- | --- |
+| light moving, GTAO + SSGI | 0.675, 3.48% | 0.018, 0.01% |
+| camera orbiting 5 degrees/s, GTAO + SSGI, over the floor | 2.118, 12.8% | 0.140, 0.18% |
+| camera turning in place 0.05 degrees a frame | 1.032, 3.49% | 0.266, 0.31% (with GTAO + SSGI) |
+| camera dollying 1 cm a frame | 1.457, 10.4% | 0.558, 2.66% |
+
+The dolly is what is left: splats changing size on screen. Temporal AA is the
+`Temporal AA` setting (on); the Mip filter is `splat.setMipFilter(0..1)`.
 
 ### Levels of detail
 
@@ -2121,6 +2166,7 @@ to the type the shader declares:
   | --- | --- |
   | `time` | seconds since start, the same clock as `rhi.time()`; it stops while paused (`rhi.set_paused`) |
   | `timeDelta` | the seconds `time` moved since the last frame (0 while paused) |
+  | `frameCounter` | a `uint`: the frames drawn so far |
   | `viewportSize` | the size in pixels of the viewport being drawn into (the window's size for dispatches) |
 - **Matrices** are written tightly packed. That is exact for `float4x4`; smaller matrices in
   constant buffers may be padded differently.

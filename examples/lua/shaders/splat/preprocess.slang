@@ -30,6 +30,11 @@ RWStructuredBuffer<uint> drawCount; // [0]: splats drawn this frame (packed at t
 
 StructuredBuffer<uint> lodLevel; // per splat: 0 for the file's, the height above them for merged ones
 uniform uint lodShowLevels;      // 1: tint the splats by level
+// The 2D Mip filter (Mip-Splatting, Yu et al. 2024): the low-pass filter below widens a
+// splat; its opacity is lowered by as much, so that a splat smaller than a pixel keeps the
+// weight it has rather than growing to a pixel's. Without it, splats shimmer as they
+// shrink and grow on screen (a dolly, a zoom). 0: off (as 3DGS was trained), 1: in full.
+uniform float splatMipFilter;
 
 // A color per level, for lodShowLevels.
 float3 levelColor(uint level)
@@ -185,6 +190,9 @@ void preprocessMain(uint3 tid: SV_DispatchThreadID)
     float a = covariance2D[0][0] + 0.3;
     float b = covariance2D[0][1];
     float c = covariance2D[1][1] + 0.3;
+    float detUnfiltered = max(covariance2D[0][0] * covariance2D[1][1] - b * b, 0.0);
+    float compensation = sqrt(detUnfiltered / max(a * c - b * b, 1e-12));
+    opacity *= lerp(1.0, compensation, splatMipFilter);
 
     // The ellipse's axes are the eigenvectors of the 2D covariance.
     float mid = 0.5 * (a + c);
@@ -223,7 +231,10 @@ void preprocessMain(uint3 tid: SV_DispatchThreadID)
     {
         projected[slot] = splat;
         drawnSplats[slot] = uint2(i, instance);
-        sortKeys[slot] = -t.z;
+        // By the distance to the eye, not the view depth: an order that turning the camera
+        // doesn't change (only moving it does), so overlapping splats don't swap -- and pop --
+        // as the view turns (as StopThePop, Radl et al. 2024, notes of view-depth sorting).
+        sortKeys[slot] = -length(t);
         sortValues[slot] = slot;
     }
 }

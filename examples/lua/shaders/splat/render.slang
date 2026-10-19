@@ -8,6 +8,12 @@
 // with other passes by depth: where a splat is at least fairly opaque, it writes the
 // splat's depth (its center's, for the whole splat), and depth testing keeps the nearest.
 //
+// depthBlendFragmentMain draws them, blended as the colors are (premultiplied, back to
+// front), into an rgba16f target as (view depth x alpha, 0, 0, alpha): the result's red over
+// its alpha is the depth of what the pixel shows, weighted as the colors are -- smooth, and
+// wherever the splats cover it together, however faint each (splat/depth-resolve.slang turns
+// it into a depth). What the composite, the screen-space effects and TAA rely on.
+//
 // Clipping (clip.slang): a splat across the clip field's surface is clipped per pixel --
 // its vertices hand the fragments which splat it is, and each fragment finds where the
 // splat is densest along its own ray, and clips there.
@@ -99,6 +105,19 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         discard;
     }
     return float4(input.color.rgb * alpha, alpha);
+}
+
+[shader("fragment")]
+float4 depthBlendFragmentMain(VertexOutput input) : SV_Target
+{
+    float alpha = min(0.99, input.color.a * exp(-4.5 * dot(input.offset, input.offset)));
+    if (alpha < 1.0 / 255.0 || clippedAway(input))
+    {
+        discard;
+    }
+    // The splat's center's view depth: the quad's z/w (the same at every vertex), undone.
+    float viewZ = kDepthNear * kDepthFar / (kDepthFar - input.position.z * (kDepthFar - kDepthNear));
+    return float4(viewZ * alpha, 0, 0, alpha);
 }
 
 // How opaque a splat has to be at a pixel to count as a surface in the depth buffer.

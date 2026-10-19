@@ -106,6 +106,7 @@ return function(setTitle, order)
         values = values or settings.load()
         scenes.renderer.shadowFaceSize = settings.SHADOW_FACE_SIZES[values.shadowQuality]
         scenes.renderer.effects = { ao = values.ambientOcclusion ~= "Off", aoMethod = values.ambientOcclusion, gi = values.ssgi, quality = values.effectsQuality }
+        scenes.renderer.taa = values.temporalAA ~= false
         menu = menu or pauseMenu.new {
             settings = values,
             onPause = function(paused)
@@ -119,6 +120,9 @@ return function(setTitle, order)
                 elseif name == "shadowQuality" then
                     scenes.renderer.shadowFaceSize = settings.SHADOW_FACE_SIZES[values.shadowQuality]
                     load(index) -- the shadow maps are part of the scene's graph
+                elseif name == "temporalAA" then
+                    scenes.renderer.taa = values.temporalAA
+                    load(index) -- TAA's passes are part of the scene's graph
                 elseif name == "ambientOcclusion" or name == "ssgi" or name == "effectsQuality" then
                     scenes.renderer.effects = { ao = values.ambientOcclusion ~= "Off", aoMethod = values.ambientOcclusion, gi = values.ssgi, quality = values.effectsQuality }
                     if values.ambientOcclusion == "Off" and not values.ssgi and showMode > 5 and showMode < 9 then

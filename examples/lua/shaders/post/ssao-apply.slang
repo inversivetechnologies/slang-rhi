@@ -16,6 +16,8 @@ Texture2D<float4> litColor; // the view's merged image, linear
 Texture2D<float4> aoEffects;
 Texture2D<float4> giEffects;
 uniform float giStrength;
+uniform uint splatGiCached; // 1: where a splat is nearest, it has its indirect light already
+                            // (cached per splat: splat/lighting.slang), so none is added
 uniform uint outputEncodeGamma; // 1 if the destination doesn't do the sRGB encoding itself
 uniform uint showMode;          // as the depth composite's: 0 everything; 5 the AO, 6 the GI,
                                 // 7 the meshes' motion vectors
@@ -84,6 +86,8 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     {
         visibility = upsample(aoEffects, pixel, z, size).a;
         indirect = upsample(giEffects, pixel, z, size).rgb * giStrength;
+        if (splatGiCached != 0 && viewDistance(splatDepth.Load(int3(pixel, 0))) <= z * 1.0001)
+            indirect = float3(0, 0, 0);
     }
 
     float3 color;

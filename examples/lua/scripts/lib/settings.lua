@@ -10,6 +10,7 @@
 --   ambientOcclusion  "Off", "SSAO" or "GTAO" (post/ssao.slang)
 --   ssgi            screen-space indirect light
 --   effectsQuality  "Half", "Mixed" (AO at full resolution, GI at half) or "Full"
+--   temporalAA      true / false: the main view stabilized over frames (post/taa.slang)
 
 local json = rhi.include("lib/scene/json.lua")
 
@@ -28,6 +29,7 @@ local DEFAULTS = {
     ambientOcclusion = "GTAO",
     ssgi = false,
     effectsQuality = "Half",
+    temporalAA = true,
 }
 
 local function path()
