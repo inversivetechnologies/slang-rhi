@@ -24,6 +24,17 @@ function system.load(ctx)
     ctx.muted = false
 end
 
+-- The pause menu: paused sounds go on where they were.
+function system.setPaused(ctx, paused)
+    for _, s in ipairs(ctx.sounds) do
+        if paused then
+            s.handle:pause()
+        elseif s.spec.autoplay then
+            s.handle:play()
+        end
+    end
+end
+
 function system.enter(ctx)
     for _, s in ipairs(ctx.sounds) do
         if s.spec.autoplay then s.handle:play() end

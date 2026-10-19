@@ -64,3 +64,6 @@ function on_key(key, action)
         current = (current - 2) % #shaders + 1
     end
 end
+
+-- Escape: the pause menu (lib/pause.lua): resume, settings, quit.
+rhi.include("lib/pause.lua").install()

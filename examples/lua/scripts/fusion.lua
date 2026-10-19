@@ -16,3 +16,9 @@ function on_mouse_button(button, action, mods) fusion.on_mouse_button(button, ac
 function on_mouse_move(x, y) fusion.on_mouse_move(x, y) end
 function on_scroll(x, y) fusion.on_scroll(x, y) end
 function on_resize(width, height) fusion.on_resize(width, height) end
+
+-- Escape: the pause menu (lib/pause.lua): resume, settings, quit.
+rhi.include("lib/pause.lua").install {
+    only = { "resolution", "fullscreen", "splatBudget", "shadowQuality" },
+    apply = function(values) splat.setBudget(values.splatBudget) end,
+}

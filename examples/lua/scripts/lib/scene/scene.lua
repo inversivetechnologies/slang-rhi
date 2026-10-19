@@ -2,8 +2,8 @@
 -- and its render graph (lib/scene/renderer.lua).
 --
 --   local scenes = rhi.include("lib/scene/scene.lua")
---   local scene = scenes.load("scenes/composite.json", overlays) -- overlays: optional,
---                                                    -- lib/scene/overlays.lua
+--   local scene = scenes.load("scenes/composite.json", layers) -- layers: optional, drawn
+--                       -- over everything (lib/scene/overlays.lua, lib/pause-menu.lua)
 --   scene:enter()            -- hands the graph (and physics, sounds) to the host
 --   scene:update(dt)         -- behaviors and cameras, every frame
 --   scene:on_key(...)        -- input goes to the systems, the first to want it takes it
@@ -31,10 +31,10 @@ local scenes = { systems = SYSTEMS, renderer = renderer }
 local Scene = {}
 Scene.__index = Scene
 
-function scenes.load(path, overlays)
+function scenes.load(path, layers)
     local world, settings, name = loader.load(path, SYSTEMS)
     local ctx = { world = world, settings = settings, name = name, path = path, cameraProviders = {},
-                  overlays = overlays }
+                  layers = layers or {} }
     for _, system in ipairs(SYSTEMS) do
         if system.load then system.load(ctx) end
     end
@@ -69,7 +69,7 @@ end
 
 function Scene:layout(width, height)
     each(self, "layout", width, height)
-    if self.ctx.overlays then self.ctx.overlays:layout(width, height) end
+    for _, layer in ipairs(self.ctx.layers) do layer:layout(width, height) end
 end
 
 function Scene:update(dt)
@@ -87,6 +87,11 @@ function Scene:toggleInsets()
     for _, view in ipairs(self.ctx.views) do
         if view.inset and view.framePass then view.framePass.enabled = not view.framePass.enabled end
     end
+end
+
+-- Pausing (the pause menu): systems with a `setPaused` hook (sounds) stop and go on.
+function Scene:setPaused(paused)
+    each(self, "setPaused", paused)
 end
 
 function Scene:setShowMode(mode)

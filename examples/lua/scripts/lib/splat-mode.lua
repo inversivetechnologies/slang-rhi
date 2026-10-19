@@ -729,6 +729,12 @@ return function(setTitle, file)
         if music then music:pause() end
     end
 
+    -- The pause menu (lib/pause.lua): the music stops, and goes on where it was.
+    function splat.setPaused(paused)
+        if not music then return end
+        if paused then music:pause() else music:play() end
+    end
+
     -- Input: changes parameter blocks only; the graph itself never changes.
 
     local function updateView()

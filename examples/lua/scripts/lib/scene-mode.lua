@@ -75,7 +75,8 @@ return function(setTitle)
     -- texture is relative to the window (the same, so it isn't stretched).
     local INSET = { 0.68, 0.66, 0.30, 0.30 }
 
-    local SHADOW_FACE_SIZE = 512 -- texels per cube face; the atlas is 3 x 2 faces
+    -- Texels per cube face (the atlas is 3 x 2 faces): the pause menu's shadow quality.
+    local SHADOW_FACE_SIZE = rhi.include("lib/settings.lua").shadowFaceSize()
     local VERTEX_SIZE = 32       -- sizeof(MeshVertex)
 
     -- ---------------------------------------------------------------------------------

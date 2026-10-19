@@ -10,6 +10,8 @@
 --   V                       show everything / meshes / splats / SDFs / depth buffers
 --   Tab                     hide / show the insets
 --   O                       2D overlays (ShaderToy shaders in a panel): none, each in turn
+--   Escape                  the pause menu: resume, settings (resolution, fullscreen, max
+--                           splats, shadow quality), quit
 --   everything else         the scene's: see the README's table of scenes
 --
 -- Edit this script, a scene or prefab file, or any of the shaders while it runs; they
@@ -42,6 +44,7 @@ end
 function update(time, dt) viewer.update(time, dt) end
 
 function on_key(key, action, mods)
+    if viewer.menu_key(key, action, mods) then return end -- the pause menu first
     if action == input.PRESS and (key == keys.RIGHT or key == keys.LEFT) then
         viewer.step(key == keys.RIGHT and 1 or -1)
         return

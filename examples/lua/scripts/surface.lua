@@ -12,3 +12,6 @@ end
 function draw(frame)
     frame:clear(grey, grey, grey)
 end
+
+-- Escape: the pause menu (lib/pause.lua): resume, settings, quit.
+rhi.include("lib/pause.lua").install()

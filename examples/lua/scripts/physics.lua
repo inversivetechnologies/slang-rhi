@@ -18,3 +18,8 @@ function on_mouse_move(x, y) physics.on_mouse_move(x, y) end
 function on_scroll(x, y) physics.on_scroll(x, y) end
 function update(time, dt) physics.update(time, dt) end
 function on_controller_button(slot, button, pressed) physics.on_controller_button(slot, button, pressed) end
+
+-- Escape: the pause menu (lib/pause.lua): resume, settings, quit.
+rhi.include("lib/pause.lua").install {
+    only = { "resolution", "fullscreen", "shadowQuality" },
+}

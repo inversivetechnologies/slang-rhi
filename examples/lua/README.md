@@ -47,6 +47,8 @@ examples/lua/
                        raymarching pass (raymarch)
     post/              full-screen passes (composite, depth-composite, crosshair)
     shader-toy/        the ShaderToy framework (shader-toy.slang) and the toys
+    ui/                2D user interface: rectangles and text (ui), the bitmap font (font)
+  tools/               make-font.py: generates shaders/ui/font.slang
   assets/              data files the scripts load (gsplats/skull.ply, audio/timelapse.mpeg)
     scenes/            scene files (JSON with comments) for the scene viewer
     prefabs/           prefabs: entities that scenes use and override
@@ -106,9 +108,62 @@ and 2D SDFs.
 | V | show everything / the meshes / the splats / the SDFs / the depth buffers |
 | Tab | hide or show the insets |
 | O | 2D overlays: none, Controller, 2D SDFs |
-| Escape | gives the mouse pointer back (click the window to hide it again) |
+| Escape, Steam Controller Menu | the [pause menu](#the-pause-menu) |
 | F11 | toggles fullscreen |
 | everything else | the scene's: see [the scenes](#the-scenes) |
+
+#### The pause menu
+
+Escape (or the Steam Controller's Menu button) pauses the showcase, the scene viewer or any
+of the standalone scripts, and opens a menu over it: **Resume**, **Settings** and **Quit**. While it is open the scene
+waits: its behaviors and cameras don't update, its physics doesn't step, its sounds pause,
+and the shaders' `time` stops, so everything animated by it holds still too.
+
+| Setting | Choices | |
+| --- | --- | --- |
+| Resolution | the monitor's video modes from 800 x 600 | the window's size; with fullscreen, the monitor's video mode |
+| Fullscreen | Off, On | fullscreen on the primary monitor, at the resolution |
+| Max splats | 250,000 .. 2,000,000 | the splats' budget: the levels of detail fit what is drawn to it (a scene's own `splatBudget`, if lower, still holds) |
+| Shadow quality | Low (256), Medium (512), High (1024), Ultra (2048) | the shadow maps' texels per cube face; the scene (or script) is loaded again with them |
+
+Each script shows the settings it has:
+
+| Script | Settings |
+| --- | --- |
+| `showcase.lua`, `scenes.lua`, `fusion.lua` | all four |
+| `physics.lua`, `scene.lua` | resolution, fullscreen, shadow quality |
+| `splat.lua` | resolution, fullscreen, max splats |
+| `sdf-cache.lua`, `shader-toy.lua`, `surface.lua` | resolution, fullscreen |
+
+| Input | Action |
+| --- | --- |
+| Up / Down, D-pad | choose |
+| Left / Right, D-pad | change a setting |
+| Enter, Space, A | pick a button; a setting's next choice |
+| Escape, B | back a page; from the first, resume |
+| mouse | point to choose; click a button, or a setting's left half (back) or right half (forward) |
+
+- **Saved:** every change applies at once and is saved to
+  `%LOCALAPPDATA%/slang-rhi-lua-settings.json` (`$HOME` elsewhere), and the next run (or
+  reload) starts with it. Delete the file to go back to the defaults.
+- **Files:** `scripts/lib/pause-menu.lua` (the menu), `scripts/lib/settings.lua` (the
+  settings, their file and choices), `scripts/lib/ui.lua` and `shaders/ui/` (drawing).
+- **In a script of your own:** one call at the end of the script, after its callbacks:
+
+  ```lua
+  rhi.include("lib/pause.lua").install {
+      only = { "resolution", "fullscreen", "splatBudget" }, -- default: the first two
+      onPause = function(paused) end,  -- e.g. pause its music
+      apply = function(values) end,    -- after init, and when max splats changes
+  }
+  ```
+
+  It wraps the script's `update`, `draw` and input callbacks. While the menu is open,
+  `update` isn't called and the input goes to the menu. The menu is drawn from `draw`,
+  which runs after the graph, so it shows over either kind of script. A new shadow quality
+  reloads the script (`rhi.reload`); `settings.shadowFaceSize()` gives the size to build
+  shadow maps with.
+- **F11** still toggles a borderless fullscreen at the monitor's current mode.
 
 - **Title:** the window title shows the scene, its entities and systems, and its keys.
 - **Splats:** a scene with splats loads them (about a second for the 454 MB file, once its
@@ -463,6 +518,12 @@ pass's shader, to combine images by depth, or for any screen-space effect.
 | `rhi.device()` | the backend's name, e.g. `"Vulkan"` |
 | `rhi.time()` | seconds since start |
 | `rhi.set_title(text)` | sets the window title; the backend and GPU are appended |
+| `rhi.set_paused(paused)`, `rhi.paused()` | stops (or restarts) the shaders' `time` and the physics; `update` and input still run, with real time. A reload unpauses |
+| `rhi.show_pointer(shown)` | keeps the mouse pointer visible whatever Escape and clicks do (a menu's); `false` hides it over the window again |
+| `rhi.display()` | `{ width, height, fullscreen, modes }`: the window's size, whether it is fullscreen, and the primary monitor's video modes (`{ {w, h}, ... }`, distinct, smallest first) |
+| `rhi.set_display{ width, height, fullscreen }` | sizes the window, or with `fullscreen`, switches the primary monitor to that video mode (the nearest it has) with the window covering it; leaving fullscreen puts the window back where it was. Call it from `update`, not from inside an input callback |
+| `rhi.quit()` | closes the window: the program ends after this frame |
+| `rhi.reload()` | runs the script again from the start before the next frame, as saving it does |
 | `rhi.include(path)` | runs a Lua file (relative to the script) and returns its result; saving that file reloads the script |
 | `rhi.window_srgb()` | `true` if the window's format encodes sRGB itself (as `frame.srgb`, but usable in `init`) |
 | `rhi.window_size()` | the window's size in pixels, `width, height` (usable in `init`) |
@@ -747,7 +808,8 @@ from the Lua values as described in [Shader parameters](#shader-parameters).
 
 Nothing in a graph calls Lua, so anything that moves continuously should be computed in
 the shaders. The host provides `time` (seconds) to every draw and dispatch that declares
-it; see [Shader parameters](#shader-parameters). The scene computes its light's orbit and
+it; see [Shader parameters](#shader-parameters). It counts only while the script isn't
+paused (`rhi.set_paused`), so a pause menu stops everything animated by it. The scene computes its light's orbit and
 the cube's spin from `time`, and Lua only changes the speeds. Lua then only has to react
 to events (input, reloads), never to frames.
 
@@ -1255,6 +1317,7 @@ on each other.
 | `lib/scene/renderer.lua` | the render graph, from what the systems contribute |
 | `lib/scene/scene.lua` | a loaded scene: load, enter, leave, update, input |
 | `lib/scene/overlays.lua` | the [2D overlays](#2d-overlays): ShaderToy shaders in a panel, over any scene |
+| `lib/pause-menu.lua`, `lib/pause.lua`, `lib/settings.lua`, `lib/ui.lua` | the [pause menu](#the-pause-menu), its wrapper for standalone scripts, the settings it saves, and the 2D drawing it uses |
 | `lib/scene-viewer-mode.lua` | the viewer (the showcase; `scenes.lua`) |
 | `scripts/behaviors/*.lua` | behaviors: Lua that entities run |
 
@@ -1972,7 +2035,8 @@ Constants:
   - `LeftPadClick`, `RightTriggerClick`, ...
 
 **Reserved keys**: the host handles Escape (release the pointer) and F11 (fullscreen).
-Scripts still receive these keys.
+Scripts still receive these keys. The scene viewer and the showcase use Escape for their
+pause menu as well.
 
 **Steam desktop mode**: a Steam Controller in desktop mode types arrow keys and Escape. The
 host recognizes those keystrokes and drops them, so the d-pad never reaches `on_key` as

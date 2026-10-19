@@ -126,6 +126,8 @@ public:
     // the mode is only set when it changes.
     bool m_cursorReleased = false;
     bool m_cursorHidden = false;
+    // Set by an example that needs the pointer whatever Escape and clicks did (a menu).
+    bool m_pointerShown = false;
 
     // F11 fullscreen toggle: the windowed placement to put back, and which mode the
     // window is in now.
@@ -731,7 +733,7 @@ static void updateCursorModes()
             continue;
         }
         bool focused = glfwGetWindowAttrib(example->m_window, GLFW_FOCUSED) != 0;
-        bool hide = focused && !example->m_cursorReleased;
+        bool hide = focused && !example->m_cursorReleased && !example->m_pointerShown;
         if (hide != example->m_cursorHidden)
         {
             glfwSetInputMode(

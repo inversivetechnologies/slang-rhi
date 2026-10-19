@@ -31,7 +31,7 @@ return function(setTitle)
         rhi.set_title("Physics | " .. details)
     end
 
-    local SHADOW_FACE_SIZE = 512
+    local SHADOW_FACE_SIZE = rhi.include("lib/settings.lua").shadowFaceSize() -- the pause menu's shadow quality
 
     local world, groups, blocks, graph, player, crosshairPass
     local slowMotion = false

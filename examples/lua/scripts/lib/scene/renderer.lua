@@ -16,8 +16,9 @@
 --                      into a texture for an inset
 --   overlays           systems' passes over the main view (the player's crosshair)
 --   insets             each inset's texture, framed, in its corner of the window
---   2D overlays        the viewer's (lib/scene/overlays.lua), in their panels, all off but
---                      the one shown
+--   layers             the viewer's, over everything: 2D overlays (lib/scene/overlays.lua),
+--                      in their panels, all off but the one shown; the pause menu
+--                      (lib/pause-menu.lua), while it is open
 --
 -- Every surface reads one light block and one shadow block, which systems add to
 -- (`shadowFields`): the SDFs' composition, whether there are splat shadows. So meshes,
@@ -30,7 +31,6 @@
 
 local renderer = {}
 
-local FACE = 512 -- shadow map texels per cube face; the atlases are 3 x 2 faces
 
 local function placeholderFields()
     return {
@@ -65,7 +65,12 @@ local function createTargets(inset)
 end
 
 -- Builds the scene's graph. `ctx` has been loaded by the systems (ctx.views, ctx.light).
+-- Shadow map texels per cube face (the atlases are 3 x 2 faces); the shadow quality
+-- setting changes it, for the graphs built after.
+renderer.shadowFaceSize = 512
+
 function renderer.build(ctx, systems)
+    local FACE = renderer.shadowFaceSize
     local srgb = rhi.window_srgb()
     local background = ctx.settings.background or { 0.015, 0.018, 0.025 }
 
@@ -174,7 +179,8 @@ function renderer.build(ctx, systems)
         end
     end
 
-    if ctx.overlays then ctx.overlays:addPasses(graph) end
+    -- The viewer's layers over everything: 2D overlays, the pause menu.
+    for _, layer in ipairs(ctx.layers or {}) do layer:addPasses(graph) end
     return graph
 end
 

@@ -891,8 +891,19 @@ public:
             m_lastWatchTime = time;
             pollFiles();
         }
+        if (m_reloadRequested)
+        {
+            // rhi.reload(): here, outside the script, rather than from inside its call.
+            m_reloadRequested = false;
+            m_queue->waitOnHost();
+            reloadScript();
+        }
 
-        if (m_physics && !m_physics->paused)
+        if (!m_paused)
+        {
+            m_shaderTime += m_timeDelta;
+        }
+        if (m_physics && !m_physics->paused && !m_paused)
         {
             m_physics->world->step(m_timeDelta * m_physics->timeScale);
         }
@@ -1084,6 +1095,8 @@ public:
         closeScript();
         m_graph.reset(); // the new script sets up its own
         m_physics.reset();
+        m_paused = false; // nor does a pause or a menu's pointer outlive the script
+        m_pointerShown = false;
         m_lua = L;
         m_scriptFailed = false;
         printf("[lua] reloaded '%s'\n", m_scriptPath.filename().string().c_str());
@@ -1855,7 +1868,7 @@ public:
         ShaderCursor time = root["time"];
         if (time.isValid())
         {
-            setNumbers(time, {glfwGetTime()});
+            setNumbers(time, {m_shaderTime});
         }
         ShaderCursor viewportSize = root["viewportSize"];
         if (viewportSize.isValid())
@@ -3694,6 +3707,153 @@ public:
         return 0;
     }
 
+    // rhi.set_paused(paused): stops (or restarts) the `time` the shaders get and the
+    // physics; update() and input still run, with real time. rhi.paused() says which.
+    static int apiSetPaused(lua_State* L)
+    {
+        get(L)->m_paused = lua_toboolean(L, 1) != 0;
+        return 0;
+    }
+
+    static int apiPaused(lua_State* L)
+    {
+        lua_pushboolean(L, get(L)->m_paused);
+        return 1;
+    }
+
+    // rhi.show_pointer(shown): keeps the mouse pointer visible (true) whatever Escape and
+    // clicks do, as a menu needs; false hands it back to them (hidden over the window).
+    static int apiShowPointer(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        app->m_pointerShown = lua_toboolean(L, 1) != 0;
+        if (!app->m_pointerShown)
+        {
+            app->m_cursorReleased = false;
+        }
+        return 0;
+    }
+
+    // rhi.reload(): runs the script again from the start before the next frame, as saving
+    // it does -- for changes its graph is built around (the pause menu's shadow quality).
+    static int apiReload(lua_State* L)
+    {
+        get(L)->m_reloadRequested = true;
+        return 0;
+    }
+
+    // rhi.quit(): closes the window, ending the program after this frame.
+    static int apiQuit(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        if (app->m_window)
+        {
+            glfwSetWindowShouldClose(app->m_window, GLFW_TRUE);
+        }
+        return 0;
+    }
+
+    // rhi.display(): { width, height (the window's size), fullscreen, modes } -- modes are
+    // the primary monitor's sizes, { {width, height}, ... }, distinct, smallest first.
+    static int apiDisplay(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        int width = 0, height = 0;
+        if (app->m_window)
+        {
+            glfwGetWindowSize(app->m_window, &width, &height);
+        }
+        lua_newtable(L);
+        lua_pushinteger(L, width);
+        lua_setfield(L, -2, "width");
+        lua_pushinteger(L, height);
+        lua_setfield(L, -2, "height");
+        lua_pushboolean(L, app->m_fullscreen);
+        lua_setfield(L, -2, "fullscreen");
+        std::vector<std::pair<int, int>> sizes;
+        if (GLFWmonitor* monitor = glfwGetPrimaryMonitor())
+        {
+            int count = 0;
+            const GLFWvidmode* modes = glfwGetVideoModes(monitor, &count);
+            for (int i = 0; i < count; ++i)
+            {
+                sizes.emplace_back(modes[i].width, modes[i].height);
+            }
+        }
+        std::sort(sizes.begin(), sizes.end());
+        sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
+        lua_createtable(L, int(sizes.size()), 0);
+        for (size_t i = 0; i < sizes.size(); ++i)
+        {
+            lua_createtable(L, 2, 0);
+            lua_pushinteger(L, sizes[i].first);
+            lua_rawseti(L, -2, 1);
+            lua_pushinteger(L, sizes[i].second);
+            lua_rawseti(L, -2, 2);
+            lua_rawseti(L, -2, lua_Integer(i + 1));
+        }
+        lua_setfield(L, -2, "modes");
+        return 1;
+    }
+
+    // rhi.set_display{ width, height, fullscreen }: the window's size, or with fullscreen,
+    // the primary monitor's video mode (the nearest it has) with the window covering it.
+    // Leaving fullscreen puts the window back where it was. Missing fields keep theirs.
+    // F11 still toggles the borderless fullscreen of the monitor's current mode.
+    static int apiSetDisplay(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        luaL_checktype(L, 1, LUA_TTABLE);
+        if (!app->m_window)
+        {
+            return 0;
+        }
+        int width = 0, height = 0;
+        glfwGetWindowSize(app->m_window, &width, &height);
+        width = int(readFloat(L, 1, "width", float(width)));
+        height = int(readFloat(L, 1, "height", float(height)));
+        bool fullscreen = app->m_fullscreen;
+        if (lua_getfield(L, 1, "fullscreen") != LUA_TNIL)
+        {
+            fullscreen = lua_toboolean(L, -1) != 0;
+        }
+        lua_pop(L, 1);
+        if (width <= 0 || height <= 0)
+        {
+            return 0;
+        }
+
+        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+        if (fullscreen && monitor)
+        {
+            if (!app->m_fullscreen)
+            {
+                glfwGetWindowPos(app->m_window, &app->m_windowedRect[0], &app->m_windowedRect[1]);
+                glfwGetWindowSize(app->m_window, &app->m_windowedRect[2], &app->m_windowedRect[3]);
+            }
+            glfwSetWindowMonitor(app->m_window, monitor, 0, 0, width, height, GLFW_DONT_CARE);
+            app->m_fullscreen = true;
+        }
+        else if (app->m_fullscreen)
+        {
+            glfwSetWindowMonitor(
+                app->m_window,
+                nullptr,
+                app->m_windowedRect[0],
+                app->m_windowedRect[1],
+                width,
+                height,
+                GLFW_DONT_CARE
+            );
+            app->m_fullscreen = false;
+        }
+        else
+        {
+            glfwSetWindowSize(app->m_window, width, height);
+        }
+        return 0;
+    }
+
     // -----------------------------------------------------------------------------------
     // API: input.*
     // -----------------------------------------------------------------------------------
@@ -4111,6 +4271,13 @@ public:
             {"device", apiDevice},
             {"time", apiTime},
             {"set_title", apiSetTitle},
+            {"set_paused", apiSetPaused},
+            {"paused", apiPaused},
+            {"show_pointer", apiShowPointer},
+            {"quit", apiQuit},
+            {"reload", apiReload},
+            {"display", apiDisplay},
+            {"set_display", apiSetDisplay},
             {"window_size", apiWindowSize},
             {"sound", apiSound},
             {"sampler", apiSampler},
@@ -4365,6 +4532,10 @@ public:
 
     double m_time = 0.0;
     double m_timeDelta = 0.0;
+    // rhi.set_paused: the shaders' `time` and the physics stop; the script still runs.
+    bool m_paused = false;
+    double m_shaderTime = 0.0; // the `time` builtin: seconds run while not paused
+    bool m_reloadRequested = false; // rhi.reload(), done at the next update
 
     // Hot reload.
     static constexpr double kWatchInterval = 0.15; // seconds between checks

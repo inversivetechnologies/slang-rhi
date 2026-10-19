@@ -14,3 +14,6 @@ function on_key(key, action, mods) cache.on_key(key, action, mods) end
 function on_mouse_button(button, action, mods) cache.on_mouse_button(button, action, mods) end
 function on_mouse_move(x, y) cache.on_mouse_move(x, y) end
 function on_scroll(x, y) cache.on_scroll(x, y) end
+
+-- Escape: the pause menu (lib/pause.lua): resume, settings, quit.
+rhi.include("lib/pause.lua").install()

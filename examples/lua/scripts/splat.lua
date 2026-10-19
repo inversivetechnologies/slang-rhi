@@ -16,3 +16,10 @@ function on_key(key, action, mods) splat.on_key(key, action, mods) end
 function on_mouse_button(button, action, mods) splat.on_mouse_button(button, action, mods) end
 function on_mouse_move(x, y) splat.on_mouse_move(x, y) end
 function on_scroll(x, y) splat.on_scroll(x, y) end
+
+-- Escape: the pause menu (lib/pause.lua): resume, settings, quit.
+rhi.include("lib/pause.lua").install {
+    only = { "resolution", "fullscreen", "splatBudget" },
+    onPause = function(paused) splat.setPaused(paused) end,
+    apply = function(values) splat.setBudget(values.splatBudget) end,
+}
