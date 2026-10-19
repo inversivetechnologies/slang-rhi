@@ -79,6 +79,7 @@ renderer.EFFECT_PARAMS = {
     aoStrength = 1.6, -- SSAO's: 1 black where fully occluded
     gtaoPower = 1.5,  -- GTAO's: its visibility raised to this
     giRadius = 2.5, giStrength = 2.5,
+    historyClip = 1.25, -- the temporal pass's clamp, in standard deviations (0: off)
 }
 
 -- Tiled light culling (scene/light-culling.slang): the tiles a main view's buffer holds,
@@ -150,6 +151,7 @@ function renderer.build(ctx, systems)
             depthNear = 0.1, depthFar = 100,
             aoRadius = p.aoRadius, aoStrength = p.aoStrength, giRadius = p.giRadius,
             aoMethod = fx.aoMethod == "GTAO" and 1 or 0, gtaoPower = p.gtaoPower,
+            historyClip = p.historyClip,
             frameIndex = 0,
         }
         ctx.effectsNodes = {} -- the main view's, timed

@@ -304,7 +304,15 @@ has two (AO at full resolution, GI at half), the others one.
   - **Splats** don't move (their clip shapes do, which changes what is shown, not where).
 
   V shows the bodies' motion vectors too ("motion vectors": the motion's size per axis,
-  a body moving 1 cm a frame at 0.3). A resize or a new graph starts the
+  a body moving 1 cm a frame at 0.3).
+- **History clipping:** what stays where it was but changes -- the floor a box slid off,
+  a wall a lamp moved away from -- passes reprojection and the depth test, so its history
+  is taken, and the old AO or light fades out over about ten frames: a trail. The temporal
+  pass clamps the history to the current frame's 3 x 3 neighborhood, its mean plus or minus
+  1.25 standard deviations per channel (Salvi 2016; `historyClip` in
+  `renderer.EFFECT_PARAMS`, 0 to turn it off). The current frame is already blurred, so the
+  window is tight where the result is flat: a change bigger than the noise is taken at
+  once, and the noise is still averaged away. A resize or a new graph starts the
   history over too. While the pause menu is open the frames go on accumulating, so a
   paused image settles to its smoothest.
 - **Depth-aware upsampling:** at half resolution, each pixel takes the 4 nearest effect

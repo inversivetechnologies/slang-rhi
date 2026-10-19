@@ -56,6 +56,11 @@ uniform uint frameIndex;  // turns the samples a little each frame
 // The temporal pass's (the view's temporal block).
 uniform EffectsCamera prevCamera; // the last frame's camera
 uniform uint historyValid;        // 0: no frames before (just built, or resized)
+// History clipping (Salvi 2016): the history is clamped to this many standard deviations
+// about the mean of the current frame's 3 x 3 neighborhood, per channel; 0 turns it off.
+// What stays where it was but changed -- the floor a box slid off, a wall a light moved
+// away from -- passes reprojection and depth, and without it fades out over ~10 frames.
+uniform float historyClip;
 
 // What moved: the bodies, per pixel (the motion pass: the previous world position minus the
 // current, where a body is the nearest mesh), and the SDF composition, turning about its
@@ -333,8 +338,29 @@ float4 computeTemporal(uint2 tid, Texture2D<float4> current, Texture2D<float4> h
     if (weights < 0.25)
         return now; // newly seen: nothing to go on
     // Where only some of the texels agree, the history counts for less.
+    float4 kept = sum / weights;
+    if (historyClip > 0)
+    {
+        // The current frame's spread here (it is blurred already, so tight where flat):
+        // a history outside it is out of date, and comes in to its edge.
+        float4 mean = float4(0, 0, 0, 0), meanSquares = float4(0, 0, 0, 0);
+        for (int y = -1; y <= 1; ++y)
+        {
+            for (int x = -1; x <= 1; ++x)
+            {
+                int2 n = clamp(int2(tid) + int2(x, y), int2(0, 0), int2(viewportSize) - 1);
+                float4 c = current.Load(int3(n, 0));
+                mean += c;
+                meanSquares += c * c;
+            }
+        }
+        mean /= 9.0;
+        float4 sigma = sqrt(max(meanSquares / 9.0 - mean * mean, 0.0));
+        float4 extent = historyClip * sigma + float4(0.002, 0.002, 0.002, 0.01);
+        kept = clamp(kept, mean - extent, mean + extent);
+    }
     float keep = kHistoryWeight * saturate(weights);
-    return lerp(now, sum / weights, keep);
+    return lerp(now, kept, keep);
 }
 
 [shader("compute")]
