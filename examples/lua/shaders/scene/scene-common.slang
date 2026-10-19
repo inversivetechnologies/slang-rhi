@@ -29,6 +29,50 @@ float3 lightPosition()
     return light.center + float3(cos(angle) * light.orbitRadius, light.bob * sin(angle * 1.7), sin(angle) * light.orbitRadius);
 }
 
+// ---------------------------------------------------------------------------------------
+// More point lights, beside the one above: unshadowed, placed by Lua each frame (the light
+// system: lib/scene/systems/light.lua), and added by every kind of surface -- the meshes
+// (lit.slang), the SDFs (sdf/raymarch.slang), the splats (splat/lighting.slang) -- with the
+// same falloff as the shadowed light. A few multiply-adds a light a shaded point: no pass,
+// map or buffer of their own.
+// ---------------------------------------------------------------------------------------
+
+static const uint kMaxPointLights = 8;
+
+struct ExtraLight
+{
+    float3 position;
+    float range;     // reaches no further
+    float3 color;
+    float intensity;
+};
+uniform ExtraLight pointLights[kMaxPointLights];
+uniform uint pointLightCount;
+
+// The light they add at `world`, with its normal, toward the eye, and albedo, as lit.slang
+// shades. `specularScale` 0 leaves out the highlight; `normalTrust` below 1 fades the
+// diffuse term toward 0.5 (a splat whose normal means little).
+float3 pointLightsRadiance(float3 world, float3 normal, float3 toEye, float3 albedo, float specularScale, float normalTrust)
+{
+    float3 sum = float3(0, 0, 0);
+    for (uint i = 0; i < min(pointLightCount, kMaxPointLights); ++i)
+    {
+        ExtraLight l = pointLights[i];
+        float3 toLight = l.position - world;
+        float distanceToLight = length(toLight);
+        if (distanceToLight >= l.range)
+            continue;
+        toLight /= max(distanceToLight, 1e-4);
+        float window = saturate(1.0 - pow(distanceToLight / l.range, 4.0));
+        float attenuation = l.intensity * window * window / (1.0 + distanceToLight * distanceToLight);
+        float facing = saturate(dot(normal, toLight));
+        float diffuse = lerp(0.5, facing, normalTrust);
+        float specular = specularScale * pow(saturate(dot(normal, normalize(toLight + toEye))), 48.0) * 0.5 * (facing > 0 ? 1 : 0);
+        sum += (albedo * diffuse + specular) * l.color * attenuation;
+    }
+    return sum;
+}
+
 // Where an object sits: scaled, turned about the vertical axis, then moved.
 struct Transform
 {

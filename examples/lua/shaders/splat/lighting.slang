@@ -83,9 +83,14 @@ void lightSplatsMain(uint3 tid: SV_DispatchThreadID)
     float attenuation = light.intensity * window * window / (1.0 + distanceToLight * distanceToLight);
     float diffuse = lerp(0.5, saturate(dot(normal, toLight)), saturate(flatness));
     float3 albedo = pow(max(captured, 0.0), 2.2);
-    float3 lit = albedo * float3(0.05, 0.06, 0.08) + albedo * diffuse * light.color * attenuation * visibility;
+    // The unshadowed point lights: a diffuse term only, trusted as far as the normal is.
+    float3 toEye = normalize(camera.eye - world);
+    float3 extra = pointLightsRadiance(world, normal, toEye, albedo, 0.0, saturate(flatness));
+    float3 lit = albedo * float3(0.05, 0.06, 0.08) + albedo * diffuse * light.color * attenuation * visibility + extra;
     lit = lit / (1.0 + lit);
     float3 relit = pow(max(lit, 0.0), 1.0 / 2.2); // max: fxc can't tell lit >= 0
+    // As captured, the point lights still add on (in linear light, then back).
+    shadowed = pow(pow(max(shadowed, 0.0), 2.2) + extra, 1.0 / 2.2);
 
     splat.color.rgb = lerp(shadowed, relit, relight);
     if (showVisibility != 0)

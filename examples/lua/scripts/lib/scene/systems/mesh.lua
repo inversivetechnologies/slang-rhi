@@ -4,7 +4,7 @@
 --   "mesh": { "shape": "box" | "sphere", "size": [x, y, z] (a box's, whole),
 --             "radius": 0.5 (a sphere's), "color": [r, g, b],
 --             "pattern": 0 (plain) | 1 (stripes) | 2 (checker, on the floor) |
---                        3 (checker, on every face) }
+--                        3 (checker, on every face) | 4 (emissive: its color, unlit) }
 --   "body": { "motion": "static" | "dynamic" | "kinematic", "density": 1000 (kg/m^3),
 --             "friction": 0.5, "restitution": 0, "velocity": [x, y, z],
 --             "angularVelocity": [x, y, z] }

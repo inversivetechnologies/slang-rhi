@@ -1,7 +1,9 @@
 // The depth composite (`fusion.lua`) as a scene: meshes, the skull's splats and an SDF
 // sculpture, each rendered on its own and merged by depth, lit and shadowed by one light
-// that orbits them; a second camera in the corner. Keys: the splats' (splat-controls.lua:
-// L lighting, , . budget, / LOD tint, [ ] size) and the SDFs' (sdf-controls.lua: J K blend).
+// that orbits them, and lit by three colored lamps (point lights without shadows) that
+// circle the skull, the sculpture and the ball; a second camera in the corner. Keys: the
+// splats' (splat-controls.lua: L lighting, , . budget, / LOD tint, [ ] size) and the
+// SDFs' (sdf-controls.lua: J K blend).
 {
     "name": "Depth composite",
     "settings": { "background": [0.015, 0.018, 0.025] },
@@ -9,6 +11,18 @@
         { "id": "light", "transform": { "position": [0, 0.4, 0] },
           "light": { "color": [1.0, 0.85, 0.65], "intensity": 9, "range": 14, "orbitRadius": 2.3,
                      "speed": 0.5, "phase": 0.8, "bob": 0.4 } },
+
+        // The lamps: point lights after the first light, lighting meshes, SDFs and splats
+        // alike (scene-common.slang's pointLights).
+        { "id": "red lamp", "prefab": "lamp", "transform": { "position": [-0.2, -0.75, 1.5] },
+          "light": { "color": [1.0, 0.22, 0.12], "orbitRadius": 1.6, "speed": 0.9, "phase": 0.0, "bob": 0.25 },
+          "mesh": { "color": [1.0, 0.22, 0.12] } },
+        { "id": "cyan lamp", "prefab": "lamp", "transform": { "position": [1.85, -0.6, 1.25] },
+          "light": { "color": [0.15, 0.85, 1.0], "orbitRadius": 0.9, "speed": -1.2, "phase": 2.0, "bob": 0.3 },
+          "mesh": { "color": [0.15, 0.85, 1.0] } },
+        { "id": "green lamp", "prefab": "lamp", "transform": { "position": [-1.2, -0.8, 0.3] },
+          "light": { "color": [0.35, 1.0, 0.25], "orbitRadius": 1.2, "speed": 0.7, "phase": 4.0, "bob": 0.2 },
+          "mesh": { "color": [0.35, 1.0, 0.25] } },
 
         { "id": "floor", "prefab": "floor", "transform": { "position": [0, -1.25, 0] } },
         { "id": "ball", "transform": { "position": [-1.2, -0.2, 0.3] },

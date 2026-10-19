@@ -218,7 +218,7 @@ Each scene stands for one of the examples; its keys come from behaviors in the s
 | --- | --- | --- | --- |
 | `physics.scene` | `physics.lua` | the ramp, the dominoes, the pyramid, the tower, the player | the player's; B drop boxes; P pause, T slow motion, R reset |
 | `splats.scene` | `splat.lua` | a grid of skulls carved per pixel by moving shapes, with music | `,` `.` budget, `/` LOD tint, `[` `]` size, L lighting, C clip mode, M mute |
-| `composite.scene` | `fusion.lua` | meshes, the skull's splats and an SDF sculpture merged by depth, a second camera in the corner | the splats' (as above, but C), J K blend |
+| `composite.scene` | `fusion.lua` | meshes, the skull's splats and an SDF sculpture merged by depth, three colored lamps circling them, a second camera in the corner | the splats' (as above, but C), J K blend |
 | `sdf-benchmark.scene` | `sdf-cache.lua` | a turning spiral of 64 shapes around a core, 129 nodes, cached | C DAG / cache / cache error, `[` `]` resolution, B benchmark, J K blend, Space stop the camera |
 | `sdf-gallery.scene` | | three SDF sculptures and an arch, baked into one cache | as `sdf-benchmark.scene` |
 
@@ -1456,8 +1456,8 @@ missing required field stops the load, with the entity and the field in the mess
 
 | Component | Fields (defaults) | System |
 | --- | --- | --- |
-| `light` | `color`, `intensity` (9), `range` (14), `orbitRadius` (0), `speed` (0, radians per second), `phase`, `bob` | one point light, orbiting the entity's position; one per scene |
-| `mesh` | `shape` ("box" or "sphere"), `size` (a box's, whole: [1, 1, 1]), `radius` (0.5), `color`, `pattern` (0 plain, 1 stripes, 2 checker on the floor, 3 checker on every face) | instanced, lit and shadowed boxes and spheres |
+| `light` | `color`, `intensity` (9), `range` (14), `orbitRadius` (0), `speed` (0, radians per second), `phase`, `bob` | a point light, orbiting the entity's position: the scene's first is its key light, shadowing everything; up to 8 more are [point lights without shadows](#more-lights), and move a visual mesh of their entity along with them |
+| `mesh` | `shape` ("box" or "sphere"), `size` (a box's, whole: [1, 1, 1]), `radius` (0.5), `color`, `pattern` (0 plain, 1 stripes, 2 checker on the floor, 3 checker on every face, 4 emissive: its color, unlit) | instanced, lit and shadowed boxes and spheres |
 | `body` | `motion` ("dynamic", "static", "kinematic"), `density` (1000), `friction` (0.5), `restitution` (0), `velocity`, `angularVelocity` | a Jolt body for the mesh; without it, the mesh is visual (placed by Lua) |
 | `splat` | `file` (required), `fit` (a radius to scale to; 0: as is), `grid` ([nx, nz] copies), `spacing`, `turn` (degrees per copy), `clip` (`mode` "carve" or "keep", `shapes`: spheres and boxes with `position`, `move`, `speed`, `spin`) | Gaussian splats with LOD, lighting, shadows, clipping; one renderer per file, entities as its instances |
 | `sdf` | `shape` (required: a node, below), `cache` (0: the DAG; or voxels a side), `sharpness` (8, of soft shadows), `blend` (0: how smoothly the entities' shapes join one another) | all entities' shapes as one composition, raymarched (timed on the GPU), shadowing everything; cached if any asks |
@@ -1523,6 +1523,30 @@ return true when they handle the event), `addOverlays(graph)`, `enter()`, `leave
   shadow block. Systems add their fields to the shadow block: the SDF composition, whether
   splats cast shadows. So meshes, splats and SDFs light and shadow one another the same way
   in every scene, whatever is in it.
+
+#### More lights
+
+A scene's first `light` is its key light, lit and shadowed as before. Every `light` after
+it (up to 8) is a point light without shadows: `pointLights` in the same light block
+(`scene/scene-common.slang`), added by every kind of surface as it is shaded:
+
+| Surface | Where | |
+| --- | --- | --- |
+| meshes | `scene/lit.slang` | diffuse and specular, as the key light's |
+| SDFs | `sdf/raymarch.slang` | the same, at the hit |
+| splats | `splat/lighting.slang` | diffuse only, trusted as far as the splat's normal is (as the key light's), lit or as captured |
+
+- **Why it's cheap:** one function (`pointLightsRadiance`) loops over the lights where each
+  technique already shades a point: a few multiply-adds per light, and no pass, shadow map
+  or buffer of their own. In the composite scene, at 1600 x 900, the raymarching took the
+  same time with its three lamps as without, within the GPU's timing noise.
+- **Motion:** the light system works out their orbits in Lua each frame (so they stop
+  with the pause menu) and writes them into the block. An entity with a light and a mesh
+  without a body has the mesh moved along: with `"pattern": 4` (emissive) it marks the
+  light. `assets/prefabs/lamp.prefab` is one: a small glowing sphere with a light; an
+  instance sets both colors.
+- **No shadows:** they light through everything, so keep their `range` short. The key
+  light's shadows and the screen-space effects (AO, SSGI) still apply to what they light.
 - **Missing surfaces:** with no SDFs or no splats, their targets stay empty and the
   composite passes them over. The splats' depth buffer is cleared every frame, since the
   composite reads it.

@@ -7,7 +7,8 @@ struct Material
 {
     float3 albedo;
     uint pattern;   // 0: plain, 1: the mesh's quad grid, 2: a checkerboard on the floor,
-                    // 3: a checkerboard on every face (4 squares a meter, in the world)
+                    // 3: a checkerboard on every face (4 squares a meter, in the world),
+                    // 4: emissive: its color, unlit (a light's marker)
     float emissive; // 1: unlit, glows in the light's color (the light's marker)
 };
 
@@ -95,6 +96,10 @@ float4 shade(VertexOutput input, Material m)
     {
         color = light.color * 1.5;
     }
+    else if (m.pattern == 4)
+    {
+        color = m.albedo * 1.5;
+    }
     else
     {
         float3 albedo = m.albedo;
@@ -131,6 +136,7 @@ float4 shade(VertexOutput input, Material m)
 
         float3 ambient = albedo * float3(0.05, 0.06, 0.08);
         color = ambient + (albedo * diffuse + specular) * light.color * attenuation * shadow;
+        color += pointLightsRadiance(input.world, normal, toEye, albedo, 1.0, 1.0); // the unshadowed ones
     }
 
     color = color / (1.0 + color); // tone map: keep highlights from clipping

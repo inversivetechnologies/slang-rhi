@@ -1,0 +1,7 @@
+// A small point light with a glowing marker: an unshadowed point light (any light after a
+// scene's first), and a mesh without a body ("pattern": 4: emissive) that the light
+// system moves along its orbit. An instance gives both the same color.
+{
+    "light": { "color": [1, 1, 1], "intensity": 3.5, "range": 4.5 },
+    "mesh": { "shape": "sphere", "radius": 0.09, "color": [1, 1, 1], "pattern": 4 },
+}
