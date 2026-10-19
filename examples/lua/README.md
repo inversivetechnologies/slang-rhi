@@ -98,8 +98,8 @@ and exits. It doesn't fall back to another API.
 ### The showcase
 
 The showcase is the [scene viewer](#the-scenes): the scene files in `assets/scenes/`, one at
-a time, in this order: the physics, the splats, the depth composite, the SDF benchmark,
-the SDF gallery (and any other scene files after them). O puts a
+a time, in this order: the physics, the splats, the depth composite, the many lights, the
+SDF benchmark, the SDF gallery (and any other scene files after them). O puts a
 [2D overlay](#2d-overlays) over whichever scene is shown: the ShaderToy shaders Controller
 and 2D SDFs.
 
@@ -108,7 +108,7 @@ and 2D SDFs.
 | Left / Right arrow, Page Up / Page Down | previous / next scene |
 | `1` .. `9` | jump to a scene |
 | Steam Controller LB / RB | previous / next scene |
-| V | show everything / the meshes / the splats / the SDFs / the depth buffers (/ the ambient occlusion / the indirect light / the bodies' motion vectors, with the effects on) |
+| V | show everything / the meshes / the splats / the SDFs / the depth buffers (/ the ambient occlusion / the indirect light / the bodies' motion vectors, with the effects on / the light tiles, with point lights) |
 | Tab | hide or show the insets |
 | O | 2D overlays: none, Controller, 2D SDFs |
 | Escape, Steam Controller Menu | the [pause menu](#the-pause-menu) |
@@ -207,7 +207,7 @@ depth](#example-combining-passes-by-depth).
 | Input | Action |
 | --- | --- |
 | Page Up / Page Down | previous / next scene |
-| V | show everything / the meshes / the splats / the SDFs / the depth buffers (/ the ambient occlusion / the indirect light / the bodies' motion vectors, with the effects on) |
+| V | show everything / the meshes / the splats / the SDFs / the depth buffers (/ the ambient occlusion / the indirect light / the bodies' motion vectors, with the effects on / the light tiles, with point lights) |
 | Tab | hide or show the insets |
 | O | 2D overlays (`assets/overlays/`): none, then each in turn |
 | everything else | the scene's: its behaviors (below), its orbit camera (drag, wheel), M to mute its sounds |
@@ -218,6 +218,7 @@ Each scene stands for one of the examples; its keys come from behaviors in the s
 | --- | --- | --- | --- |
 | `physics.scene` | `physics.lua` | the ramp, the dominoes, the pyramid, the tower, the player | the player's; B drop boxes; P pause, T slow motion, R reset |
 | `splats.scene` | `splat.lua` | a grid of skulls carved per pixel by moving shapes, with music | `,` `.` budget, `/` LOD tint, `[` `]` size, L lighting, C clip mode, M mute |
+| `many-lights.scene` | | 256 colored lamps over meshes, the skull's splats and the SDF sculpture, culled per screen tile | the splats' and the SDFs' |
 | `composite.scene` | `fusion.lua` | meshes, the skull's splats and an SDF sculpture merged by depth, three colored lamps circling them, a second camera in the corner | the splats' (as above, but C), J K blend |
 | `sdf-benchmark.scene` | `sdf-cache.lua` | a turning spiral of 64 shapes around a core, 129 nodes, cached | C DAG / cache / cache error, `[` `]` resolution, B benchmark, J K blend, Space stop the camera |
 | `sdf-gallery.scene` | | three SDF sculptures and an arch, baked into one cache | as `sdf-benchmark.scene` |
@@ -573,6 +574,9 @@ local buf2 = rhi.buffer { 1, 2, 3, 4 }            -- floats
   pixel, as `math.floor(height * scale + 0.5)` (at least 1).
 - **`rhi.buffer`** creates a read/write structured or byte-address buffer.
   `rhi.vertex_buffer` is only for vertex input.
+- **`buffer:write(floats [, offset])`** writes floats into a buffer from float `offset`
+  (default 0), uploaded before the next frame's passes: for data Lua changes every frame,
+  such as the scene's point lights. `buffer.size` is its size in bytes.
 
 #### Depth targets
 
@@ -1456,7 +1460,7 @@ missing required field stops the load, with the entity and the field in the mess
 
 | Component | Fields (defaults) | System |
 | --- | --- | --- |
-| `light` | `color`, `intensity` (9), `range` (14), `orbitRadius` (0), `speed` (0, radians per second), `phase`, `bob` | a point light, orbiting the entity's position: the scene's first is its key light, shadowing everything; up to 8 more are [point lights without shadows](#more-lights), and move a visual mesh of their entity along with them |
+| `light` | `color`, `intensity` (9), `range` (14), `orbitRadius` (0), `speed` (0, radians per second), `phase`, `bob` | a point light, orbiting the entity's position: the scene's first is its key light, shadowing everything; up to 1024 more are [point lights without shadows](#more-lights), culled per screen tile,, and move a visual mesh of their entity along with them |
 | `mesh` | `shape` ("box" or "sphere"), `size` (a box's, whole: [1, 1, 1]), `radius` (0.5), `color`, `pattern` (0 plain, 1 stripes, 2 checker on the floor, 3 checker on every face, 4 emissive: its color, unlit) | instanced, lit and shadowed boxes and spheres |
 | `body` | `motion` ("dynamic", "static", "kinematic"), `density` (1000), `friction` (0.5), `restitution` (0), `velocity`, `angularVelocity` | a Jolt body for the mesh; without it, the mesh is visual (placed by Lua) |
 | `splat` | `file` (required), `fit` (a radius to scale to; 0: as is), `grid` ([nx, nz] copies), `spacing`, `turn` (degrees per copy), `clip` (`mode` "carve" or "keep", `shapes`: spheres and boxes with `position`, `move`, `speed`, `spin`) | Gaussian splats with LOD, lighting, shadows, clipping; one renderer per file, entities as its instances |
@@ -1524,29 +1528,6 @@ return true when they handle the event), `addOverlays(graph)`, `enter()`, `leave
   splats cast shadows. So meshes, splats and SDFs light and shadow one another the same way
   in every scene, whatever is in it.
 
-#### More lights
-
-A scene's first `light` is its key light, lit and shadowed as before. Every `light` after
-it (up to 8) is a point light without shadows: `pointLights` in the same light block
-(`scene/scene-common.slang`), added by every kind of surface as it is shaded:
-
-| Surface | Where | |
-| --- | --- | --- |
-| meshes | `scene/lit.slang` | diffuse and specular, as the key light's |
-| SDFs | `sdf/raymarch.slang` | the same, at the hit |
-| splats | `splat/lighting.slang` | diffuse only, trusted as far as the splat's normal is (as the key light's), lit or as captured |
-
-- **Why it's cheap:** one function (`pointLightsRadiance`) loops over the lights where each
-  technique already shades a point: a few multiply-adds per light, and no pass, shadow map
-  or buffer of their own. In the composite scene, at 1600 x 900, the raymarching took the
-  same time with its three lamps as without, within the GPU's timing noise.
-- **Motion:** the light system works out their orbits in Lua each frame (so they stop
-  with the pause menu) and writes them into the block. An entity with a light and a mesh
-  without a body has the mesh moved along: with `"pattern": 4` (emissive) it marks the
-  light. `assets/prefabs/lamp.prefab` is one: a small glowing sphere with a light; an
-  instance sets both colors.
-- **No shadows:** they light through everything, so keep their `range` short. The key
-  light's shadows and the screen-space effects (AO, SSGI) still apply to what they light.
 - **Missing surfaces:** with no SDFs or no splats, their targets stay empty and the
   composite passes them over. The splats' depth buffer is cleared every frame, since the
   composite reads it.
@@ -1555,6 +1536,48 @@ it (up to 8) is a point light without shadows: `pointLights` in the same light b
 - **Cost:** `composite.scene` runs at 33–34 ms per frame on the RTX 3050 Laptop GPU (Release),
   against 31–32 ms for the hand-built `fusion.lua` it reproduces. Some details differ (its SDF
   doesn't spin; its bounds are larger; a behavior spins the cube from Lua).
+
+#### More lights
+
+A scene's first `light` is its key light, lit and shadowed as before. Every `light` after
+it (up to 1024) is a point light without shadows, added by every kind of surface as it is
+shaded, and culled per screen tile so that each point adds only the lights that can reach
+it:
+
+| Surface | Where | |
+| --- | --- | --- |
+| meshes | `scene/lit.slang` | diffuse and specular, as the key light's |
+| SDFs | `sdf/raymarch.slang` | the same, at the hit |
+| splats | `splat/lighting.slang` | diffuse only, trusted as far as the splat's normal is (as the key light's), lit or as captured; the tile is the one its center falls in |
+
+- **The lights:** a buffer in the light block, `pointLightData` (2 `float4`s a light:
+  position and range, color and intensity; `scene/light-tiles-layout.slang`). The light
+  system works out their orbits in Lua each frame (so they stop with the pause menu) and
+  writes them with `buffer:write`.
+- **Tiled culling** (`scene/light-culling.slang`), per view, before anything shades:
+  - **Tiles:** 16 pixels square, one thread group (16 x 16) each.
+  - **Test:** the group's threads share the lights between them and test each light's
+    sphere (its `range`) against the tile's frustum: the four planes through the eye and
+    the tile's edges, and the near and far planes.
+  - **Lists:** those that touch it go into the view's `lightTiles` buffer, at most 127 a
+    tile, which `pointLightsRadiance` (`scene/scene-common.slang`) reads at each point's
+    pixel.
+  - **Big windows:** a main view's buffer holds 16,000 tiles (2560 x 1600 at 16 pixels); a
+    larger window gets 32-pixel tiles, and so on.
+- **No depth bounds:** the meshes shade in the pass that writes their depth, so a tile
+  can't know its depth range in time. A tile sees every light inside its frustum, however
+  far behind what it shows; each is then dropped by the range test at the point. Distant
+  tiles over a field of lights get long lists (V's "light tiles" shows them).
+- **Cost:** in `many-lights.scene`, 256 lamps, culling took 0.07 ms (D3D12), 0.10 ms
+  (Vulkan) and 0.08 ms (D3D11) at 1600 x 900 on an RTX 3050 Laptop GPU. In the composite
+  scene, the raymarching took the same time with its three lamps as without them.
+- **Markers:** an entity with a light and a mesh without a body has the mesh moved along:
+  with `"pattern": 4` (emissive) it marks the light. `assets/prefabs/lamp.prefab` is one,
+  a small glowing sphere with a light; an instance sets both colors.
+- **No shadows:** they light through everything, so keep their `range` short. The key
+  light's shadows and the screen-space effects (AO, SSGI) still apply to what they light.
+- **Seeing the tiles:** V goes on to "light tiles" in a scene with point lights: each tile
+  tinted by how many lights reach it, blue for one to red for 32 and more, over the image.
 
 ### Adding a component
 

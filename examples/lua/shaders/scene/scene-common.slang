@@ -33,42 +33,48 @@ float3 lightPosition()
 // More point lights, beside the one above: unshadowed, placed by Lua each frame (the light
 // system: lib/scene/systems/light.lua), and added by every kind of surface -- the meshes
 // (lit.slang), the SDFs (sdf/raymarch.slang), the splats (splat/lighting.slang) -- with the
-// same falloff as the shadowed light. A few multiply-adds a light a shaded point: no pass,
-// map or buffer of their own.
+// same falloff as the shadowed light. Culled per screen tile (scene/light-culling.slang):
+// a point adds only the lights whose spheres reach its tile, so hundreds of short-range
+// lights cost what the few near each point do.
 // ---------------------------------------------------------------------------------------
 
-static const uint kMaxPointLights = 8;
+#include "light-tiles-layout.slang"
 
-struct ExtraLight
-{
-    float3 position;
-    float range;     // reaches no further
-    float3 color;
-    float intensity;
-};
-uniform ExtraLight pointLights[kMaxPointLights];
+StructuredBuffer<float4> pointLightData; // the light block's
 uniform uint pointLightCount;
+StructuredBuffer<uint> lightTiles;       // the view block's: its tiles' lights
 
-// The light they add at `world`, with its normal, toward the eye, and albedo, as lit.slang
-// shades. `specularScale` 0 leaves out the highlight; `normalTrust` below 1 fades the
-// diffuse term toward 0.5 (a splat whose normal means little).
-float3 pointLightsRadiance(float3 world, float3 normal, float3 toEye, float3 albedo, float specularScale, float normalTrust)
+// The light they add at `world` (seen at `pixel` of the view), with its normal, toward the
+// eye, and albedo, as lit.slang shades. `specularScale` 0 leaves out the highlight;
+// `normalTrust` below 1 fades the diffuse term toward 0.5 (a splat whose normal means
+// little).
+float3 pointLightsRadiance(float2 pixel, float3 world, float3 normal, float3 toEye, float3 albedo, float specularScale, float normalTrust)
 {
     float3 sum = float3(0, 0, 0);
-    for (uint i = 0; i < min(pointLightCount, kMaxPointLights); ++i)
+    if (pointLightCount == 0)
+        return sum;
+    uint tilesX = lightTiles[0], tilesY = lightTiles[1], tileSize = max(lightTiles[2], 1u);
+    int2 tile = int2(floor(pixel / float(tileSize)));
+    if (any(tile < 0) || uint(tile.x) >= tilesX || uint(tile.y) >= tilesY)
+        return sum;
+    uint base = kTileHeader + (uint(tile.y) * tilesX + uint(tile.x)) * kTileStride;
+    uint count = min(lightTiles[base], kMaxLightsPerTile);
+    for (uint k = 0; k < count; ++k)
     {
-        ExtraLight l = pointLights[i];
-        float3 toLight = l.position - world;
+        uint i = lightTiles[base + 1 + k];
+        float4 placement = pointLightData[2 * i]; // position, range
+        float4 look = pointLightData[2 * i + 1];  // color, intensity
+        float3 toLight = placement.xyz - world;
         float distanceToLight = length(toLight);
-        if (distanceToLight >= l.range)
+        if (distanceToLight >= placement.w)
             continue;
         toLight /= max(distanceToLight, 1e-4);
-        float window = saturate(1.0 - pow(distanceToLight / l.range, 4.0));
-        float attenuation = l.intensity * window * window / (1.0 + distanceToLight * distanceToLight);
+        float window = saturate(1.0 - pow(distanceToLight / placement.w, 4.0));
+        float attenuation = look.w * window * window / (1.0 + distanceToLight * distanceToLight);
         float facing = saturate(dot(normal, toLight));
         float diffuse = lerp(0.5, facing, normalTrust);
         float specular = specularScale * pow(saturate(dot(normal, normalize(toLight + toEye))), 48.0) * 0.5 * (facing > 0 ? 1 : 0);
-        sum += (albedo * diffuse + specular) * l.color * attenuation;
+        sum += (albedo * diffuse + specular) * look.rgb * attenuation;
     }
     return sum;
 }

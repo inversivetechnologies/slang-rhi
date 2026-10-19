@@ -136,7 +136,7 @@ float4 shade(VertexOutput input, Material m)
 
         float3 ambient = albedo * float3(0.05, 0.06, 0.08);
         color = ambient + (albedo * diffuse + specular) * light.color * attenuation * shadow;
-        color += pointLightsRadiance(input.world, normal, toEye, albedo, 1.0, 1.0); // the unshadowed ones
+        color += pointLightsRadiance(input.position.xy, input.world, normal, toEye, albedo, 1.0, 1.0); // the unshadowed ones
     }
 
     color = color / (1.0 + color); // tone map: keep highlights from clipping

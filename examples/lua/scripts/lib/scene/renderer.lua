@@ -81,6 +81,12 @@ renderer.EFFECT_PARAMS = {
     giRadius = 2.5, giStrength = 2.5,
 }
 
+-- Tiled light culling (scene/light-culling.slang): the tiles a main view's buffer holds,
+-- 16 pixels square up to 2560 x 1600 (bigger windows get bigger tiles), and the uints a
+-- tile takes (light-tiles-layout.slang's kTileStride, and the header's 4).
+local LIGHT_TILE_CAPACITY = 16000
+local LIGHT_TILE_STRIDE = 128
+
 -- The effects' chains for a quality: what each computes, and at what scale of the view.
 local function effectChains(fx)
     if fx.quality == "Mixed" and fx.ao and fx.gi then
@@ -125,6 +131,11 @@ function renderer.build(ctx, systems)
         compositeTexture = rhi.render_pipeline { shader = "post/depth-composite.slang", format = "rgba16f" },
         frame = rhi.render_pipeline { shader = "post/composite.slang" },
     }
+    local lightsOn = ctx.pointLights and #ctx.pointLights > 0
+    if lightsOn then
+        pipelines.lightCulling = rhi.compute_pipeline("scene/light-culling.slang", "cullMain")
+    end
+    ctx.noLightTiles = ctx.noLightTiles or rhi.buffer(16)
     local fx = renderer.effects
     local effectsOn = fx.ao or fx.gi
     if effectsOn then
@@ -165,6 +176,23 @@ function renderer.build(ctx, systems)
     ctx.composites = {}
     for _, view in ipairs(ctx.views) do
         view.targets = createTargets(view.inset)
+        -- Which point lights reach each of the view's tiles, before anything shades.
+        if lightsOn then
+            local scale = view.inset or 1
+            local capacity = math.ceil(LIGHT_TILE_CAPACITY * scale * scale)
+            view.lightTiles = rhi.buffer((4 + capacity * LIGHT_TILE_STRIDE) * 4)
+            view.block.lightTiles = view.lightTiles
+            local node = graph:dispatch {
+                name = view.name .. ": light culling",
+                pipeline = pipelines.lightCulling,
+                params = { view.block, ctx.light, { lightTiles = view.lightTiles, lightTileCapacity = capacity } },
+                threads = view.targets.meshColor, -- the view's size: a group per 16 x 16 pixels
+                timed = not view.inset,
+            }
+            if not view.inset then ctx.lightCullNode = node end
+        else
+            view.block.lightTiles = ctx.noLightTiles
+        end
         local opaque = graph:render_pass {
             name = view.name .. ": opaque",
             target = view.targets.meshColor,
@@ -213,6 +241,7 @@ function renderer.build(ctx, systems)
             -- With the effects, linear into a texture of its own; they encode it after.
             encodeGamma = (view.inset or effectsOn) and 0 or (srgb and 0 or 1),
             showMode = ctx.showMode or 0,
+            lightTiles = view.lightTiles or ctx.noLightTiles,
         }
         ctx.composites[#ctx.composites + 1] = view.composite
         local scale, shape = view.inset or 1, view.inset and "square" or nil
@@ -308,7 +337,7 @@ end
 
 -- What the depth composites show: 0 everything, 1 the meshes, 2 the splats, 3 the SDFs,
 -- 4 the depth buffers; with the effects on, 5 the ambient occlusion, 6 the indirect light,
--- 7 the meshes' motion vectors.
+-- 7 the meshes' motion vectors; 8 the light tiles (how many point lights reach each).
 function renderer.setShowMode(ctx, mode)
     ctx.showMode = mode
     for _, block in ipairs(ctx.composites or {}) do block.showMode = mode end
@@ -338,6 +367,12 @@ function renderer.resetHistory(ctx)
         view.historyFrames = 0
         view.lastCamera = nil
     end
+end
+
+-- The point lights, and their culling's GPU time in the main view, for a title.
+function renderer.describeLights(ctx)
+    if not ctx.lightCullNode then return nil end
+    return string.format("%d point lights, culled in %.2f ms", #ctx.pointLights, ctx.lightCullNode.gpu_time or 0)
 end
 
 -- The effects' GPU time in the main view (all their passes), for a title; nil without them.

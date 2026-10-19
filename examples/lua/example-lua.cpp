@@ -560,6 +560,8 @@ struct Buffer
 {
     ComPtr<IBuffer> buffer;
     uint64_t size = 0;
+    // buffer:write's data, uploaded before the next frame's passes: offset (bytes), floats.
+    std::vector<std::pair<uint64_t, std::vector<float>>> pendingWrites;
 };
 
 // A shader parameter value captured from Lua, so it can be applied without the Lua state:
@@ -915,6 +917,24 @@ public:
     }
 
     // Writes every body group's transforms into its GPU buffer, ahead of the frame's passes.
+    // buffer:write's data, ahead of the frame's passes.
+    void uploadBufferWrites(ICommandEncoder* encoder)
+    {
+        for (auto it = m_writtenBuffers.begin(); it != m_writtenBuffers.end();)
+        {
+            std::shared_ptr<Buffer> buffer = it->lock();
+            if (buffer)
+            {
+                for (auto& [offset, floats] : buffer->pendingWrites)
+                {
+                    encoder->uploadBufferData(buffer->buffer, offset, floats.size() * sizeof(float), floats.data());
+                }
+                buffer->pendingWrites.clear();
+            }
+            it = m_writtenBuffers.erase(it);
+        }
+    }
+
     void uploadBodies(ICommandEncoder* encoder)
     {
         if (!m_physics)
@@ -1003,6 +1023,7 @@ public:
         m_frame.height = height;
         m_frame.active = true;
         uploadBodies(commandEncoder);
+        uploadBufferWrites(commandEncoder);
         if (m_graph)
         {
             runGraph(*m_graph);
@@ -3661,6 +3682,40 @@ public:
     }
 
     // sound.playing, sound.position, sound.length (seconds), sound.volume, sound.loop
+    // buffer.size (bytes), and its methods.
+    static int bufferIndex(lua_State* L)
+    {
+        auto buffer = checkShared<Buffer>(L, 1, kBufferType);
+        const char* key = luaL_checkstring(L, 2);
+        if (strcmp(key, "size") == 0)
+        {
+            lua_pushinteger(L, lua_Integer(buffer->size));
+            return 1;
+        }
+        lua_pushvalue(L, lua_upvalueindex(1));
+        lua_getfield(L, -1, key);
+        return 1;
+    }
+
+    // buffer:write(floats [, offset]): writes the floats into the buffer from float `offset`
+    // (default 0), before the next frame's passes -- for data Lua changes every frame (the
+    // scene's lights). Writes past the end are cut off.
+    static int bufferWrite(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        std::shared_ptr<Buffer> buffer = checkShared<Buffer>(L, 1, kBufferType);
+        std::vector<float> floats = checkFloats(L, 2);
+        uint64_t offset = uint64_t(luaL_optinteger(L, 3, 0)) * sizeof(float);
+        if (offset >= buffer->size || floats.empty())
+        {
+            return 0;
+        }
+        floats.resize(std::min<size_t>(floats.size(), size_t((buffer->size - offset) / sizeof(float))));
+        buffer->pendingWrites.emplace_back(offset, std::move(floats));
+        app->m_writtenBuffers.push_back(buffer);
+        return 0;
+    }
+
     static int soundIndex(lua_State* L)
     {
         auto sound = checkShared<audio::Sound>(L, 1, kSoundType);
@@ -4435,7 +4490,11 @@ public:
 
         newType(L, kPipelineType, pipelineIndex, nullptr, collectHandle<Pipeline>);
         newType(L, kTextureType, textureIndex, nullptr, collectHandle<Texture>);
-        newType(L, kBufferType, [](lua_State* L) { return lua_pushnil(L), 1; }, nullptr, collectHandle<Buffer>);
+        static const luaL_Reg kBufferMethods[] = {
+            {"write", bufferWrite},
+            {nullptr, nullptr},
+        };
+        newType(L, kBufferType, bufferIndex, kBufferMethods, collectHandle<Buffer>);
 
         static const luaL_Reg kControllerMethods[] = {
             {"button", controllerButton},
@@ -4559,6 +4618,7 @@ public:
     bool m_paused = false;
     double m_shaderTime = 0.0; // the `time` builtin: seconds run while not paused
     bool m_reloadRequested = false; // rhi.reload(), done at the next update
+    std::vector<std::weak_ptr<Buffer>> m_writtenBuffers; // with buffer:write data to upload
 
     // Hot reload.
     static constexpr double kWatchInterval = 0.15; // seconds between checks

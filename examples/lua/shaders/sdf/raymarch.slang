@@ -136,7 +136,7 @@ void raymarchMain(uint3 tid: SV_DispatchThreadID)
     float shadow = shadowVisibility(world + normal * (0.02 + 0.04 * grazing) - lightPos, 0.02);
 
     float3 color = albedo * float3(0.05, 0.06, 0.08) + (albedo * diffuse + specular) * light.color * attenuation * shadow;
-    color += pointLightsRadiance(world, normal, toEye, albedo, 1.0, 1.0); // the unshadowed ones
+    color += pointLightsRadiance(float2(tid.xy) + 0.5, world, normal, toEye, albedo, 1.0, 1.0); // the unshadowed ones
     color = color / (1.0 + color);
     sdfColor[tid.xy] = float4(color, 1);
     sdfDepth[tid.xy] = depthFromViewZ(t * forwardness);

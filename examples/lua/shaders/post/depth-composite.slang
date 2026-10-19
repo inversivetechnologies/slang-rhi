@@ -23,7 +23,29 @@ uniform float depthNear;
 uniform float depthFar;
 uniform uint encodeGamma; // 1 if the window doesn't do the sRGB encoding itself
 uniform uint showMode;    // 0: combined, 1: mesh only, 2: splats only, 3: SDFs only,
-                          // 4: the depth buffers
+                          // 4: the depth buffers, 8: combined, tinted by the light tiles
+
+// The view's light tiles (scene/light-culling.slang), for showMode 8.
+#include "scene/light-tiles-layout.slang"
+StructuredBuffer<uint> lightTiles;
+
+// How many lights reach this pixel's tile: blue (none) to green, yellow, red (32 and more).
+float3 lightTileTint(float2 pixel)
+{
+    uint tilesX = lightTiles[0], tilesY = lightTiles[1], tileSize = max(lightTiles[2], 1u);
+    uint2 tile = uint2(pixel) / tileSize;
+    if (tile.x >= tilesX || tile.y >= tilesY)
+        return float3(0, 0, 0);
+    float count = float(lightTiles[kTileHeader + (tile.y * tilesX + tile.x) * kTileStride]);
+    float x = saturate(count / 32.0);
+    float3 heat = x < 0.33 ? lerp(float3(0, 0, 1), float3(0, 1, 0), x / 0.33)
+                : x < 0.66 ? lerp(float3(0, 1, 0), float3(1, 1, 0), (x - 0.33) / 0.33)
+                           : lerp(float3(1, 1, 0), float3(1, 0, 0), (x - 0.66) / 0.34);
+    // The tile's edges, so the grid shows.
+    float2 inTile = fmod(pixel, float(tileSize));
+    float edge = any(inTile < 1.0) ? 0.5 : 1.0;
+    return (count > 0 ? heat : float3(0.05, 0.05, 0.1)) * edge;
+}
 
 struct VertexOutput
 {
@@ -96,6 +118,8 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         // Where no splat is opaque enough to be in the splats' depth buffer, its depth is
         // the far plane; faint fringes there still go over whatever is behind.
         color = splatDistance <= opaqueDistance ? splatLinear + (1.0 - splat.a) * opaque : opaque;
+        if (showMode == 8)
+            color = color * 0.35 + lightTileTint(input.position.xy) * 0.4;
     }
 
     if (encodeGamma != 0)

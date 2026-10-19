@@ -8,14 +8,14 @@
 -- (scene/scene-common.slang's PointLight; its orbit is computed by the shaders from
 -- `time`). Without one, a default key light hangs above the origin.
 --
--- The others, up to 8, are point lights without shadows (scene-common.slang's
--- pointLights): the meshes, the SDFs and the splats all add them as they shade, which
--- costs a few multiply-adds a light per shaded point and nothing else. Their orbits are
--- worked out here, every frame, and written into the light block; an entity with a mesh
--- without a body (a visual one: "pattern": 4 makes it glow) is moved along with its light,
--- as its marker.
+-- The others, up to 1024, are point lights without shadows: the meshes, the SDFs and the
+-- splats all add them as they shade -- each point only those whose range reaches its
+-- screen tile (the renderer's light culling, scene/light-culling.slang). Their orbits are
+-- worked out here, every frame, and written into the light block's buffer
+-- (pointLightData: scene/light-tiles-layout.slang); an entity with a mesh without a body
+-- (a visual one: "pattern": 4 makes it glow) is moved along with its light, as its marker.
 
-local MAX_POINT_LIGHTS = 8 -- scene-common.slang's kMaxPointLights
+local MAX_POINT_LIGHTS = 1024 -- light-tiles-layout.slang's kMaxPointLights
 
 local system = {
     name = "light",
@@ -38,15 +38,16 @@ local function orbitPosition(l)
              c[3] + math.sin(l.angle) * l.orbitRadius }
 end
 
--- The block's pointLights: every slot filled, the unused ones dark.
-local function pointLightParams(lights)
-    local list = {}
-    for i = 1, MAX_POINT_LIGHTS do
-        local l = lights[i]
-        list[i] = l and { position = l.position, range = l.range, color = l.color, intensity = l.intensity }
-            or { position = { 0, 0, 0 }, range = 0, color = { 0, 0, 0 }, intensity = 0 }
+-- The lights' floats, as pointLightData holds them: position, range; color, intensity.
+local function pointLightFloats(lights)
+    local floats, n = {}, 0
+    for _, l in ipairs(lights) do
+        local p, c = l.position, l.color
+        floats[n + 1], floats[n + 2], floats[n + 3], floats[n + 4] = p[1], p[2], p[3], l.range
+        floats[n + 5], floats[n + 6], floats[n + 7], floats[n + 8] = c[1], c[2], c[3], l.intensity
+        n = n + 8
     end
-    return list
+    return floats
 end
 
 function system.load(ctx)
@@ -81,12 +82,14 @@ function system.load(ctx)
         end
     end
     ctx.lightData = data
+    local floats = pointLightFloats(ctx.pointLights)
+    ctx.pointLightBuffer = #floats > 0 and rhi.buffer(floats) or rhi.buffer(32)
     ctx.light = rhi.params {
         light = {
             center = data.center, orbitRadius = data.orbitRadius, color = data.color, intensity = data.intensity,
             range = data.range, speed = data.speed, phase = data.phase, bob = data.bob,
         },
-        pointLights = pointLightParams(ctx.pointLights),
+        pointLightData = ctx.pointLightBuffer,
         pointLightCount = #ctx.pointLights,
     }
 end
@@ -105,12 +108,8 @@ function system.update(ctx, dt)
             l.placed = true
         end
     end
-    if moved then ctx.light.pointLights = pointLightParams(ctx.pointLights) end
+    if moved then ctx.pointLightBuffer:write(pointLightFloats(ctx.pointLights)) end
 end
 
-function system.describe(ctx)
-    if #ctx.pointLights == 0 then return nil end
-    return string.format("%d point lights", #ctx.pointLights)
-end
 
 return system

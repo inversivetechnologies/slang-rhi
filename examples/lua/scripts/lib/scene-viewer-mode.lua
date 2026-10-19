@@ -4,7 +4,8 @@
 --   Page Up / Page Down   previous / next scene
 --   V                     show: everything / meshes / splats / SDFs / the depth buffers /
 --                         the ambient occlusion / the indirect light / the bodies' motion
---                         vectors (when the effects are on)
+--                         vectors (when the effects are on) / the light tiles (how many
+--                         point lights reach each, with point lights)
 --   Tab                   hide / show the insets (cameras with "inset")
 --   O                     2D overlays (assets/overlays/, lib/scene/overlays.lua): none,
 --                         then each in turn, over whichever scene is shown
@@ -21,7 +22,7 @@ local pauseMenu = rhi.include("lib/pause-menu.lua")
 local settings = rhi.include("lib/settings.lua")
 
 local SHOW_MODES = { "everything", "meshes", "splats", "SDFs", "depth buffers", "ambient occlusion", "indirect light",
-    "motion vectors" }
+    "motion vectors", "light tiles" }
 
 -- `setTitle(details)` shows the title (default: "Scenes | ..."); `order`, if given, lists
 -- scene file names to put first, in that order (the rest follow, sorted).
@@ -120,7 +121,9 @@ return function(setTitle, order)
                     load(index) -- the shadow maps are part of the scene's graph
                 elseif name == "ambientOcclusion" or name == "ssgi" or name == "effectsQuality" then
                     scenes.renderer.effects = { ao = values.ambientOcclusion ~= "Off", aoMethod = values.ambientOcclusion, gi = values.ssgi, quality = values.effectsQuality }
-                    if values.ambientOcclusion == "Off" and not values.ssgi and showMode > 5 then showMode = 1 end
+                    if values.ambientOcclusion == "Off" and not values.ssgi and showMode > 5 and showMode < 9 then
+                        showMode = 1
+                    end
                     load(index) -- so are the effects' passes
                 end
             end,
@@ -197,8 +200,17 @@ return function(setTitle, order)
         end
         if not current then return end
         if action == input.PRESS and key == keys.V then
-            local count = (values.ambientOcclusion ~= "Off" or values.ssgi) and #SHOW_MODES or 5 -- the effects' only with them
-            showMode = showMode % count + 1
+            -- The effects' only with them, the light tiles only with point lights.
+            local available = { 1, 2, 3, 4, 5 }
+            if values.ambientOcclusion ~= "Off" or values.ssgi then
+                for i = 6, 8 do available[#available + 1] = i end
+            end
+            if current.ctx.pointLights and #current.ctx.pointLights > 0 then available[#available + 1] = 9 end
+            local next = available[1]
+            for k, i in ipairs(available) do
+                if i == showMode then next = available[k % #available + 1] end
+            end
+            showMode = next
             current:setShowMode(showMode - 1)
             updateTitle()
         elseif action == input.PRESS and key == keys.TAB then

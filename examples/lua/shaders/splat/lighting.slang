@@ -85,7 +85,7 @@ void lightSplatsMain(uint3 tid: SV_DispatchThreadID)
     float3 albedo = pow(max(captured, 0.0), 2.2);
     // The unshadowed point lights: a diffuse term only, trusted as far as the normal is.
     float3 toEye = normalize(camera.eye - world);
-    float3 extra = pointLightsRadiance(world, normal, toEye, albedo, 0.0, saturate(flatness));
+    float3 extra = pointLightsRadiance(splat.centerAxis1.xy, world, normal, toEye, albedo, 0.0, saturate(flatness));
     float3 lit = albedo * float3(0.05, 0.06, 0.08) + albedo * diffuse * light.color * attenuation * visibility + extra;
     lit = lit / (1.0 + lit);
     float3 relit = pow(max(lit, 0.0), 1.0 / 2.2); // max: fxc can't tell lit >= 0

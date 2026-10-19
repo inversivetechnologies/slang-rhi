@@ -28,6 +28,7 @@ local ORDER = {
     "physics.scene",
     "splats.scene",
     "composite.scene",
+    "many-lights.scene",
     "sdf-benchmark.scene",
     "sdf-gallery.scene",
 }
