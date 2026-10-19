@@ -16,7 +16,12 @@ Texture2D<float4> litColor; // the view's merged image, linear
 Texture2D<float4> aoEffects;
 Texture2D<float4> giEffects;
 uniform float giStrength;
-uniform uint splatGiCached; // 1: where a splat is nearest, it has its indirect light already
+uniform uint splatGiCached;  // 1: where a splat is nearest, it has its indirect light already
+uniform uint splatAoCached;  // 1: and its ambient visibility (the radiance cascades')
+Texture2D<float4> giNormals;  // the GI's G-buffer (view normal, view depth), with giNormalAware
+uniform uint giNormalAware;   // 1: the upsampling weighs the low texels by normal as well
+Texture2D<float4> giAlbedo;   // the GI's G-buffer's albedo, with giAlbedoAware
+uniform uint giAlbedoAware;   // 1: the indirect light is irradiance: times the surface's albedo // 1: where a splat is nearest, it has its indirect light already
                             // (cached per splat: splat/lighting.slang), so none is added
 uniform uint outputEncodeGamma; // 1 if the destination doesn't do the sRGB encoding itself
 uniform uint showMode;          // as the depth composite's: 0 everything; 5 the AO, 6 the GI,
@@ -36,6 +41,8 @@ VertexOutput vertexMain(uint vertexId: SV_VertexID)
     output.position = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return output;
 }
+
+static bool splatNearest = false; // set per pixel in fragmentMain
 
 float4 upsample(Texture2D<float4> effects, int2 pixel, float z, uint2 size)
 {
@@ -61,6 +68,17 @@ float4 upsample(Texture2D<float4> effects, int2 pixel, float z, uint2 size)
         float gap = abs(tz - z) / z;
         float4 value = effects.Load(int3(t, 0));
         float weight = (bilinear + 1e-3) / (1e-3 + gap * 50.0);
+        // (Not where a splat is nearest: its pixels' normals, rebuilt from its blended
+        // depth, are too rough to weigh by.)
+        if (giNormalAware != 0 && !splatNearest)
+        {
+            // A joint bilateral weight by normal too: the low texel's probe's normal (at its
+            // pixel) against this pixel's.
+            float3 nLow = giNormals.Load(int3(toFull(uint2(t), lowSize, size), 0)).xyz;
+            float3 nHigh = giNormals.Load(int3(pixel, 0)).xyz;
+            float agree = saturate(dot(nLow, nHigh));
+            weight *= agree * agree * agree * agree + 1e-3;
+        }
         sum += value * weight;
         weights += weight;
         if (gap < nearestGap)
@@ -84,10 +102,17 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     float3 indirect = float3(0, 0, 0);
     if (!isBackground(z))
     {
+        splatNearest = viewDistance(splatDepth.Load(int3(pixel, 0))) <= z * 1.0001;
         visibility = upsample(aoEffects, pixel, z, size).a;
         indirect = upsample(giEffects, pixel, z, size).rgb * giStrength;
-        if (splatGiCached != 0 && viewDistance(splatDepth.Load(int3(pixel, 0))) <= z * 1.0001)
+        if (giAlbedoAware != 0)
+            indirect *= giAlbedo.Load(int3(pixel, 0)).rgb;
+        if (splatGiCached != 0 && splatNearest)
+        {
             indirect = float3(0, 0, 0);
+            if (splatAoCached != 0)
+                visibility = 1.0;
+        }
     }
 
     float3 color;

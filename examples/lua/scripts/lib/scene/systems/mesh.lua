@@ -127,6 +127,7 @@ function system.load(ctx)
             shader = "scene/lit.slang", vertex = "bodyVertexMain", fragment = "bodyFragmentMain", format = "rgba16f", depth = true,
         },
         motion = rhi.render_pipeline { shader = "scene/motion.slang", vertex = "bodyVertexMain", format = "rgba16f", depth = true },
+        albedo = rhi.render_pipeline { shader = "scene/albedo.slang", vertex = "bodyVertexMain", format = "rgba16f", depth = true },
     }
 end
 
@@ -162,6 +163,19 @@ function system.addMotion(ctx, view, pass)
     for _, d in ipairs(m.draws) do
         pass:draw {
             pipeline = m.pipelines.motion, count = d.mesh.count, instances = d.group,
+            params = { { vertices = d.mesh.buffer, bodies = d.group.buffer }, view.block },
+        }
+    end
+end
+
+-- The bodies' albedo, for the GI's G-buffer (scene/albedo.slang; the renderer's albedo
+-- pass, with the radiance cascades on).
+function system.addAlbedo(ctx, view, pass)
+    local m = ctx.mesh
+    if not m then return end
+    for _, d in ipairs(m.draws) do
+        pass:draw {
+            pipeline = m.pipelines.albedo, count = d.mesh.count, instances = d.group,
             params = { { vertices = d.mesh.buffer, bodies = d.group.buffer }, view.block },
         }
     end

@@ -23,6 +23,15 @@ local settings = rhi.include("lib/settings.lua")
 
 local SHOW_MODES = { "everything", "meshes", "splats", "SDFs", "depth buffers", "ambient occlusion", "indirect light",
     "motion vectors", "light tiles" }
+-- Then the GI's debug views (lib/scene/gi.lua), as "GI: <name>".
+for _, name in ipairs(scenes.renderer.gi.DEBUG_MODES) do SHOW_MODES[#SHOW_MODES + 1] = "GI: " .. name end
+
+-- The renderer's effects, as the settings ask.
+local function effectsOf(values)
+    local giMethod = values.globalIllumination
+    return { ao = values.ambientOcclusion ~= "Off", aoMethod = values.ambientOcclusion,
+             gi = giMethod ~= "Off", giMethod = giMethod, quality = values.effectsQuality }
+end
 
 -- `setTitle(details)` shows the title (default: "Scenes | ..."); `order`, if given, lists
 -- scene file names to put first, in that order (the rest follow, sorted).
@@ -105,7 +114,7 @@ return function(setTitle, order)
         overlays = overlays or overlayLayer.load()
         values = values or settings.load()
         scenes.renderer.shadowFaceSize = settings.SHADOW_FACE_SIZES[values.shadowQuality]
-        scenes.renderer.effects = { ao = values.ambientOcclusion ~= "Off", aoMethod = values.ambientOcclusion, gi = values.ssgi, quality = values.effectsQuality }
+        scenes.renderer.effects = effectsOf(values)
         scenes.renderer.taa = values.temporalAA ~= false
         menu = menu or pauseMenu.new {
             settings = values,
@@ -123,9 +132,9 @@ return function(setTitle, order)
                 elseif name == "temporalAA" then
                     scenes.renderer.taa = values.temporalAA
                     load(index) -- TAA's passes are part of the scene's graph
-                elseif name == "ambientOcclusion" or name == "ssgi" or name == "effectsQuality" then
-                    scenes.renderer.effects = { ao = values.ambientOcclusion ~= "Off", aoMethod = values.ambientOcclusion, gi = values.ssgi, quality = values.effectsQuality }
-                    if values.ambientOcclusion == "Off" and not values.ssgi and showMode > 5 and showMode < 9 then
+                elseif name == "ambientOcclusion" or name == "globalIllumination" or name == "effectsQuality" then
+                    scenes.renderer.effects = effectsOf(values)
+                    if showMode > 5 then
                         showMode = 1
                     end
                     load(index) -- so are the effects' passes
@@ -206,10 +215,13 @@ return function(setTitle, order)
         if action == input.PRESS and key == keys.V then
             -- The effects' only with them, the light tiles only with point lights.
             local available = { 1, 2, 3, 4, 5 }
-            if values.ambientOcclusion ~= "Off" or values.ssgi then
+            if values.ambientOcclusion ~= "Off" or values.globalIllumination ~= "Off" then
                 for i = 6, 8 do available[#available + 1] = i end
             end
             if current.ctx.pointLights and #current.ctx.pointLights > 0 then available[#available + 1] = 9 end
+            if values.globalIllumination == "Cascades" then
+                for i = 1, #scenes.renderer.gi.DEBUG_MODES do available[#available + 1] = 9 + i end
+            end
             local next = available[1]
             for k, i in ipairs(available) do
                 if i == showMode then next = available[k % #available + 1] end

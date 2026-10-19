@@ -64,19 +64,26 @@ Texture2D<float4> splatGi;      // the view's GI history (rgb), last frame's
 SamplerState splatGiSampler;
 uniform float splatGiStrength;  // 0: no GI on the splats here
 uniform float splatGiBlend;     // the new frame's share
+// 1: splatGi is the radiance cascades' (lib/scene/gi.lua): rgb irradiance -- times the
+// splat's albedo -- and a the ambient visibility, cached as well (the effects' apply pass
+// then leaves both out where a splat is nearest). 0: SSGI's light, added as it is.
+uniform uint splatGiIrradiance;
 RWStructuredBuffer<uint> giHistory;
 uniform float2 viewportSize;    // the view's: the host's (the window's) or the view block's (an inset's)
 
-uint packGi(float3 c)
+// rgb: the square root of a quarter of the light, 8 bits each (faint light keeps its
+// precision); a: the ambient visibility, 8 bits.
+uint packGi(float4 c)
 {
-    uint3 q = uint3(sqrt(saturate(c * 0.25)) * 1023.0 + 0.5);
-    return q.x | (q.y << 10) | (q.z << 20);
+    uint3 q = uint3(sqrt(saturate(c.rgb * 0.25)) * 255.0 + 0.5);
+    uint a = uint(saturate(c.a) * 255.0 + 0.5);
+    return q.x | (q.y << 8) | (q.z << 16) | (a << 24);
 }
 
-float3 unpackGi(uint v)
+float4 unpackGi(uint v)
 {
-    float3 r = float3(v & 1023u, (v >> 10) & 1023u, (v >> 20) & 1023u) / 1023.0;
-    return r * r * 4.0;
+    float3 r = float3(v & 255u, (v >> 8) & 255u, (v >> 16) & 255u) / 255.0;
+    return float4(r * r * 4.0, float(v >> 24) / 255.0);
 }
 
 [shader("compute")]
@@ -108,9 +115,12 @@ void lightSplatsMain(uint3 tid: SV_DispatchThreadID)
     // the levels of detail's cut, or back in view). A second view in the same frame finds
     // this frame's already, and takes it as it is.
     ProjectedSplat splat = projected[slot];
-    float3 indirect = float3(0, 0, 0);
+    float4 indirect = float4(0, 0, 0, 1); // rgb light, a ambient visibility
     if (splatGiStrength > 0)
-        indirect = splatGi.SampleLevel(splatGiSampler, splat.centerAxis1.xy / viewportSize, 0).rgb * splatGiStrength;
+    {
+        float4 g = splatGi.SampleLevel(splatGiSampler, splat.centerAxis1.xy / viewportSize, 0);
+        indirect = float4(g.rgb * splatGiStrength, splatGiIrradiance != 0 ? g.a : 1.0);
+    }
 
     uint historyIndex = drawn.y * lightingEntries + i;
     [branch]
@@ -122,7 +132,7 @@ void lightSplatsMain(uint3 tid: SV_DispatchThreadID)
         uint now = frameCounter & 0xFFFFu;
         bool fresh = stamp == now;
         bool continuing = stamp == ((now - 1u) & 0xFFFFu);
-        float3 indirectBefore = splatGiStrength > 0 ? unpackGi(giHistory[historyIndex]) : float3(0, 0, 0);
+        float4 indirectBefore = splatGiStrength > 0 ? unpackGi(giHistory[historyIndex]) : float4(0, 0, 0, 1);
         if (fresh)
         {
             visibility = before;
@@ -177,10 +187,13 @@ void lightSplatsMain(uint3 tid: SV_DispatchThreadID)
     }
     float3 lit = albedo * float3(0.05, 0.06, 0.08) + albedo * diffuse * light.color * attenuation * visibility + extra;
     lit = lit / (1.0 + lit);
-    lit += indirect; // the indirect light, after the tone map, as the effects add it
+    // The indirect light, after the tone map, as the effects add it: the cascades' times
+    // the ambient visibility and the albedo; SSGI's as it is.
+    float3 bounce = splatGiIrradiance != 0 ? albedo * indirect.rgb : indirect.rgb;
+    lit = lit * indirect.a + bounce;
     float3 relit = pow(max(lit, 0.0), 1.0 / 2.2); // max: fxc can't tell lit >= 0
     // As captured, the point lights still add on (in linear light, then back).
-    shadowed = pow(max(pow(max(shadowed, 0.0), 2.2) + extra + indirect, 0.0), 1.0 / 2.2);
+    shadowed = pow(max(pow(max(shadowed, 0.0), 2.2) * indirect.a + extra + bounce, 0.0), 1.0 / 2.2);
 
     splat.color.rgb = lerp(shadowed, relit, relight);
     if (showVisibility != 0)

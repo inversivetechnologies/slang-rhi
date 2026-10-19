@@ -113,6 +113,8 @@ function Scene:describe()
     end
     local lights = renderer.describeLights(self.ctx)
     if lights then parts[#parts + 1] = lights end
+    local cascades = renderer.gi.describe(self.ctx)
+    if cascades then parts[#parts + 1] = cascades end
     local effects = renderer.describeEffects(self.ctx)
     if effects then parts[#parts + 1] = effects end
     return table.concat(parts, " | ")

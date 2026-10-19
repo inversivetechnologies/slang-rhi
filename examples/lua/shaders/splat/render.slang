@@ -9,8 +9,9 @@
 // splat's depth (its center's, for the whole splat), and depth testing keeps the nearest.
 //
 // depthBlendFragmentMain draws them, blended as the colors are (premultiplied, back to
-// front), into an rgba16f target as (view depth x alpha, 0, 0, alpha): the result's red over
-// its alpha is the depth of what the pixel shows, weighted as the colors are -- smooth, and
+// front), into an rgba16f target as (view depth x alpha, albedo luminance x alpha, 0, alpha):
+// the result's red over its alpha is the depth of what the pixel shows (green, the albedo's
+// luminance there, for the GI), weighted as the colors are -- smooth, and
 // wherever the splats cover it together, however faint each (splat/depth-resolve.slang turns
 // it into a depth). What the composite, the screen-space effects and TAA rely on.
 //
@@ -70,8 +71,8 @@ static const float2 kCorners[6] = {
     float2(-1, -1), float2(1, 1), float2(-1, 1),
 };
 
-[shader("vertex")]
-VertexOutput vertexMain(uint vertexId: SV_VertexID)
+// A splat's quad corner (the entry points below share it: an entry point isn't called).
+VertexOutput splatVertex(uint vertexId)
 {
     VertexOutput output;
     uint slot = vertexId / 6;
@@ -107,17 +108,57 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     return float4(input.color.rgb * alpha, alpha);
 }
 
-[shader("fragment")]
-float4 depthBlendFragmentMain(VertexOutput input) : SV_Target
+[shader("vertex")]
+VertexOutput vertexMain(uint vertexId: SV_VertexID)
 {
+    return splatVertex(vertexId);
+}
+
+// The blended depth pass's: the same, with the splat's albedo luminance (from axis2.w).
+struct BlendVertexOutput
+{
+    float4 position : SV_Position;
+    float2 offset : OFFSET;
+    nointerpolation float4 color : COLOR;
+    nointerpolation uint clipSlot : CLIP;
+    nointerpolation float albedoLuminance : ALBEDO;
+};
+
+[shader("vertex")]
+BlendVertexOutput depthBlendVertexMain(uint vertexId: SV_VertexID)
+{
+    VertexOutput v = splatVertex(vertexId);
+    BlendVertexOutput output;
+    output.position = v.position;
+    output.offset = v.offset;
+    output.color = v.color;
+    output.clipSlot = v.clipSlot;
+    output.albedoLuminance = 0;
+    uint slot = vertexId / 6;
+    if (slot < drawCount[0])
+    {
+        float w = projected[sortValues[slot]].axis2.w;
+        output.albedoLuminance = (w - floor(w)) / 0.49;
+    }
+    return output;
+}
+
+[shader("fragment")]
+float4 depthBlendFragmentMain(BlendVertexOutput input) : SV_Target
+{
+    VertexOutput v;
+    v.position = input.position;
+    v.offset = input.offset;
+    v.color = input.color;
+    v.clipSlot = input.clipSlot;
     float alpha = min(0.99, input.color.a * exp(-4.5 * dot(input.offset, input.offset)));
-    if (alpha < 1.0 / 255.0 || clippedAway(input))
+    if (alpha < 1.0 / 255.0 || clippedAway(v))
     {
         discard;
     }
     // The splat's center's view depth: the quad's z/w (the same at every vertex), undone.
     float viewZ = kDepthNear * kDepthFar / (kDepthFar - input.position.z * (kDepthFar - kDepthNear));
-    return float4(viewZ * alpha, 0, 0, alpha);
+    return float4(viewZ * alpha, input.albedoLuminance * alpha, 0, alpha);
 }
 
 // How opaque a splat has to be at a pixel to count as a surface in the depth buffer.

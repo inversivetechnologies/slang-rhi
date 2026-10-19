@@ -120,9 +120,13 @@ function Menu:rows()
           end)(),
           format = function(m) return m end,
           apply = function(m) v.ambientOcclusion = m return "ambientOcclusion", m end },
-        { key = "ssgi", label = "Indirect light", choices = { false, true }, index = v.ssgi and 2 or 1,
-          format = function(on) return on and "On" or "Off" end,
-          apply = function(on) v.ssgi = on return "ssgi", on end },
+        { key = "globalIllumination", label = "Global illumination", choices = settings.GI_METHODS,
+          index = (function()
+              for i, m in ipairs(settings.GI_METHODS) do if m == v.globalIllumination then return i end end
+              return 1
+          end)(),
+          format = function(m) return m == "Cascades" and "Radiance cascades" or m end,
+          apply = function(m) v.globalIllumination = m return "globalIllumination", m end },
         { key = "temporalAA", label = "Temporal AA", choices = { false, true }, index = v.temporalAA and 2 or 1,
           format = function(on) return on and "On" or "Off" end,
           apply = function(on) v.temporalAA = on return "temporalAA", on end },

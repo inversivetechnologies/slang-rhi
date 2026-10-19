@@ -128,8 +128,8 @@ and the shaders' `time` stops, so everything animated by it holds still too.
 | Fullscreen | Off, On | fullscreen on the primary monitor, at the resolution |
 | Max splats | 250,000 .. 2,000,000 | the splats' budget: the levels of detail fit what is drawn to it (a scene's own `splatBudget`, if lower, still holds) |
 | Shadow quality | Low (256), Medium (512), High (1024), Ultra (2048) | the shadow maps' texels per cube face; the scene (or script) is loaded again with them |
-| Ambient occlusion | GTAO, Off, SSAO | [GTAO or SSAO](#ambient-occlusion-and-indirect-light): darker where surfaces are close to others; GTAO by default |
-| Indirect light | Off, On | [SSGI](#ambient-occlusion-and-indirect-light): light bounced from the surfaces seen nearby |
+| Ambient occlusion | GTAO, Off, SSAO | [GTAO or SSAO](#ambient-occlusion-and-indirect-light): darker where surfaces are close to others; GTAO by default. With radiance cascades, the AO is theirs (any setting but Off) |
+| Global illumination | Radiance cascades, Off, SSGI | light bounced from the surfaces around: [radiance cascades](#radiance-cascades-gi) (the default: no screen-space history) or [SSGI](#ambient-occlusion-and-indirect-light) |
 | Effects quality | Half, Mixed, Full | the resolution SSAO and SSGI are computed at: both at half; AO at full and GI at half; both at full |
 | Temporal AA | On, Off | the main view's image stabilized over frames ([splat stability](#splat-stability)) |
 
@@ -267,6 +267,42 @@ watched, so the scene reloads when it turns up), with a warning:
 | a prefab file | a blue checkered box (a `mesh`, `pattern` 3); the instance's components that need the prefab's fields are left out |
 | a sound file | nothing: silence |
 | a behavior | nothing: the entity runs no behavior |
+
+#### Radiance cascades GI
+
+The default global illumination (`lib/scene/gi.lua`, `shaders/gi/`): hybrid radiance
+cascades, with no screen-space temporal accumulation -- every frame's cascades are its own,
+so nothing trails what moves. Built in phases, each with debug views (V, from "GI: normals"
+on):
+
+| Phase | What | Passes | Debug view |
+| --- | --- | --- | --- |
+| 1 | the G-buffer: normals (rebuilt from the merged depth: on each axis the neighbor nearer in depth) and view depth; the albedo of the nearest surface; a Hi-Z pyramid of the nearest depth, half to a 32nd resolution | `gbuffer.slang`; the meshes' albedo pass (`scene/albedo.slang`), the raymarcher's albedo, the splats' albedo luminance in their blended depth | normals, Hi-Z, albedo |
+| 2 | the global SDF: a 96^3 volume of 0.2 m voxels about the camera (snapped to 4 voxels), narrow-band (0.8 m), with albedo -- rebuilt every frame from the bodies (boxes, spheres: analytic) and the SDF composition. A voxel is one uint, its distance (16 bits) above its albedo (5:6:5), so one atomic min keeps the nearest and its color | `global-sdf-bake.slang`, read with `global-sdf.slang` | global SDF: the volume sphere-traced and lit |
+| 3 | world-space probes (DDGI) as the far field: 16 x 8 x 16, 1 m apart, about the camera (storage by world cell, so a probe's data stays with its place); 96 rays a probe a frame through the global SDF, the hits lit by the key light (shadow maps), the point lights and the probes themselves (further bounces); octahedral irradiance, radiance and depth moments (Chebyshev visibility), blended in world space (hysteresis 0.95) | `ddgi-update.slang`, read with `ddgi.slang` | DDGI: the probes' irradiance at each pixel's surface |
+| 4 | screen-space radiance cascades for the near field: 4 cascades of probes on the G-buffer's surfaces (a probe every 8 pixels in cascade 0 at Half quality, 4 at Full, doubling each cascade; each probe's depth and normal the means over its cell), 4 x 4 hemispherical octahedral directions in cascade 0, doubling each cascade (every atlas the same size), intervals 0.12 m long in cascade 0, 4 x longer each cascade. Each interval marched on the screen, the Hi-Z pyramid skipping what the ray is in front of; a hit within 0.35 m behind the depth takes the lit image's color there; off the screen, or behind a surface by more, the global SDF takes over (its hits lit by the key light and the probes) | `rc.slang`: `probesMain`, `cascadeMain` | cascade 0 .. 3: their atlases, each probe's directions a tile |
+| 5 | merged coarse to fine: each direction continued by the 4 probes of the cascade above (bilinear), weighted by depth (plane distance) and normal and whether the direction is in that probe's hemisphere, its ray traced to *that* probe's interval start (the bilinear fix: no gaps or overlaps between probes' intervals); the last cascade continued by the probes' radiance (the far field) | `cascadeMain` | (the cascade views show them merged) |
+| 6 | cascade 0 cosine-integrated into irradiance per probe, and the ambient visibility from the near cascades' transmittance (cascade 0's times cascade 1's, merged as the light is); upsampled by depth and normal (a joint bilateral) and applied: the image times the visibility, plus the irradiance times the albedo | `integrateMain`; `post/ssao-apply.slang` | the existing "ambient occlusion" and "indirect light" |
+
+- **Splats:** their blended depth moves with the view (what overlaps changes), so a
+  screen-space estimate on a splat does too. They take the cascades' irradiance and ambient
+  visibility per splat instead, as they take their shadows: at their center, last frame's,
+  blended into their own history (object space, not screen space), and lit by it
+  (`splat/lighting.slang`); the apply pass leaves both out where a splat is nearest. The
+  splats still bounce light onto everything else.
+- **Stability**, measured as in [splat stability](#splat-stability) (TAA off, D3D12), against
+  GTAO + SSGI: a box moving between a wall and the floor, then stopped -- what lags,
+  2.22% of pixels off by more than 2/255 with SSGI, 0.75% with the cascades (mostly the box's
+  own outline, the same in both); a still scene, 0.090 against 0.002 (mean, off the splats);
+  a moving light, splats 0.181 against 0.055; the camera orbiting, splats 1.01% against
+  1.05% of pixels jumping more than 4/255.
+- **Cost** at 1600 x 900 on an RTX 3050 Laptop GPU (D3D12): the global SDF's clear and
+  resolve 0.08 ms (its bake between them untimed), the probes 1.1 ms, the cascades 2.8 ms
+  at Half and 10 ms at Full. The window title gives them.
+- **Not (yet) in the global SDF:** the splats (on screen, the cascades see them; off it, or
+  behind something, they neither occlude nor bounce). The point lights' direct light on what
+  only the global SDF sees (off screen) is left out; the probes carry its bounce.
+- **D3D11:** fxc compiles `rc.slang` in about 1.5 s; the GI's GPU times read 0 there.
 
 #### Ambient occlusion and indirect light
 

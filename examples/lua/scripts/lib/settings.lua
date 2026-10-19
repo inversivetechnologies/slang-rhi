@@ -8,7 +8,8 @@
 --   splatBudget     the most splats drawn a frame (the levels of detail fit them to it)
 --   shadowQuality   "Low", "Medium", "High" or "Ultra": the shadow maps' size
 --   ambientOcclusion  "Off", "SSAO" or "GTAO" (post/ssao.slang)
---   ssgi            screen-space indirect light
+--   globalIllumination  "Off", "SSGI" (screen-space, post/ssao.slang) or "Cascades" (radiance
+--                   cascades: lib/scene/gi.lua)
 --   effectsQuality  "Half", "Mixed" (AO at full resolution, GI at half) or "Full"
 --   temporalAA      true / false: the main view stabilized over frames (post/taa.slang)
 
@@ -21,13 +22,14 @@ settings.SHADOW_FACE_SIZES = { Low = 256, Medium = 512, High = 1024, Ultra = 204
 settings.SPLAT_BUDGETS = { 250000, 500000, 1000000, 1500000, 2000000 }
 settings.EFFECT_QUALITIES = { "Half", "Mixed", "Full" }
 settings.AO_METHODS = { "Off", "SSAO", "GTAO" }
+settings.GI_METHODS = { "Off", "SSGI", "Cascades" }
 
 local DEFAULTS = {
     fullscreen = false,
     splatBudget = 1000000,
     shadowQuality = "Medium",
     ambientOcclusion = "GTAO",
-    ssgi = false,
+    globalIllumination = "Cascades",
     effectsQuality = "Half",
     temporalAA = true,
 }
@@ -61,6 +63,14 @@ function settings.load()
     -- Files from before the AO methods have `ssao` on or off: off stays off.
     if values.ssao == false and not (saved and saved.ambientOcclusion) then values.ambientOcclusion = "Off" end
     values.ssao = nil
+    -- And `ssgi` on or off: on is SSGI.
+    if saved and saved.globalIllumination == nil and saved.ssgi ~= nil then
+        values.globalIllumination = saved.ssgi and "SSGI" or "Off"
+    end
+    values.ssgi = nil
+    known = false
+    for _, m in ipairs(settings.GI_METHODS) do known = known or m == values.globalIllumination end
+    if not known then values.globalIllumination = DEFAULTS.globalIllumination end
     known = false
     for _, m in ipairs(settings.AO_METHODS) do known = known or m == values.ambientOcclusion end
     if not known then values.ambientOcclusion = DEFAULTS.ambientOcclusion end

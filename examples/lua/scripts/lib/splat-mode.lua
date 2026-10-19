@@ -231,7 +231,8 @@ return function(setTitle, file)
             render = rhi.render_pipeline { shader = "splat/render.slang", format = "rgba16f", blend = "premultiplied" },
             -- The same quads into a depth buffer only: no color target.
             renderDepth = rhi.render_pipeline { shader = "splat/render.slang", fragment = "depthFragmentMain", format = "none", depth = true },
-            renderDepthBlend = rhi.render_pipeline { shader = "splat/render.slang", fragment = "depthBlendFragmentMain", format = "rgba16f", blend = "premultiplied" },
+            renderDepthBlend = rhi.render_pipeline { shader = "splat/render.slang", vertex = "depthBlendVertexMain",
+                                                     fragment = "depthBlendFragmentMain", format = "rgba16f", blend = "premultiplied" },
             depthResolve = rhi.compute_pipeline("splat/depth-resolve.slang", "resolveMain"),
             -- Shadows: the splats' Gaussians drawn into a translucent shadow map, see
             -- shaders/splat/shadow.slang.
@@ -451,7 +452,8 @@ return function(setTitle, file)
             }
             -- The screen-space GI to cache per splat (options.gi: splatGi, splatGiStrength,
             -- splatGiSampler), or none.
-            params[#params + 1] = options.gi or { splatGiStrength = 0, splatGi = blocks.noGi, splatGiSampler = blocks.giSampler }
+            params[#params + 1] = options.gi or { splatGiStrength = 0, splatGiIrradiance = 0, splatGi = blocks.noGi,
+                                                  splatGiSampler = blocks.giSampler }
             -- One thread per drawn splat at most (preprocess packed them at the front).
             add(g:dispatch { name = name .. ": lighting", pipeline = r.lighting, params = params, threads = { r.sortCount, 1, 1 } })
         end

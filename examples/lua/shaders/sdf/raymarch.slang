@@ -37,6 +37,7 @@ uniform float2 viewportSize; // provided by the host: the window's size
 Texture2D<float> meshDepth;
 RWTexture2D<float4> sdfColor; // linear, tone mapped like the meshes; 0 where nothing is hit
 RWTexture2D<float> sdfDepth;  // z/w depth; 1 (the far plane) where nothing is hit
+RWTexture2D<float4> sdfAlbedo; // the hit's albedo (the GI's G-buffer takes it); 0 where nothing is
 
 static const float kNear = 0.1;
 static const float kFar = 100.0;
@@ -105,6 +106,7 @@ void raymarchMain(uint3 tid: SV_DispatchThreadID)
     if (!hit)
     {
         sdfColor[tid.xy] = float4(0, 0, 0, 0);
+        sdfAlbedo[tid.xy] = float4(0, 0, 0, 0);
         sdfDepth[tid.xy] = 1.0;
         return;
     }
@@ -117,6 +119,7 @@ void raymarchMain(uint3 tid: SV_DispatchThreadID)
         float voxels = abs(sampleSdfCache(toSdfSpace(world))) / sdfCacheVoxelSize();
         float3 error = cacheErrorColor(voxels * 4.0) * (0.4 + 0.6 * saturate(dot(fromSdfSpaceDirection(normal), normalize(float3(0.4, 1, -0.3)))));
         sdfColor[tid.xy] = float4(error, 1);
+        sdfAlbedo[tid.xy] = float4(albedo, 1);
         sdfDepth[tid.xy] = depthFromViewZ(t * forwardness);
         return;
     }
@@ -139,5 +142,6 @@ void raymarchMain(uint3 tid: SV_DispatchThreadID)
     color += pointLightsRadiance(float2(tid.xy) + 0.5, world, normal, toEye, albedo, 1.0, 1.0); // the unshadowed ones
     color = color / (1.0 + color);
     sdfColor[tid.xy] = float4(color, 1);
+    sdfAlbedo[tid.xy] = float4(albedo, 1);
     sdfDepth[tid.xy] = depthFromViewZ(t * forwardness);
 }

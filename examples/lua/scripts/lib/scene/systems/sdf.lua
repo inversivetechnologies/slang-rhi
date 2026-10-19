@@ -261,7 +261,7 @@ function system.addSurfaces(ctx, graph, view)
     s.raymarchNodes[#s.raymarchNodes + 1] = graph:dispatch {
         name = view.name .. ": raymarch",
         pipeline = s.raymarch,
-        params = { ctx.light, ctx.shadowBlock, view.block, { meshDepth = t.meshDepth, sdfColor = t.sdfColor, sdfDepth = t.sdfDepth } },
+        params = { ctx.light, ctx.shadowBlock, view.block, { meshDepth = t.meshDepth, sdfColor = t.sdfColor, sdfDepth = t.sdfDepth, sdfAlbedo = t.sdfAlbedo } },
         threads = t.sdfColor,
         timed = true,
     }

@@ -220,7 +220,11 @@ void preprocessMain(uint3 tid: SV_DispatchThreadID)
 
     ProjectedSplat splat;
     splat.centerAxis1 = float4(center, axis * radius1);
-    splat.axis2 = float4(float2(-axis.y, axis.x) * radius2, t.z, clipClass == 1 ? 1.0 : 0.0);
+    // w: 1 to clip per pixel, plus 0.49 x the albedo's luminance (the captured color's,
+    // linear): what the GI's G-buffer takes for the splats' albedo (render.slang).
+    float3 albedoLinear = pow(saturate(color), 2.2);
+    float albedoLuminance = dot(albedoLinear, float3(0.2126, 0.7152, 0.0722));
+    splat.axis2 = float4(float2(-axis.y, axis.x) * radius2, t.z, (clipClass == 1 ? 1.0 : 0.0) + 0.49 * saturate(albedoLuminance));
     splat.color = float4(color, opacity);
     // Packed at the front; sorted ascending, so far splats (large z) come first: drawn
     // back to front.

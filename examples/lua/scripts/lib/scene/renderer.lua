@@ -30,6 +30,9 @@
 --   addOverlays(ctx, graph)      addMotion(ctx, view, pass)
 
 local renderer = {}
+-- Radiance cascades GI (giMethod "Cascades"): lib/scene/gi.lua.
+local gi = rhi.include("lib/scene/gi.lua")
+renderer.gi = gi
 
 
 local function placeholderFields()
@@ -63,6 +66,7 @@ local function createTargets(inset)
         splatDepthBlend = rhi.render_target("rgba16f", scale, shape),
         sdfColor = rhi.render_target("rgba16f", scale, shape),
         sdfDepth = rhi.render_target("r32f", scale, shape),
+        sdfAlbedo = rhi.render_target("rgba16f", scale, shape), -- the SDFs' albedo (for the GI)
     }
 end
 
@@ -90,6 +94,7 @@ renderer.EFFECT_PARAMS = {
     aoStrength = 1.6, -- SSAO's: 1 black where fully occluded
     gtaoPower = 1.5,  -- GTAO's: its visibility raised to this
     giRadius = 2.5, giStrength = 2.5,
+    cascadeStrength = 1.0, -- the radiance cascades' indirect light, as it is
     historyClip = 1.25,      -- the temporal pass's clamp, in standard deviations (0: off)
     fastHistoryWeight = 0.5, -- the fast history's (anti-lag): the clamp's center (0: the mean)
 }
@@ -102,6 +107,9 @@ local LIGHT_TILE_STRIDE = 128
 
 -- The effects' chains for a quality: what each computes, and at what scale of the view.
 local function effectChains(fx)
+    -- The radiance cascades take both the indirect light and the ambient occlusion, with
+    -- no screen-space history: no chains.
+    if fx.giMethod == "Cascades" then return {} end
     if fx.quality == "Mixed" and fx.ao and fx.gi then
         return { { ao = true, gi = false, scale = 1 }, { ao = false, gi = true, scale = 0.5 } }
     end
@@ -241,10 +249,22 @@ function renderer.build(ctx, systems)
             }
             call(systems, "addMotion", ctx, view, motion)
         end
+        if effectsOn and fx.giMethod == "Cascades" and not view.inset then
+            -- The bodies' albedo, for the GI's G-buffer (what the indirect light lights).
+            view.targets.meshAlbedo = rhi.render_target("rgba16f")
+            view.targets.albedoDepth = rhi.depth_target()
+            local albedo = graph:render_pass {
+                name = view.name .. ": albedo",
+                target = view.targets.meshAlbedo,
+                depth_target = view.targets.albedoDepth,
+                clear = { 0, 0, 0, 0 },
+            }
+            call(systems, "addAlbedo", ctx, view, albedo)
+        end
         -- With SSGI, the splats take the indirect light per splat, from the GI chain's history
         -- (last frame's): made here, before they shade, and given to the chain below.
         view.splatGi, view.splatGiParams = nil, nil
-        if effectsOn and fx.gi and ctx.splats then
+        if effectsOn and fx.gi and fx.giMethod ~= "Cascades" and ctx.splats then
             local giScale = 0.5
             for _, chain in ipairs(effectChains(fx)) do
                 if chain.gi then giScale = chain.scale end
@@ -252,7 +272,17 @@ function renderer.build(ctx, systems)
             view.splatGi = rhi.render_target("rgba16f", (view.inset or 1) * giScale, view.inset and "square" or nil)
             ctx.splatGiSampler = ctx.splatGiSampler or rhi.sampler { filter = "linear", address = "clamp" }
             view.splatGiParams = { splatGi = view.splatGi, splatGiSampler = ctx.splatGiSampler,
-                                   splatGiStrength = renderer.EFFECT_PARAMS.giStrength }
+                                   splatGiStrength = renderer.EFFECT_PARAMS.giStrength, splatGiIrradiance = 0 }
+        end
+        -- With the radiance cascades, the splats cache theirs per splat too (irradiance and
+        -- ambient visibility, last frame's): the screen-space estimate on a splat moves with
+        -- the view (its blended depth does), cached per splat it doesn't. The cascades write
+        -- their result into this texture (gi.addView).
+        if effectsOn and fx.giMethod == "Cascades" and ctx.splats and not view.inset then
+            view.splatGi = rhi.render_target("rgba16f", 1 / (gi.SPACING0[fx.quality] or 8))
+            ctx.splatGiSampler = ctx.splatGiSampler or rhi.sampler { filter = "linear", address = "clamp" }
+            view.splatGiParams = { splatGi = view.splatGi, splatGiSampler = ctx.splatGiSampler,
+                                   splatGiStrength = renderer.EFFECT_PARAMS.cascadeStrength, splatGiIrradiance = 1 }
         end
         call(systems, "addSurfaces", ctx, graph, view)
         if not ctx.splats then
@@ -301,6 +331,24 @@ function renderer.build(ctx, systems)
             local inputs = { meshDepth = t.meshDepth, splatDepth = t.splatDepth, sdfDepth = t.sdfDepth,
                              litColor = view.litImage, meshMotion = t.meshMotion }
             local results = {}
+            if fx.giMethod == "Cascades" then
+                -- The main view's radiance cascades; an inset gets none (neutral).
+                if not view.inset then
+                    local r = gi.addView(ctx, graph, view, t, fx)
+                    view.giNormals, view.giAlbedo = r.normals, r.albedo
+                    results.ao, results.gi = r.irradiance, r.irradiance
+                    if not fx.ao then
+                        -- Ambient occlusion off: the cascades' light without their occlusion.
+                        ctx.giNeutral = ctx.giNeutral or rhi.render_target("rgba16f", 1 / 32)
+                        graph:render_pass { name = view.name .. ": no AO", target = ctx.giNeutral, clear = { 0, 0, 0, 1 } }
+                        results.ao = ctx.giNeutral
+                    end
+                else
+                    ctx.giNeutral = ctx.giNeutral or rhi.render_target("rgba16f", 1 / 32)
+                    graph:render_pass { name = view.name .. ": no GI", target = ctx.giNeutral, clear = { 0, 0, 0, 1 } }
+                    results.ao, results.gi = ctx.giNeutral, ctx.giNeutral
+                end
+            end
             for _, chain in ipairs(effectChains(fx)) do
                 local function target(format) return rhi.render_target(format, scale * chain.scale, shape) end
                 local raw, blurred, resolved = target("rgba16f"), target("rgba16f"), target("rgba16f")
@@ -334,8 +382,15 @@ function renderer.build(ctx, systems)
                 depthNear = 0.1, depthFar = 100,
                 litColor = view.litImage, meshMotion = t.meshMotion,
                 aoEffects = results.ao or results.gi, giEffects = results.gi or results.ao,
-                giStrength = fx.gi and renderer.EFFECT_PARAMS.giStrength or 0,
+                giStrength = fx.gi and (fx.giMethod == "Cascades" and renderer.EFFECT_PARAMS.cascadeStrength
+                    or renderer.EFFECT_PARAMS.giStrength) or 0,
                 splatGiCached = view.splatGi and 1 or 0, -- the splats have theirs already
+                splatAoCached = (view.splatGi and fx.giMethod == "Cascades") and 1 or 0, -- and their AO
+                -- (With AO off and the cascades on, the splats' cached visibility is ignored: the
+                -- splat lighting's splatGi alpha comes from the cascades either way.)
+                -- With the cascades: normal-aware upsampling too (the G-buffer's normals).
+                giNormals = view.giNormals or t.splatDepthBlend, giNormalAware = view.giNormals and 1 or 0,
+                giAlbedo = view.giAlbedo or t.splatDepthBlend, giAlbedoAware = view.giAlbedo and 1 or 0,
                 outputEncodeGamma = toTexture(view) and 0 or (srgb and 0 or 1),
                 showMode = ctx.showMode or 0,
             }
@@ -384,6 +439,9 @@ function renderer.build(ctx, systems)
         }
     end
 
+    -- The GI's debug view (when one is chosen), over the main view's final image.
+    gi.addDebug(ctx, graph)
+
     call(systems, "addOverlays", ctx, graph)
 
     -- The insets, framed, over the main view.
@@ -413,6 +471,9 @@ end
 -- 4 the depth buffers; with the effects on, 5 the ambient occlusion, 6 the indirect light,
 -- 7 the meshes' motion vectors; 8 the light tiles (how many point lights reach each).
 function renderer.setShowMode(ctx, mode)
+    -- From 9 up: the GI's debug views (gi.DEBUG_MODES), over the image as it is.
+    gi.setDebug(ctx, mode >= 9 and mode - 8 or 0)
+    if mode >= 9 then mode = 0 end
     ctx.showMode = mode
     for _, block in ipairs(ctx.composites or {}) do block.showMode = mode end
 end
@@ -420,6 +481,7 @@ end
 -- Every frame (paused too): the effects' noise turns, and each view's temporal block gets
 -- the last frame's camera.
 function renderer.updateFrame(ctx)
+    gi.updateFrame(ctx)
     ctx.effectsFrame = (ctx.effectsFrame or 0) + 1
     if ctx.effectsBlock then ctx.effectsBlock.frameIndex = ctx.effectsFrame end
     for _, view in ipairs(ctx.views) do

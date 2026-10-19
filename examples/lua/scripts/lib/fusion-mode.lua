@@ -128,6 +128,7 @@ return function(scene, splat, setTitle)
             splatDepth = rhi.depth_target(scale, shape),
             sdfColor = rhi.render_target("rgba16f", scale, shape),
             sdfDepth = rhi.render_target("r32f", scale, shape),
+            sdfAlbedo = rhi.render_target("rgba16f", scale, shape), -- the raymarcher writes it
         }
     end
 
@@ -155,6 +156,7 @@ return function(scene, splat, setTitle)
             meshDepth = targets.meshDepth,
             sdfColor = targets.sdfColor,
             sdfDepth = targets.sdfDepth,
+            sdfAlbedo = targets.sdfAlbedo,
         }
         nodes[#nodes + 1] = g:dispatch {
             name = prefix .. "raymarch",
