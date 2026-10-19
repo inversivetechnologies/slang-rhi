@@ -6,7 +6,8 @@
 struct Material
 {
     float3 albedo;
-    uint pattern;   // 0: plain, 1: the mesh's quad grid, 2: a checkerboard on the floor
+    uint pattern;   // 0: plain, 1: the mesh's quad grid, 2: a checkerboard on the floor,
+                    // 3: a checkerboard on every face (4 squares a meter, in the world)
     float emissive; // 1: unlit, glows in the light's color (the light's marker)
 };
 
@@ -105,6 +106,12 @@ float4 shade(VertexOutput input, Material m)
         {
             int2 cell = int2(floor(input.world.xz * 2.0));
             albedo *= ((cell.x + cell.y) & 1) != 0 ? 0.55 : 1.0;
+        }
+        else if (m.pattern == 3)
+        {
+            // Just inside the surface, so a face on a square's edge picks one side.
+            int3 cell = int3(floor((input.world - normalize(input.normal) * 0.001) * 4.0));
+            albedo *= ((cell.x + cell.y + cell.z) & 1) != 0 ? 0.35 : 1.0;
         }
 
         float3 normal = normalize(input.normal);

@@ -17,10 +17,9 @@ local system = {
 function system.load(ctx)
     ctx.sounds = {}
     for _, sound in ctx.world:query("sound") do
-        ctx.sounds[#ctx.sounds + 1] = {
-            handle = rhi.sound(sound.file, { loop = sound.loop, volume = sound.volume }),
-            spec = sound,
-        }
+        -- A missing file gives no sound (rhi.sound warns, and reloads once it is there).
+        local handle = rhi.sound(sound.file, { loop = sound.loop, volume = sound.volume })
+        if handle then ctx.sounds[#ctx.sounds + 1] = { handle = handle, spec = sound } end
     end
     ctx.muted = false
 end

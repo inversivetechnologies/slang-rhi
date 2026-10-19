@@ -30,8 +30,16 @@ local system = {
 function system.load(ctx)
     ctx.behaviors = {}
     for id, script in ctx.world:query("script") do
-        local constructor = rhi.include("behaviors/" .. script.file)
-        ctx.behaviors[#ctx.behaviors + 1] = constructor(ctx, id, script.params)
+        -- A missing behavior is left out (the file is watched: it loads once it is there).
+        local ok, constructor = pcall(rhi.include, "behaviors/" .. script.file)
+        if ok then
+            ctx.behaviors[#ctx.behaviors + 1] = constructor(ctx, id, script.params)
+        elseif tostring(constructor):find("cannot open", 1, true) then
+            print(string.format("[scene] %s: behavior %s is missing; left out until it is there",
+                ctx.name, script.file))
+        else
+            error(constructor, 0)
+        end
     end
 end
 

@@ -1,7 +1,7 @@
 -- Gaussian splats: a PLY file of 3D Gaussians (lib/splat-mode.lua's renderer: levels of
 -- detail held to a budget, lighting and shadows both ways, clipping), drawn in every view.
 --
---   "splat": { "file": "skull.ply",
+--   "splat": { "file": "gsplats/skull.ply",
 --              "fit": 0 (as the file has it) or a radius to scale the splats to,
 --              "grid": [nx, nz], "spacing": 4, "turn": 0 (degrees per copy) -- copies,
 --              "clip": { "mode": "carve" | "keep",
@@ -138,6 +138,13 @@ function system.describe(ctx)
     if not ctx.splats then return nil end
     local n = 0
     for _, f in ipairs(ctx.splats) do n = n + f.instanceCount end
+    local missing = {}
+    for _, f in ipairs(ctx.splats) do
+        if f.module.missing() then missing[#missing + 1] = f.file end
+    end
+    if #missing > 0 then
+        return string.format("%d splat instances (missing, as cubes: %s)", n, table.concat(missing, ", "))
+    end
     return string.format("%d splat instances", n)
 end
 

@@ -27,7 +27,9 @@
 --                  `rotationStep` per copy, and given the values of `vary` in turn
 --   "_..."       anything starting with an underscore is a comment, and ignored
 --
--- A prefab file is an entity like any other, which may itself start from a prefab.
+-- A prefab file is an entity like any other, which may itself start from a prefab. A
+-- missing prefab file is a blue checkered box in its place (with a warning), until it is
+-- there; its instances' components that need the prefab's fields are left out.
 
 local json = rhi.include("lib/scene/json.lua")
 local ecs = rhi.include("lib/scene/ecs.lua")
@@ -36,6 +38,9 @@ local T = rhi.include("lib/scene/transform.lua")
 local loader = {}
 
 local RESERVED = { id = true, prefab = true, transform = true, children = true, ["repeat"] = true }
+
+-- In place of a missing prefab.
+local PLACEHOLDER = { mesh = { shape = "box", color = { 0.08, 0.25, 0.85 }, pattern = 3 }, _placeholder = true }
 
 local function isArray(t)
     return type(t) == "table" and (t[1] ~= nil or next(t) == nil)
@@ -137,7 +142,14 @@ function loader.load(path, systems)
         local spec = inline[name]
         if not spec then
             local file = "prefabs/" .. name .. ".json"
-            spec = json.decode(rhi.read_asset(file), file)
+            local ok, text = pcall(rhi.read_asset, file)
+            if ok then
+                spec = json.decode(text, file)
+            else
+                print(string.format("[scene] %s: prefab '%s' is missing (%s); a placeholder box until it is there",
+                    path, name, tostring(text)))
+                spec = copy(PLACEHOLDER)
+            end
         end
         if spec.prefab then
             spec = merge(prefab(spec.prefab, chain), spec)
@@ -177,7 +189,13 @@ function loader.load(path, systems)
                     table.sort(known)
                     error(string.format("%s: unknown component '%s' (known: %s)", where, type, table.concat(known, ", ")), 0)
                 end
-                world:set(id, type, validate(where .. "." .. type, schema, copy(data)))
+                if spec._placeholder then
+                    -- In place of a missing prefab: what doesn't validate without it is left out.
+                    local ok, value = pcall(validate, where .. "." .. type, schema, copy(data))
+                    if ok then world:set(id, type, value) end
+                else
+                    world:set(id, type, validate(where .. "." .. type, schema, copy(data)))
+                end
             end
         end
         for _, child in ipairs(spec.children or {}) do

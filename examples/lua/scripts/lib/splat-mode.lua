@@ -48,7 +48,7 @@ return function(setTitle, file)
     setTitle = setTitle or function(details)
         rhi.set_title("Gaussian Splats | " .. details)
     end
-    file = file or "skull.ply"
+    file = file or "gsplats/skull.ply"
 
     local camera = { yaw = 0.0, pitch = 0.15, distance = 3, target = { 0, 0, 0 }, fovY = math.rad(50) }
     local splatScale = 1.0
@@ -61,6 +61,7 @@ return function(setTitle, file)
     local count = 0   -- the file's splats
     local entries = 0 -- with the merged ones
     local lodInfo = ""
+    local missing     -- why the file couldn't be loaded (rhi.load_ply shows a cube instead)
 
     -- The levels of detail are held to a budget: every frame, the GPU picks the finest cut
     -- through the tree that draws at most this many splats, over all instances, by their
@@ -113,7 +114,8 @@ return function(setTitle, file)
 
     local function updateTitle()
         local sound = music and (music.volume > 0 and "music (M)" or "muted (M)") or "no music"
-        setTitle(string.format("%s x%d (- =), %d splats each, size x%.2f | %s | clip: %s (C) | %s", file, grid * grid,
+        local name = missing and file .. " (missing: a placeholder cube)" or file
+        setTitle(string.format("%s x%d (- =), %d splats each, size x%.2f | %s | clip: %s (C) | %s", name, grid * grid,
             count, splatScale, lodText(), CLIP_MODES[clipMode], sound))
     end
 
@@ -192,6 +194,7 @@ return function(setTitle, file)
         if resources then return resources end
         local ply = rhi.load_ply(file)
         count = ply.count
+        missing = ply.missing
         -- With levels of detail, the merged splats follow the file's in the buffer.
         local lod = ply.lod
         entries = lod and lod.count or count
@@ -622,6 +625,10 @@ return function(setTitle, file)
     end
 
     function splat.budget() return budget end
+
+    -- Why the file couldn't be loaded, if it couldn't: rhi.load_ply shows a blue checkered
+    -- cube in its place, until it is there.
+    function splat.missing() return missing end
 
     -- The splats' own graph: drawn on a dark background, composited onto the window.
     local instanceNodes = {} -- this graph's dispatches over every instance

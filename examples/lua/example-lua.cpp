@@ -192,6 +192,49 @@ struct PlyData
     std::vector<float> data;             // count records of properties.size() floats
 };
 
+// The stand-in for a splat file that is missing (or doesn't read): a cube of side 1 at the
+// origin, its faces covered by flat splats in a blue checker, 4 x 4 squares a face.
+PlyData placeholderPly()
+{
+    const int perSide = 32;  // splats along a face's edge
+    const int squares = 4;   // checker squares along a face's edge
+    const float spacing = 1.0f / perSide;
+    const float shC0 = 0.28209479f; // the 0th spherical harmonic: color = 0.5 + shC0 * f_dc
+    const float blue[2][3] = {{0.08f, 0.25f, 0.85f}, {0.55f, 0.7f, 1.0f}};
+
+    PlyData ply;
+    ply.properties = {"x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity",
+                      "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"};
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        for (int side = 0; side < 2; ++side)
+        {
+            for (int i = 0; i < perSide; ++i)
+            {
+                for (int j = 0; j < perSide; ++j)
+                {
+                    float position[3];
+                    position[axis] = side ? 0.5f : -0.5f;
+                    position[(axis + 1) % 3] = (i + 0.5f) * spacing - 0.5f;
+                    position[(axis + 2) % 3] = (j + 0.5f) * spacing - 0.5f;
+                    const float* color = blue[(i * squares / perSide + j * squares / perSide + axis + side) % 2];
+                    // Flat along the face's normal; wide enough to overlap their neighbors.
+                    float scale[3];
+                    scale[axis] = std::log(spacing * 0.05f);
+                    scale[(axis + 1) % 3] = scale[(axis + 2) % 3] = std::log(spacing * 0.6f);
+                    float record[] = {position[0], position[1], position[2],
+                                      (color[0] - 0.5f) / shC0, (color[1] - 0.5f) / shC0, (color[2] - 0.5f) / shC0,
+                                      6.0f, // logit: opaque
+                                      scale[0], scale[1], scale[2], 1.0f, 0.0f, 0.0f, 0.0f};
+                    ply.data.insert(ply.data.end(), std::begin(record), std::end(record));
+                    ++ply.count;
+                }
+            }
+        }
+    }
+    return ply;
+}
+
 // Reads the vertex element of a binary little-endian PLY file whose vertex properties are
 // all floats -- the format Gaussian splatting scenes are stored in.
 bool readPly(const fs::path& path, PlyData& out, std::string& error)
@@ -2110,6 +2153,21 @@ public:
         return fs::path(LUA_ASSETS_DIR) / name;
     }
 
+    // An asset that is missing (or doesn't read), standing in for which is `instead`: said
+    // once per file, and the file is watched like an include, so the script reloads when
+    // it turns up.
+    void warnMissingAsset(const fs::path& path, const std::string& error, const char* instead = "a placeholder")
+    {
+        std::string key = pathKey(path);
+        if (m_warnedAssets.insert(key).second)
+        {
+            printf("[lua] %s: %s; using %s until it is there\n", path.generic_string().c_str(), error.c_str(), instead);
+            fflush(stdout);
+        }
+        m_watcher.watch(key);
+        m_includedScripts.insert(key);
+    }
+
     // A shader path from a script: relative to the script if there is such a file there,
     // else relative to the shared shaders folder.
     fs::path resolveShaderPath(const std::string& name) const
@@ -2447,18 +2505,19 @@ public:
 
     // rhi.read_asset(path): a text file's contents, looked up as rhi.load_ply's files are
     // (next to the script, then in assets/). The file is watched like an include: saving
-    // it reloads the script. For data the script parses itself (scenes, prefabs).
+    // it reloads the script. For data the script parses itself (scenes, prefabs). A missing
+    // file is an error, but is watched all the same: the script reloads when it is there.
     static int apiReadAsset(lua_State* L)
     {
         LuaApp* app = get(L);
         fs::path path = app->resolveAssetPath(luaL_checkstring(L, 1));
+        std::string key = pathKey(path);
+        app->m_watcher.watch(key);
+        app->m_includedScripts.insert(key);
         std::ifstream file(path, std::ios::binary);
         if (!file)
             luaL_error(L, "%s: no such file", path.generic_string().c_str());
         std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        std::string key = pathKey(path);
-        app->m_watcher.watch(key);
-        app->m_includedScripts.insert(key);
         lua_pushlstring(L, text.data(), text.size());
         return 1;
     }
@@ -3379,9 +3438,13 @@ public:
         }
         PlyData ply;
         std::string error;
-        if (!readPly(path, ply, error))
+        bool missing = !readPly(path, ply, error);
+        if (missing)
         {
-            luaL_error(L, "%s: %s", path.generic_string().c_str(), error.c_str());
+            // A blue checkered cube in its place; the file is watched, so the script
+            // reloads with it once it is there (or fixed).
+            app->warnMissingAsset(path, error);
+            ply = placeholderPly();
         }
         uint32_t stride = uint32_t(ply.properties.size());
 
@@ -3390,7 +3453,11 @@ public:
         double lodSeconds = 0.0;
         splatlod::Layout layout = splatlod::findLayout(ply.properties);
         bool hasLod = wantLod && layout.isSplats() && ply.count > 1;
-        if (hasLod)
+        if (hasLod && missing)
+        {
+            lod = splatlod::build(layout, ply.data, ply.count); // small: not worth a cache
+        }
+        else if (hasLod)
         {
             // Cached between runs in the temp directory, keyed by the file's size and time.
             std::error_code ec;
@@ -3450,6 +3517,11 @@ public:
             lua_setfield(L, -2, ply.properties[i].c_str());
         }
         lua_setfield(L, -2, "properties");
+        if (missing)
+        {
+            lua_pushstring(L, error.c_str());
+            lua_setfield(L, -2, "missing");
+        }
 
         // Where the points are, for framing them.
         auto find = [&](const char* name) -> int
@@ -3490,7 +3562,9 @@ public:
     // rhi.sound(path [, { loop = false, volume = 1, play = false }]): a sound from a file
     // (WAV, FLAC or MP3, by its contents), looked up as rhi.load_ply's files are, and
     // streamed from disk as it plays (audio.h). Without an audio device it still works,
-    // silently. The sound stops when its handle is collected (or the script reloads).
+    // silently. The sound stops when its handle is collected (or the script reloads). A
+    // missing file (or one that doesn't decode) gives nil, with a warning, and is watched:
+    // the script reloads when it is there.
     static int apiSound(lua_State* L)
     {
         LuaApp* app = get(L);
@@ -3499,7 +3573,11 @@ public:
         bool silent = false;
         std::unique_ptr<audio::Sound> sound = audio::Sound::load(path, error, silent);
         if (!sound)
-            luaL_error(L, "%s: %s", path.generic_string().c_str(), error.c_str());
+        {
+            app->warnMissingAsset(path, error, "silence");
+            lua_pushnil(L);
+            return 1;
+        }
         static bool warned = false;
         if (silent && !warned)
         {
@@ -4268,6 +4346,7 @@ public:
     std::shared_ptr<PhysicsWorld> m_physics;
     // Lua files loaded with rhi.include(); saving one reloads the script.
     std::set<std::string> m_includedScripts;
+    std::set<std::string> m_warnedAssets; // missing assets already reported
     std::vector<std::weak_ptr<Texture>> m_renderTargets;
 
     // The frame being recorded; only valid during the script's draw().

@@ -15,7 +15,7 @@ All examples are scripts, in `scripts/`:
 | `surface.lua` | clearing the window |
 | `scene.lua` | a lit 3D scene: a GPU-generated spherified cube, a cube and a floor, with a point light, realtime shadow mapping and a second camera composited into the corner -- built as a render graph the host runs without Lua |
 | `shader-toy.lua` | ShaderToy-style compute shaders blitted to the window |
-| `splat.lua` | Gaussian splatting with compute shaders: loads `assets/skull.ply` (1.9 million splats), projects, sorts and draws them every frame |
+| `splat.lua` | Gaussian splatting with compute shaders: loads `assets/gsplats/skull.ply` (1.9 million splats), projects, sorts and draws them every frame |
 | `fusion.lua` | the scene, the splats and a raymarched SDF composition in one picture: each rendered with its own depth buffer, combined per pixel by depth; shadows between all of them |
 | `sdf-cache.lua` | an SDF composition raymarched from its DAG or from a cache baked into 3D textures, with GPU timings of both |
 | `scenes.lua` | the scene viewer: scenes described in JSON (`assets/scenes/`), built from entities, components and prefabs (`assets/prefabs/`) by the scene system (`lib/scene/`) |
@@ -47,7 +47,7 @@ examples/lua/
                        raymarching pass (raymarch)
     post/              full-screen passes (composite, depth-composite, crosshair)
     shader-toy/        the ShaderToy framework (shader-toy.slang) and the toys
-  assets/              data files the scripts load (skull.ply, audio/timelapse.mpeg)
+  assets/              data files the scripts load (gsplats/skull.ply, audio/timelapse.mpeg)
     scenes/            scene files (JSON with comments) for the scene viewer
     prefabs/           prefabs: entities that scenes use and override
     overlays/          2D overlays: ShaderToy shaders in a panel, over any scene (O)
@@ -192,6 +192,16 @@ next, then none. Each is a file in `assets/overlays/`, read by `lib/scene/overla
 
 Saving a scene or prefab file reloads it. A scene that fails to load (bad JSON, an unknown
 component or field) says why in the window title, and the viewer goes on.
+
+Missing assets don't stop a scene; each is replaced until it is there (its path is
+watched, so the scene reloads when it turns up), with a warning:
+
+| Missing | In its place |
+| --- | --- |
+| a splat file | a blue checkered cube of splats (`rhi.load_ply`), placed, fitted, clipped and lit as the splats would be |
+| a prefab file | a blue checkered box (a `mesh`, `pattern` 3); the instance's components that need the prefab's fields are left out |
+| a sound file | nothing: silence |
+| a behavior | nothing: the entity runs no behavior |
 
 ### The SDF cache
 
@@ -459,7 +469,7 @@ pass's shader, to combine images by depth, or for any screen-space effect.
 | `rhi.params{...}`, `rhi.graph()`, `rhi.set_graph(graph)` | see [Render graphs](#render-graphs) |
 | `rhi.load_ply(path [, { lod = true }])` | loads a PLY file's vertices into a buffer; see below |
 | `rhi.sound(path [, { loop, volume, play }])` | a sound from a file; see [Sound](#sound) |
-| `rhi.read_asset(path)` | a text file's contents, looked up as `rhi.load_ply`'s are; the file is watched, so saving it reloads the script |
+| `rhi.read_asset(path)` | a text file's contents, looked up as `rhi.load_ply`'s are; the file is watched, so saving it reloads the script (a missing file is an error, but is watched too) |
 | `rhi.list_assets(folder [, extension])` | the names of the files in `assets/<folder>` (and in `<folder>` next to the script), sorted |
 
 `rhi.load_ply(path)` reads the vertex element of a binary little-endian PLY file whose
@@ -476,6 +486,13 @@ uploads them unchanged, one record per vertex, and returns:
 | `lod` | levels of detail, for a file of Gaussian splats; see below |
 
 Shaders then read whatever properties they need, at offsets the script passes in.
+
+**Missing files.** A file that is missing, or doesn't read as a PLY file, doesn't stop the
+script: `rhi.load_ply` warns once and returns a stand-in, a cube of side 1 at the origin
+whose faces are 6,144 flat splats in a blue checker (with levels of detail, uncached). Its
+`missing` field then says why. The path is watched, so the script reloads once the file
+is there. `splat.lua`, `fusion.lua` and the scenes show the cube in the file's place and
+say so in the window title.
 
 **Levels of detail.** A file of Gaussian splats (with `x`, `y`, `z`, `scale_0..2`,
 `rot_0..3`, `opacity` and `f_dc_0..2`) gets levels of detail automatically, unless the
@@ -504,7 +521,8 @@ detail](#levels-of-detail).
 `rhi.sound(path [, options])` loads a sound: WAV, FLAC or MP3, recognized by its contents
 whatever the extension. The path is looked up like `rhi.load_ply`'s: next to the script,
 then in `assets/`. It is streamed from disk as it plays, and mixed with any others on the
-default audio device.
+default audio device. A missing file (or one that doesn't decode) gives `nil` instead, with
+a warning; the path is watched, and the script reloads once the file is there.
 
 | Option | Default | |
 | --- | --- | --- |
@@ -994,7 +1012,7 @@ as `rhi.time()`.
 
 `scripts/splat.lua` (the showcase's `splats.json`) renders a 3D Gaussian splatting scene.
 The method is Kerbl et al., "3D Gaussian Splatting for Real-Time Radiance Field Rendering"
-(2023). The scene is `assets/skull.ply`: 1.9 million Gaussians, each with a position,
+(2023). The scene is `assets/gsplats/skull.ply`: 1.9 million Gaussians, each with a position,
 rotation, scale, opacity, and degree-3 spherical harmonics for view-dependent color.
 
 | File | Role |
@@ -1293,7 +1311,7 @@ missing required field stops the load, with the entity and the field in the mess
 | Component | Fields (defaults) | System |
 | --- | --- | --- |
 | `light` | `color`, `intensity` (9), `range` (14), `orbitRadius` (0), `speed` (0, radians per second), `phase`, `bob` | one point light, orbiting the entity's position; one per scene |
-| `mesh` | `shape` ("box" or "sphere"), `size` (a box's, whole: [1, 1, 1]), `radius` (0.5), `color`, `pattern` (0 plain, 1 stripes, 2 checker) | instanced, lit and shadowed boxes and spheres |
+| `mesh` | `shape` ("box" or "sphere"), `size` (a box's, whole: [1, 1, 1]), `radius` (0.5), `color`, `pattern` (0 plain, 1 stripes, 2 checker on the floor, 3 checker on every face) | instanced, lit and shadowed boxes and spheres |
 | `body` | `motion` ("dynamic", "static", "kinematic"), `density` (1000), `friction` (0.5), `restitution` (0), `velocity`, `angularVelocity` | a Jolt body for the mesh; without it, the mesh is visual (placed by Lua) |
 | `splat` | `file` (required), `fit` (a radius to scale to; 0: as is), `grid` ([nx, nz] copies), `spacing`, `turn` (degrees per copy), `clip` (`mode` "carve" or "keep", `shapes`: spheres and boxes with `position`, `move`, `speed`, `spin`) | Gaussian splats with LOD, lighting, shadows, clipping; one renderer per file, entities as its instances |
 | `sdf` | `shape` (required: a node, below), `cache` (0: the DAG; or voxels a side), `sharpness` (8, of soft shadows), `blend` (0: how smoothly the entities' shapes join one another) | all entities' shapes as one composition, raymarched (timed on the GPU), shadowing everything; cached if any asks |
