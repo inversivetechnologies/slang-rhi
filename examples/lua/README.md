@@ -45,7 +45,8 @@ examples/lua/
     sdf/               SDF compositions: smooth booleans (smooth-ops), the DAG evaluator
                        (sdf-dag), placement in the world (sdf-world), and the
                        raymarching pass (raymarch)
-    post/              full-screen passes (composite, depth-composite, crosshair)
+    post/              full-screen passes (composite, depth-composite, crosshair,
+                       ssao and ssao-apply: ambient occlusion and indirect light)
     shader-toy/        the ShaderToy framework (shader-toy.slang) and the toys
     ui/                2D user interface: rectangles and text (ui), the bitmap font (font)
   tools/               make-font.py: generates shaders/ui/font.slang
@@ -105,7 +106,7 @@ and 2D SDFs.
 | Left / Right arrow, Page Up / Page Down | previous / next scene |
 | `1` .. `9` | jump to a scene |
 | Steam Controller LB / RB | previous / next scene |
-| V | show everything / the meshes / the splats / the SDFs / the depth buffers |
+| V | show everything / the meshes / the splats / the SDFs / the depth buffers (/ the ambient occlusion / the indirect light, when on) |
 | Tab | hide or show the insets |
 | O | 2D overlays: none, Controller, 2D SDFs |
 | Escape, Steam Controller Menu | the [pause menu](#the-pause-menu) |
@@ -125,12 +126,15 @@ and the shaders' `time` stops, so everything animated by it holds still too.
 | Fullscreen | Off, On | fullscreen on the primary monitor, at the resolution |
 | Max splats | 250,000 .. 2,000,000 | the splats' budget: the levels of detail fit what is drawn to it (a scene's own `splatBudget`, if lower, still holds) |
 | Shadow quality | Low (256), Medium (512), High (1024), Ultra (2048) | the shadow maps' texels per cube face; the scene (or script) is loaded again with them |
+| Ambient occlusion | On, Off | [SSAO](#ambient-occlusion-and-indirect-light): darker where surfaces are close to others |
+| Indirect light | Off, On | [SSGI](#ambient-occlusion-and-indirect-light): light bounced from the surfaces seen nearby |
 
 Each script shows the settings it has:
 
 | Script | Settings |
 | --- | --- |
-| `showcase.lua`, `scenes.lua`, `fusion.lua` | all four |
+| `showcase.lua`, `scenes.lua` | all six |
+| `fusion.lua` | resolution, fullscreen, max splats, shadow quality |
 | `physics.lua`, `scene.lua` | resolution, fullscreen, shadow quality |
 | `splat.lua` | resolution, fullscreen, max splats |
 | `sdf-cache.lua`, `shader-toy.lua`, `surface.lua` | resolution, fullscreen |
@@ -200,7 +204,7 @@ depth](#example-combining-passes-by-depth).
 | Input | Action |
 | --- | --- |
 | Page Up / Page Down | previous / next scene |
-| V | show everything / the meshes / the splats / the SDFs / the depth buffers |
+| V | show everything / the meshes / the splats / the SDFs / the depth buffers (/ the ambient occlusion / the indirect light, when on) |
 | Tab | hide or show the insets |
 | O | 2D overlays (`assets/overlays/`): none, then each in turn |
 | everything else | the scene's: its behaviors (below), its orbit camera (drag, wheel), M to mute its sounds |
@@ -257,6 +261,34 @@ watched, so the scene reloads when it turns up), with a warning:
 | a prefab file | a blue checkered box (a `mesh`, `pattern` 3); the instance's components that need the prefab's fields are left out |
 | a sound file | nothing: silence |
 | a behavior | nothing: the entity runs no behavior |
+
+#### Ambient occlusion and indirect light
+
+Every view of a scene can have screen-space ambient occlusion (SSAO) and screen-space
+indirect light (SSGI), switched in the [pause menu](#the-pause-menu) (SSAO is on by
+default, SSGI off). They work on whatever the view shows: meshes, SDFs and splats, from
+the depth buffers the depth composite merges.
+
+| Pass | |
+| --- | --- |
+| depth composite | as before, but into a linear texture of the view's size rather than the window |
+| effects (`post/ssao.slang`, `effectsMain`) | at half resolution, timed: each pixel's position and normal, rebuilt from the nearest depth, and 12 directions over the normal's hemisphere (cosine-weighted, turned per pixel by a 4 x 4 pattern) |
+| blur (`blurMain`) | 5 x 5, weighted to similar depths: the pattern's noise averaged out, edges kept |
+| apply (`post/ssao-apply.slang`) | the image times the visibility, plus the indirect light, into the window (or the inset's texture) |
+
+- **Occlusion:** a point a short way (1 unit) along each direction is occluded where the
+  depth buffer has a surface in front of it. A surface much nearer the camera than the
+  pixel counts less, so that foreground objects don't cast halos on what is behind them.
+- **Indirect light:** a point a longer way (2.5 units) along each direction; where the
+  direction is blocked, and the surface blocking it faces the pixel, that surface's light
+  (from the merged image) arrives by the cosine at the pixel and a falloff with distance.
+  It is what the camera sees of the scene, so a surface off screen, or behind another,
+  bounces nothing.
+- **Tuning:** the radii and strengths are `renderer.EFFECT_PARAMS` in
+  `scripts/lib/scene/renderer.lua`.
+- **Seeing them:** V goes on to the ambient visibility and the indirect light alone, when
+  they are on. The window title gives the effects pass's GPU time, about 0.9 ms for both
+  at 1600 x 900 on an RTX 3050 Laptop GPU.
 
 ### The SDF cache
 
@@ -1430,6 +1462,7 @@ return true when they handle the event), `addOverlays(graph)`, `enter()`, `leave
 | per view: opaque | renderer, mesh | color and depth; the meshes draw into it |
 | per view: surfaces | sdf, splat | the raymarching (stopping at the meshes' depth), the splats |
 | per view: depth composite | renderer | the view's surfaces merged by depth (`post/depth-composite.slang`), into the window or the inset's texture |
+| per view: effects | renderer | with SSAO or SSGI on: the composite goes to a texture, then the effects, their blur, and their application into the window or the inset's texture |
 | overlays | behaviors | over the main view: the crosshair |
 | insets | renderer, camera | each inset framed in its corner, stacked if several share one |
 | 2D overlays | the viewer's overlays | each overlay's shader and its framed panel, all off but the one shown |

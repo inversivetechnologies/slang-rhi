@@ -2,7 +2,8 @@
 -- systems and a render graph built from them), one at a time.
 --
 --   Page Up / Page Down   previous / next scene
---   V                     show: everything / meshes / splats / SDFs / the depth buffers
+--   V                     show: everything / meshes / splats / SDFs / the depth buffers /
+--                         the ambient occlusion / the indirect light (when they are on)
 --   Tab                   hide / show the insets (cameras with "inset")
 --   O                     2D overlays (assets/overlays/, lib/scene/overlays.lua): none,
 --                         then each in turn, over whichever scene is shown
@@ -18,7 +19,7 @@ local overlayLayer = rhi.include("lib/scene/overlays.lua")
 local pauseMenu = rhi.include("lib/pause-menu.lua")
 local settings = rhi.include("lib/settings.lua")
 
-local SHOW_MODES = { "everything", "meshes", "splats", "SDFs", "depth buffers" }
+local SHOW_MODES = { "everything", "meshes", "splats", "SDFs", "depth buffers", "ambient occlusion", "indirect light" }
 
 -- `setTitle(details)` shows the title (default: "Scenes | ..."); `order`, if given, lists
 -- scene file names to put first, in that order (the rest follow, sorted).
@@ -101,6 +102,7 @@ return function(setTitle, order)
         overlays = overlays or overlayLayer.load()
         values = values or settings.load()
         scenes.renderer.shadowFaceSize = settings.SHADOW_FACE_SIZES[values.shadowQuality]
+        scenes.renderer.effects = { ao = values.ssao, gi = values.ssgi }
         menu = menu or pauseMenu.new {
             settings = values,
             onPause = function(paused)
@@ -114,6 +116,10 @@ return function(setTitle, order)
                 elseif name == "shadowQuality" then
                     scenes.renderer.shadowFaceSize = settings.SHADOW_FACE_SIZES[values.shadowQuality]
                     load(index) -- the shadow maps are part of the scene's graph
+                elseif name == "ssao" or name == "ssgi" then
+                    scenes.renderer.effects = { ao = values.ssao, gi = values.ssgi }
+                    if not (values.ssao or values.ssgi) and showMode > 5 then showMode = 1 end
+                    load(index) -- so are the effects' passes
                 end
             end,
         }
@@ -188,7 +194,8 @@ return function(setTitle, order)
         end
         if not current then return end
         if action == input.PRESS and key == keys.V then
-            showMode = showMode % #SHOW_MODES + 1
+            local count = (values.ssao or values.ssgi) and #SHOW_MODES or 5 -- the effects' only with them
+            showMode = showMode % count + 1
             current:setShowMode(showMode - 1)
             updateTitle()
         elseif action == input.PRESS and key == keys.TAB then

@@ -7,6 +7,7 @@
 --   fullscreen      true / false
 --   splatBudget     the most splats drawn a frame (the levels of detail fit them to it)
 --   shadowQuality   "Low", "Medium", "High" or "Ultra": the shadow maps' size
+--   ssao, ssgi      screen-space ambient occlusion and indirect light (post/ssao.slang)
 
 local json = rhi.include("lib/scene/json.lua")
 
@@ -20,6 +21,8 @@ local DEFAULTS = {
     fullscreen = false,
     splatBudget = 1000000,
     shadowQuality = "Medium",
+    ssao = true,
+    ssgi = false,
 }
 
 local function path()

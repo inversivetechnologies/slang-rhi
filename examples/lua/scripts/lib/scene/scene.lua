@@ -105,6 +105,8 @@ function Scene:describe()
         local text = system.describe and system.describe(self.ctx)
         if text then parts[#parts + 1] = text end
     end
+    local effects = renderer.describeEffects(self.ctx)
+    if effects then parts[#parts + 1] = effects end
     return table.concat(parts, " | ")
 end
 

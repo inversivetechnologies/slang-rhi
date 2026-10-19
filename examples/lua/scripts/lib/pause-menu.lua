@@ -1,7 +1,7 @@
 -- The pause menu: Escape (or the Steam Controller's Menu button) opens it over whatever
 -- is shown, and pauses it. Resume, Settings, Quit; the settings are the resolution,
--- fullscreen, the most splats drawn and the shadows' quality (lib/settings.lua keeps
--- them between runs).
+-- fullscreen, the most splats drawn, the shadows' quality, and the screen-space ambient
+-- occlusion and indirect light (lib/settings.lua keeps them between runs).
 --
 --   local menu = rhi.include("lib/pause-menu.lua").new {
 --       settings = values,                    -- from settings.load(); changed in place
@@ -113,6 +113,12 @@ function Menu:rows()
         { key = "shadowQuality", label = "Shadow quality", choices = settings.SHADOW_QUALITIES, index = shadowIndex,
           format = function(q) return q .. " (" .. settings.SHADOW_FACE_SIZES[q] .. ")" end,
           apply = function(q) v.shadowQuality = q return "shadowQuality", q end },
+        { key = "ssao", label = "Ambient occlusion", choices = { false, true }, index = v.ssao and 2 or 1,
+          format = function(on) return on and "On" or "Off" end,
+          apply = function(on) v.ssao = on return "ssao", on end },
+        { key = "ssgi", label = "Indirect light", choices = { false, true }, index = v.ssgi and 2 or 1,
+          format = function(on) return on and "On" or "Off" end,
+          apply = function(on) v.ssgi = on return "ssgi", on end },
         { label = "Back", action = function() self.page, self.selected = "main", 2 end },
     }
     if not self.only then return rows end

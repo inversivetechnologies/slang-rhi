@@ -69,6 +69,14 @@ end
 -- setting changes it, for the graphs built after.
 renderer.shadowFaceSize = 512
 
+-- Screen-space effects on every view (post/ssao.slang): ambient occlusion and indirect
+-- light. The settings change them, for the graphs built after.
+renderer.effects = { ao = true, gi = false }
+renderer.EFFECT_PARAMS = {
+    aoRadius = 1.0, aoStrength = 1.6, -- world units; 1: black where fully occluded
+    giRadius = 2.5, giStrength = 2.5,
+}
+
 function renderer.build(ctx, systems)
     local FACE = renderer.shadowFaceSize
     local srgb = rhi.window_srgb()
@@ -98,6 +106,22 @@ function renderer.build(ctx, systems)
         compositeTexture = rhi.render_pipeline { shader = "post/depth-composite.slang", format = "rgba16f" },
         frame = rhi.render_pipeline { shader = "post/composite.slang" },
     }
+    local fx = renderer.effects
+    local effectsOn = fx.ao or fx.gi
+    if effectsOn then
+        pipelines.effects = rhi.compute_pipeline("post/ssao.slang", "effectsMain")
+        pipelines.effectsBlur = rhi.compute_pipeline("post/ssao.slang", "blurMain")
+        pipelines.applyWindow = rhi.render_pipeline { shader = "post/ssao-apply.slang" }
+        pipelines.applyTexture = rhi.render_pipeline { shader = "post/ssao-apply.slang", format = "rgba16f" }
+        local p = renderer.EFFECT_PARAMS
+        ctx.effectsBlock = rhi.params {
+            depthNear = 0.1, depthFar = 100,
+            aoEnabled = fx.ao and 1 or 0, giEnabled = fx.gi and 1 or 0,
+            aoRadius = p.aoRadius, aoStrength = p.aoStrength, giRadius = p.giRadius,
+        }
+        ctx.effectsSampler = rhi.sampler { filter = "linear", address = "clamp" }
+        ctx.effectsNodes = {}
+    end
 
     local graph = rhi.graph()
     call(systems, "addPrepasses", ctx, graph)
@@ -144,19 +168,62 @@ function renderer.build(ctx, systems)
             splatColor = t.splatColor, splatDepth = t.splatDepth,
             sdfColor = t.sdfColor, sdfDepth = t.sdfDepth,
             depthNear = 0.1, depthFar = 100, -- the planes every pass writes depth with
-            encodeGamma = view.inset and 0 or (srgb and 0 or 1),
+            -- With the effects, linear into a texture of its own; they encode it after.
+            encodeGamma = (view.inset or effectsOn) and 0 or (srgb and 0 or 1),
             showMode = ctx.showMode or 0,
         }
         ctx.composites[#ctx.composites + 1] = view.composite
+        local scale, shape = view.inset or 1, view.inset and "square" or nil
         if view.inset then
             view.image = rhi.render_target("rgba16f", view.inset, "square")
         end
-        local present = graph:render_pass { name = view.name .. ": depth composite", target = view.image }
+        if effectsOn then
+            view.litImage = rhi.render_target("rgba16f", scale, shape)
+        end
+        local present = graph:render_pass { name = view.name .. ": depth composite", target = view.litImage or view.image }
         present:draw {
-            pipeline = view.inset and pipelines.compositeTexture or pipelines.compositeWindow,
+            pipeline = (view.inset or effectsOn) and pipelines.compositeTexture or pipelines.compositeWindow,
             count = 3,
             params = view.composite,
         }
+
+        if effectsOn then
+            -- SSAO and SSGI at half resolution, blurred, then put on the image.
+            local raw = rhi.render_target("rgba16f", scale * 0.5, shape)
+            local blurred = rhi.render_target("rgba16f", scale * 0.5, shape)
+            local inputs = { meshDepth = t.meshDepth, splatDepth = t.splatDepth, sdfDepth = t.sdfDepth,
+                             litColor = view.litImage }
+            local node = graph:dispatch {
+                name = view.name .. ": " .. (fx.ao and fx.gi and "SSAO + SSGI" or fx.ao and "SSAO" or "SSGI"),
+                pipeline = pipelines.effects,
+                params = { view.block, ctx.effectsBlock, inputs, { effects = raw } },
+                threads = raw,
+                timed = not view.inset,
+            }
+            if not view.inset then
+                ctx.effectsNodes[#ctx.effectsNodes + 1] = node
+                ctx.effectsLabel = fx.ao and fx.gi and "SSAO + SSGI" or fx.ao and "SSAO" or "SSGI"
+            end
+            graph:dispatch {
+                name = view.name .. ": effects blur",
+                pipeline = pipelines.effectsBlur,
+                params = { view.block, ctx.effectsBlock, inputs, { effectsIn = raw, effectsOut = blurred } },
+                threads = blurred,
+            }
+            view.apply = rhi.params {
+                litColor = view.litImage, effects = blurred, effectsSampler = ctx.effectsSampler,
+                giStrength = fx.gi and renderer.EFFECT_PARAMS.giStrength or 0,
+                outputEncodeGamma = view.inset and 0 or (srgb and 0 or 1),
+                showMode = ctx.showMode or 0,
+            }
+            ctx.composites[#ctx.composites + 1] = view.apply
+            local apply = graph:render_pass { name = view.name .. ": effects", target = view.image }
+            apply:draw {
+                pipeline = view.inset and pipelines.applyTexture or pipelines.applyWindow,
+                count = 3,
+                params = view.apply,
+            }
+        end
     end
 
     call(systems, "addOverlays", ctx, graph)
@@ -185,10 +252,17 @@ function renderer.build(ctx, systems)
 end
 
 -- What the depth composites show: 0 everything, 1 the meshes, 2 the splats, 3 the SDFs,
--- 4 the depth buffers.
+-- 4 the depth buffers; with the effects on, 5 the ambient occlusion, 6 the indirect light.
 function renderer.setShowMode(ctx, mode)
     ctx.showMode = mode
     for _, block in ipairs(ctx.composites or {}) do block.showMode = mode end
+end
+
+-- The effects' GPU time in the main view, for a title; nil without them.
+function renderer.describeEffects(ctx)
+    local node = ctx.effectsNodes and ctx.effectsNodes[1]
+    if not node then return nil end
+    return string.format("%s %.2f ms", ctx.effectsLabel, node.gpu_time or 0)
 end
 
 return renderer
