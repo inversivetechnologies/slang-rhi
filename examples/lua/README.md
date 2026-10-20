@@ -278,7 +278,7 @@ on):
 | Phase | What | Passes | Debug view |
 | --- | --- | --- | --- |
 | 1 | the G-buffer: normals (rebuilt from the merged depth: on each axis the neighbor nearer in depth) and view depth; the albedo of the nearest surface; a Hi-Z pyramid of the nearest depth, half to a 32nd resolution | `gbuffer.slang`; the meshes' albedo pass (`scene/albedo.slang`), the raymarcher's albedo, the splats' albedo luminance in their blended depth | normals, Hi-Z, albedo |
-| 2 | the global SDF: a 96^3 volume of 0.2 m voxels about the camera (snapped to 4 voxels), narrow-band (0.8 m), with albedo -- rebuilt every frame from the bodies (boxes, spheres: analytic) and the SDF composition. A voxel is one uint, its distance (16 bits) above its albedo (5:6:5), so one atomic min keeps the nearest and its color | `global-sdf-bake.slang`, read with `global-sdf.slang` | global SDF: the volume sphere-traced and lit |
+| 2 | the global SDF: a 96^3 volume of 0.2 m voxels about the camera (snapped to 4 voxels), narrow-band (0.8 m), with albedo -- rebuilt every frame from the bodies (boxes, spheres: analytic) and the SDF composition, over a static part: the splats, as ellipsoids (2 standard deviations, opacity at least 0.2) from a cut through their levels of detail at about 0.12 m, their color as captured for albedo -- baked again only when the volume moves. A voxel is one uint, its distance (16 bits) above its albedo (5:6:5), so one atomic min keeps the nearest and its color | `global-sdf-bake.slang`, `global-sdf-splats.slang`, read with `global-sdf.slang` | global SDF: the volume sphere-traced and lit |
 | 3 | world-space probes (DDGI) as the far field: 16 x 8 x 16, 1 m apart, about the camera (storage by world cell, so a probe's data stays with its place); 96 rays a probe a frame through the global SDF, the hits lit by the key light (shadow maps), the point lights and the probes themselves (further bounces); octahedral irradiance, radiance and depth moments (Chebyshev visibility), blended in world space (hysteresis 0.95) | `ddgi-update.slang`, read with `ddgi.slang` | DDGI: the probes' irradiance at each pixel's surface |
 | 4 | screen-space radiance cascades for the near field: 4 cascades of probes on the G-buffer's surfaces (a probe every 8 pixels in cascade 0 at Half quality, 4 at Full, doubling each cascade; each probe's depth and normal the means over its cell), 4 x 4 hemispherical octahedral directions in cascade 0, doubling each cascade (every atlas the same size), intervals 0.12 m long in cascade 0, 4 x longer each cascade. Each interval marched on the screen, the Hi-Z pyramid skipping what the ray is in front of; a hit within 0.35 m behind the depth takes the lit image's color there; off the screen, or behind a surface by more, the global SDF takes over (its hits lit by the key light and the probes) | `rc.slang`: `probesMain`, `cascadeMain` | cascade 0 .. 3: their atlases, each probe's directions a tile |
 | 5 | merged coarse to fine: each direction continued by the 4 probes of the cascade above (bilinear), weighted by depth (plane distance) and normal and whether the direction is in that probe's hemisphere, its ray traced to *that* probe's interval start (the bilinear fix: no gaps or overlaps between probes' intervals); the last cascade continued by the probes' radiance (the far field) | `cascadeMain` | (the cascade views show them merged) |
@@ -299,9 +299,11 @@ on):
 - **Cost** at 1600 x 900 on an RTX 3050 Laptop GPU (D3D12): the global SDF's clear and
   resolve 0.08 ms (its bake between them untimed), the probes 1.1 ms, the cascades 2.8 ms
   at Half and 10 ms at Full. The window title gives them.
-- **Not (yet) in the global SDF:** the splats (on screen, the cascades see them; off it, or
-  behind something, they neither occlude nor bounce). The point lights' direct light on what
-  only the global SDF sees (off screen) is left out; the probes carry its bounce.
+- **Splats in the global SDF:** so off screen, or behind something, they still occlude and
+  bounce light. They don't move, so they are baked into a static copy of the volume only
+  when it follows the camera to a new place (every 0.8 m), about 4 ms then on the skull;
+  every frame's rebuild starts from that copy. The point lights' direct light on what only
+  the global SDF sees (off screen) is left out; the probes carry its bounce.
 - **D3D11:** fxc compiles `rc.slang` in about 1.5 s; the GI's GPU times read 0 there.
 
 #### Ambient occlusion and indirect light

@@ -3,7 +3,8 @@
 --
 --   phase 1  the G-buffer (normals, view depth) and a Hi-Z pyramid: shaders/gi/gbuffer.slang
 --   phase 2  the global SDF: a distance volume with albedo about the camera, rebuilt every
---            frame from the bodies and the SDF composition (shaders/gi/global-sdf*.slang)
+--            frame from the bodies, the SDF composition and the splats (a cut through their
+--            levels of detail, as ellipsoids) (shaders/gi/global-sdf*.slang)
 --   phase 3  world-space probes (DDGI) about the camera, tracing the global SDF: the far
 --            field, the cascades' last (shaders/gi/ddgi*.slang)
 --   phase 4  screen-space radiance cascades on the G-buffer's surfaces: Hi-Z marching per
@@ -25,6 +26,8 @@ gi.HIZ_LEVELS = 5 -- half resolution down to a 32nd
 gi.GSDF_RESOLUTION = 96
 gi.GSDF_VOXEL = 0.2
 gi.GSDF_BAND = 0.8
+-- The splats in it: their levels of detail cut at bounds of about this radius.
+gi.GSDF_SPLAT_SIZE = 0.12
 
 -- The probes: how many each way, how far apart, what a frame's rays keep of the last
 -- (world space: a probe's own history), and the rays a probe traces a frame.
@@ -57,6 +60,7 @@ local function makePipelines()
         gsdfBodies = rhi.compute_pipeline("gi/global-sdf-bake.slang", "bodiesMain"),
         gsdfComposition = rhi.compute_pipeline("gi/global-sdf-bake.slang", "compositionMain"),
         gsdfResolve = rhi.compute_pipeline("gi/global-sdf-bake.slang", "resolveMain"),
+        gsdfSplats = rhi.compute_pipeline("gi/global-sdf-splats.slang", "splatsMain"),
         ddgiTrace = rhi.compute_pipeline("gi/ddgi-update.slang", "traceMain"),
         ddgiIrradiance = rhi.compute_pipeline("gi/ddgi-update.slang", "irradianceMain"),
         ddgiDepth = rhi.compute_pipeline("gi/ddgi-update.slang", "depthMain"),
@@ -107,13 +111,34 @@ function gi.addView(ctx, graph, view, t, fx)
     g.gsdf = {
         volume = rhi.texture { width = R, height = R, depth = R, format = "rgba16f" },
         voxels = rhi.buffer(R * R * R * 4), -- distance (16 bits) and albedo (5:6:5)
+        static = rhi.buffer(R * R * R * 4), -- the splats', baked when the volume moves
     }
     g.gsdfBlock = rhi.params {
         gsdfOrigin = { 0, 0, 0 }, gsdfVoxel = gi.GSDF_VOXEL, gsdfResolution = R, gsdfBand = gi.GSDF_BAND,
         gsdfVoxels = g.gsdf.voxels,
         gsdfVolume = g.gsdf.volume, gsdfSampler = rhi.sampler { filter = "linear", address = "clamp" },
         compositionCorner = { 0, 0, 0 }, compositionSize = { 0, 0, 0 },
+        gsdfStatic = g.gsdf.static, gsdfHasStatic = ctx.splats and 1 or 0,
     }
+    -- The splats don't move (their instances stay put; what clipping cuts away is only
+    -- not drawn): they go into the static part, baked again only when the volume follows
+    -- the camera to a new place (gi.updateFrame), a cut through their levels of detail as
+    -- ellipsoids. The clear then starts from it every frame.
+    g.staticNodes = {}
+    if ctx.splats then
+        local toStatic = { gsdfVoxels = g.gsdf.static, gsdfStatic = g.gsdf.voxels, gsdfHasStatic = 0 }
+        g.staticNodes[#g.staticNodes + 1] = graph:dispatch {
+            name = "GI global SDF: splats, clear", pipeline = p.gsdfClear, params = { g.gsdfBlock, toStatic },
+            threads = { R * R * R, 1, 1 } }
+        for _, f in ipairs(ctx.splats) do
+            local params, entries = f.module.globalSdfParams(f.instances)
+            params[#params + 1] = g.gsdfBlock
+            params[#params + 1] = { gsdfSplatSize = gi.GSDF_SPLAT_SIZE, gsdfVoxels = g.gsdf.static }
+            g.staticNodes[#g.staticNodes + 1] = graph:dispatch {
+                name = "GI global SDF: splats " .. f.file, pipeline = p.gsdfSplats, params = params,
+                threads = { entries, f.instanceCount, 1 }, timed = true }
+        end
+    end
     g.gsdfClearNode = graph:dispatch { name = "GI global SDF: clear", pipeline = p.gsdfClear, params = { g.gsdfBlock },
                                        threads = { R * R * R, 1, 1 }, timed = true }
     -- The composition first (stored), then the bodies (where nearer).
@@ -246,6 +271,11 @@ function gi.updateFrame(ctx)
     local origin = {}
     for k = 1, 3 do origin[k] = math.floor(eye[k] / snap + 0.5) * snap - half end
     g.gsdfBlock.gsdfOrigin = origin
+    -- The static part (the splats) again, only where the volume moved to.
+    local moved = not g.staticOrigin or origin[1] ~= g.staticOrigin[1] or origin[2] ~= g.staticOrigin[2]
+        or origin[3] ~= g.staticOrigin[3]
+    for _, node in ipairs(g.staticNodes) do node.enabled = moved end
+    if moved then g.staticOrigin = origin end
     if ctx.sdf and g.compositionSize then
         local corner = {}
         for k = 1, 3 do

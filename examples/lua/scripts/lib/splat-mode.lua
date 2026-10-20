@@ -683,6 +683,15 @@ return function(setTitle, file)
 
     function splat.budget() return budget end
 
+    -- What a pass over every splat (the file's and the merged ones) of every instance needs
+    -- to place them -- the GI's global SDF (shaders/gi/global-sdf-splats.slang): its
+    -- parameter blocks, and the splats an instance has.
+    function splat.globalSdfParams(instances)
+        local r = splat.createResources()
+        return { { plyData = r.ply.buffer, ply = plyLayout(r.ply), splatCount = r.entries },
+                 blocks.lodData, instances or blocks.singleInstance, blocks.view }, r.entries
+    end
+
     -- Why the file couldn't be loaded, if it couldn't: rhi.load_ply shows a blue checkered
     -- cube in its place, until it is there.
     function splat.missing() return missing end

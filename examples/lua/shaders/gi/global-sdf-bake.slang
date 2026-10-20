@@ -1,13 +1,15 @@
 // Builds the global SDF (global-sdf.slang) every frame, in a buffer first (so that every
 // source can min into it with an atomic), then into the texture that is sampled:
 //
-//   clearMain       every voxel: the band's edge, no albedo
+//   clearMain       every voxel: the static part's (the splats, baked when the volume last
+//                   moved), or the band's edge and no albedo
 //   compositionMain the SDF composition (sdf-world.slang), over the voxels of its bounds,
-//                   first: stored as it is
+//                   first: the nearer of it and the static part
 //   bodiesMain      one thread per body and z slice of the volume (a group's bodies: boxes
 //                   or spheres, from its bodies buffer, scene-common.slang's layout): the
 //                   voxels of that slice near the body take the body's distance and color,
 //                   if nearer
+//   (the splats: global-sdf-splats.slang, into the static part, when the volume moves)
 //   resolveMain     into gsdfVolumeOut: rgb albedo, a distance
 //
 // A voxel is one uint: its distance quantized to 16 bits (over [-band, band]) above its
@@ -16,43 +18,15 @@
 // the distances: this needs none.)
 
 #include "sdf/sdf-world.slang"
-
-uniform float3 gsdfOrigin;
-uniform float gsdfVoxel;
-uniform uint gsdfResolution;
-uniform float gsdfBand;
-
-RWStructuredBuffer<uint> gsdfVoxels;
+#include "global-sdf-voxels.slang"
 
 uniform uint bodyCount;
 uniform uint bodyIsSphere; // the group's shape: 0 boxes, 1 spheres
 
-uint encodeVoxel(float d, float3 color)
-{
-    uint q = uint(saturate((d + gsdfBand) / (2.0 * gsdfBand)) * 65535.0 + 0.5);
-    uint3 c = uint3(saturate(color) * float3(31.0, 63.0, 31.0) + 0.5);
-    return (q << 16) | (c.r << 11) | (c.g << 5) | c.b;
-}
-
-float decodeDistance(uint v)
-{
-    return float(v >> 16) / 65535.0 * 2.0 * gsdfBand - gsdfBand;
-}
-
-float3 decodeAlbedo(uint v)
-{
-    return float3((v >> 11) & 31u, (v >> 5) & 63u, v & 31u) / float3(31.0, 63.0, 31.0);
-}
-
-uint voxelIndex(uint3 v)
-{
-    return (v.z * gsdfResolution + v.y) * gsdfResolution + v.x;
-}
-
-float3 voxelCenter(uint3 v)
-{
-    return gsdfOrigin + (float3(v) + 0.5) * gsdfVoxel;
-}
+// The static part (the splats: global-sdf-splats.slang), baked into gsdfStatic only when
+// the volume moves; the clear starts every frame from it.
+StructuredBuffer<uint> gsdfStatic;
+uniform uint gsdfHasStatic;
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -61,7 +35,8 @@ void clearMain(uint3 tid: SV_DispatchThreadID)
     uint n = gsdfResolution * gsdfResolution * gsdfResolution;
     if (tid.x >= n)
         return;
-    gsdfVoxels[tid.x] = encodeVoxel(gsdfBand, float3(0, 0, 0));
+    // What doesn't move (the splats), baked when the volume last moved; else nothing.
+    gsdfVoxels[tid.x] = gsdfHasStatic != 0 ? gsdfStatic[tid.x] : encodeVoxel(gsdfBand, float3(0, 0, 0));
 }
 
 // A body's distance at `p` (bodies[]: position, rotation, scale -- half extents, or the
@@ -135,8 +110,13 @@ void compositionMain(uint3 tid: SV_DispatchThreadID)
     float3 q = toSdfSpace(voxelCenter(min(v, gsdfResolution - 1)));
     float d = sdfFieldDistance(q);
     float3 color = sdfFieldColor(q);
+    // The nearer of it and what is there (the static part): one thread a voxel, no atomic.
+    // (The encoding's order is the distance's.)
     if (inside)
-        gsdfVoxels[voxelIndex(v)] = encodeVoxel(d, color);
+    {
+        uint i = voxelIndex(v);
+        gsdfVoxels[i] = min(gsdfVoxels[i], encodeVoxel(d, color));
+    }
 }
 
 [shader("compute")]
