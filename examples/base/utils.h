@@ -87,12 +87,16 @@ inline Result createDevice(
     std::vector<std::pair<std::string, std::string>> preprocessorMacros,
     IDevice** outDevice,
     std::vector<std::string> slangSearchPaths = {EXAMPLE_DIR},
-    IAdapter* adapter = nullptr // null: the default one
+    IAdapter* adapter = nullptr,         // null: the default one
+    IPersistentCache* shaderCache = nullptr, // compiled shaders, possibly shared by devices
+    const void* next = nullptr           // extended descs (e.g. VulkanDeviceExtendedDesc)
 )
 {
     DeviceDesc deviceDesc = {};
+    deviceDesc.next = next;
     deviceDesc.deviceType = deviceType;
     deviceDesc.adapter = adapter;
+    deviceDesc.persistentShaderCache = shaderCache;
 #if SLANG_RHI_DEBUG
     DebugLayerOptions debugLayerOptions;
     debugLayerOptions.coreValidation = true;

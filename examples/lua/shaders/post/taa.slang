@@ -16,18 +16,12 @@
 //
 // The image is linear (before the window's encoding).
 
-#include "ssao-common.slang"
+#include "reprojection.slang"
 
 static const float kTaaCurrent = 0.1;
 
 Texture2D<float4> taaCurrent; // the view's final image, linear
-Texture2D<float4> meshMotion; // previous world position minus current, where a body is nearest
-Texture2D<float4> splatMotion; // the splats': the same times their alpha, and their alpha (blended)
-uniform EffectsCamera prevCamera;
 uniform uint historyValid;
-uniform float3 sdfOrigin;
-uniform float sdfSpin;
-uniform float timeDelta;    // provided by the host: 0 while paused
 uniform float2 viewportSize; // provided by the host: the view's size (the dispatch's texture)
 
 float3 toYCoCg(float3 c)
@@ -101,30 +95,7 @@ float4 resolve(uint2 tid, Texture2D<float4> history)
 
     // Where this pixel's surface was the frame before.
     float3 world = viewToWorld(camera, viewPosition(camera, (float2(tid) + 0.5) / float2(size), z, aspect));
-    float3 previous = world;
-    if (!isBackground(z))
-    {
-        int3 t = int3(tid, 0);
-        float meshZ = viewDistance(meshDepth.Load(t));
-        float sdfZ = viewDistance(sdfDepth.Load(t));
-        if (meshZ <= z * 1.0001)
-        {
-            previous += meshMotion.Load(t).xyz;
-        }
-        else if (sdfZ <= z * 1.0001)
-        {
-            float a = -sdfSpin * timeDelta, c = cos(a), s = sin(a);
-            float3 d = world - sdfOrigin;
-            previous = sdfOrigin + float3(c * d.x + s * d.z, d.y, -s * d.x + c * d.z);
-        }
-        else
-        {
-            // The splats (nearest, as neither is): the motion of what the pixel shows, their
-            // blended motion over their blended alpha.
-            float4 m = splatMotion.Load(t);
-            previous += m.a > 1e-3 ? m.xyz / m.a : float3(0, 0, 0);
-        }
-    }
+    float3 previous = previousWorld(int2(tid), z, world);
     float3 before = worldToView(prevCamera, previous);
     float2 uv = projectToUv(prevCamera, before, aspect);
     if (before.z <= depthNear || any(uv < 0) || any(uv > 1))

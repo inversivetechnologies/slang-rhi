@@ -9,11 +9,16 @@
 --   fullscreen      true / false
 --   graphicsDevice  { adapter = name }: the GPU to run on (rhi.devices: the engine runs on
 --                   Vulkan only, for now); nil: the default one. The host reads it at
---                   startup; changing it restarts the script on it (rhi.restart).
+--                   startup; changing it moves the running script onto it
+--                   (rhi.switch_device).
 --   graphicsDeviceTrial  the GPU switched to, until it has started: then it becomes
 --                   graphicsDevice (load, once the script runs on it). A device that
 --                   crashes the host on its way up (a driver's) is never kept: the next
 --                   start is on the one before.
+--   upscaling       "Off", "FSR 1" (AMD's, spatial: post/fsr1.slang) or "DLSS" (NVIDIA's,
+--                   temporal; RTX GPUs only): the main view drawn smaller, upscaled
+--   upscalingQuality  "Quality", "Balanced", "Performance" or "Ultra Performance": how much
+--                   smaller (settings.UPSCALING_RATIOS: 1.5 .. 3 times)
 -- Graphics:
 --   splatBudget     the most splats drawn a frame (the levels of detail fit them to it)
 --   shadowQuality   "Low", "Medium", "High" or "Ultra": the shadow maps' size
@@ -41,6 +46,10 @@ settings.AO_METHODS = { "Off", "SSAO", "GTAO" }
 settings.GI_METHODS = { "Off", "SSGI", "Cascades" }
 settings.AA_METHODS = { "Off", "FXAA", "SMAA", "TAA" }
 settings.SENSITIVITIES = { 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3 }
+settings.UPSCALERS = { "Off", "FSR 1", "DLSS" }
+settings.UPSCALING_QUALITIES = { "Quality", "Balanced", "Performance", "Ultra Performance" }
+-- The window's size over the drawn size, per quality (as FSR and DLSS define them).
+settings.UPSCALING_RATIOS = { Quality = 1.5, Balanced = 1.7, Performance = 2.0, ["Ultra Performance"] = 3.0 }
 
 local DEFAULTS = {
     fullscreen = false,
@@ -50,6 +59,8 @@ local DEFAULTS = {
     globalIllumination = "Cascades",
     effectsQuality = "Half",
     antiAliasing = "TAA",
+    upscaling = "Off",
+    upscalingQuality = "Quality",
     mouseSensitivity = 1,
     stickSensitivity = 1,
     invertY = false,
@@ -128,6 +139,10 @@ function settings.load()
     known = false
     for _, m in ipairs(settings.AO_METHODS) do known = known or m == values.ambientOcclusion end
     if not known then values.ambientOcclusion = DEFAULTS.ambientOcclusion end
+    known = false
+    for _, m in ipairs(settings.UPSCALERS) do known = known or m == values.upscaling end
+    if not known then values.upscaling = DEFAULTS.upscaling end
+    if not settings.UPSCALING_RATIOS[values.upscalingQuality] then values.upscalingQuality = DEFAULTS.upscalingQuality end
     shareControls(values)
     return values
 end
@@ -179,6 +194,24 @@ end
 function settings.stickLook(dx, dy)
     local c = settings.controls()
     return dx * c.stick, dy * c.stick * (c.invertY and -1 or 1)
+end
+
+-- The upscalers this device has: FSR 1 everywhere, DLSS where the host says it runs
+-- (rhi.dlss_available: an RTX GPU and NVIDIA's runtime).
+function settings.upscalers()
+    local list = {}
+    for _, m in ipairs(settings.UPSCALERS) do
+        if m ~= "DLSS" or (rhi.dlss_available and rhi.dlss_available()) then list[#list + 1] = m end
+    end
+    return list
+end
+
+-- What renderer.upscaling takes, from `values`: a method the device has, and its ratio.
+function settings.upscalingOf(values)
+    local method = values.upscaling == "FSR 1" and "FSR1" or values.upscaling == "DLSS" and "DLSS" or "Off"
+    if method == "DLSS" and not (rhi.dlss_available and rhi.dlss_available()) then method = "Off" end
+    local quality = settings.UPSCALING_RATIOS[values.upscalingQuality] and values.upscalingQuality or "Quality"
+    return { method = method, ratio = settings.UPSCALING_RATIOS[quality], quality = quality, sharpness = 0.2 }
 end
 
 -- The shadow maps' texels per cube face, as the saved shadow quality asks.

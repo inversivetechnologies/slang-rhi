@@ -50,7 +50,7 @@ Result allocateVkMemory(
     VkDeviceMemory* outMemory
 )
 {
-    int memoryTypeIndex = api.findMemoryTypeIndex(memoryReqs.memoryTypeBits, reqMemoryProperties);
+    int memoryTypeIndex = api.findMemoryTypeIndex(memoryReqs.memoryTypeBits, reqMemoryProperties, memoryReqs.size);
     SLANG_RHI_ASSERT(memoryTypeIndex >= 0);
 
     VkMemoryAllocateInfo allocateInfo = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -90,7 +90,24 @@ Result allocateVkMemory(
         allocateInfo.pNext = &flagInfo;
     }
 
-    SLANG_VK_RETURN_ON_FAIL(api.vkAllocateMemory(api.m_device, &allocateInfo, nullptr, outMemory));
+    VkResult result = api.vkAllocateMemory(api.m_device, &allocateInfo, nullptr, outMemory);
+    // Device local memory full (an integrated GPU's carve-out is small): any memory the
+    // device can use, as long as the allocation didn't ask for more than device locality.
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && (reqMemoryProperties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+    {
+        int fallback = api.findMemoryTypeIndex(
+            memoryReqs.memoryTypeBits,
+            reqMemoryProperties & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            memoryReqs.size,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        );
+        if (fallback >= 0)
+        {
+            allocateInfo.memoryTypeIndex = fallback;
+            result = api.vkAllocateMemory(api.m_device, &allocateInfo, nullptr, outMemory);
+        }
+    }
+    SLANG_VK_RETURN_ON_FAIL(result);
     return SLANG_OK;
 }
 
@@ -414,6 +431,20 @@ Result DeviceImpl::createBuffer(const BufferDesc& desc_, const void* initData, I
         desc.memoryType == MemoryType::ReadBack)
     {
         reqMemoryProperties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        // Read back into cached host memory where there is some: the first host visible
+        // type can be device local (mapped over the bus), which the CPU reads slowly.
+        if (desc.memoryType == MemoryType::ReadBack)
+        {
+            const VkMemoryPropertyFlags cached = reqMemoryProperties | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+            for (uint32_t i = 0; i < m_api.m_deviceMemoryProperties.memoryTypeCount; ++i)
+            {
+                if ((m_api.m_deviceMemoryProperties.memoryTypes[i].propertyFlags & cached) == cached)
+                {
+                    reqMemoryProperties = cached;
+                    break;
+                }
+            }
+        }
     }
     else
     {

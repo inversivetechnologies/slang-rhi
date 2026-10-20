@@ -53,10 +53,12 @@ local function call(systems, name, ...)
     end
 end
 
--- The color textures and depth buffers a view renders into: window-sized, or squares of
--- `inset` times the window's height.
-local function createTargets(inset)
-    local scale, shape = inset or 1, inset and "square" or nil
+-- The color textures and depth buffers a view renders into: `scale` times the window's size
+-- (the main view's render scale, renderer.upscaling), or squares of `inset` times the
+-- window's height.
+local function createTargets(inset, scale)
+    local shape = inset and "square" or nil
+    scale = inset or scale or 1
     return {
         meshColor = rhi.render_target("rgba16f", scale, shape),
         meshDepth = rhi.depth_target(scale, shape),
@@ -92,6 +94,15 @@ renderer.captureMain = false
 --           FXAA (only what is on an edge changes)
 --   "Off"
 renderer.antiAliasing = "TAA"
+
+-- The main view drawn smaller than the window and upscaled to it, for the graphs built
+-- after (the settings change it): `method` "Off", "FSR1" (spatial, post/fsr1.slang: after
+-- the anti-aliasing, at the drawn size) or "DLSS" (NVIDIA's, temporal: in place of the
+-- anti-aliasing), `ratio` the window's size over the drawn size (1.5 "Quality" .. 3 "Ultra
+-- Performance"), `quality` its name (DLSS's quality mode), `sharpness` FSR 1's RCAS, in stops
+-- from the most (0). DLSS reads the drawn image with its depth and motion vectors
+-- (post/dlss-inputs.slang) and does the anti-aliasing too: the AA setting is set aside.
+renderer.upscaling = { method = "Off", ratio = 1.5, quality = "Quality", sharpness = 0.2 }
 
 -- Screen-space effects on every view (post/ssao.slang): ambient occlusion (by `aoMethod`,
 -- "GTAO" or "SSAO") and global illumination (by `giMethod`, "SSGI" or "Cascades"), at a
@@ -168,11 +179,20 @@ function renderer.build(ctx, systems)
     ctx.noLightTiles = ctx.noLightTiles or rhi.buffer(16)
     local fx = renderer.effects
     local effectsOn = fx.ao or fx.gi
-    local taaOn = renderer.antiAliasing == "TAA"
-    local fxaaOn = renderer.antiAliasing == "FXAA"
-    local smaaOn = renderer.antiAliasing == "SMAA"
-    -- What the temporal passes (the effects', TAA's) need: the bodies' motion, the camera's.
-    local temporalOn = effectsOn or taaOn
+    local up = renderer.upscaling
+    local fsrOn = up.method == "FSR1" and up.ratio > 1
+    local dlssOn = up.method == "DLSS" and up.ratio > 1
+    -- The main view's size, of the window's (its targets', the GI's: ctx.renderScale).
+    local renderScale = (fsrOn or dlssOn) and 1 / up.ratio or 1
+    ctx.renderScale = renderScale
+    local function viewScale(view) return view.inset or renderScale end
+    -- (DLSS anti-aliases as it upscales: no AA of the renderer's.)
+    local taaOn = renderer.antiAliasing == "TAA" and not dlssOn
+    local fxaaOn = renderer.antiAliasing == "FXAA" and not dlssOn
+    local smaaOn = renderer.antiAliasing == "SMAA" and not dlssOn
+    -- What the temporal passes (the effects', TAA's, DLSS's inputs) need: the bodies' motion,
+    -- the camera's.
+    local temporalOn = effectsOn or taaOn or dlssOn
     if fxaaOn then
         pipelines.fxaa = rhi.compute_pipeline("post/fxaa.slang", "fxaaMain")
         pipelines.fxaaSampler = rhi.sampler { filter = "linear", address = "clamp" }
@@ -181,6 +201,13 @@ function renderer.build(ctx, systems)
         pipelines.smaaEdges = rhi.compute_pipeline("post/smaa.slang", "edgesMain")
         pipelines.smaaWeights = rhi.compute_pipeline("post/smaa.slang", "weightsMain")
         pipelines.smaaBlend = rhi.compute_pipeline("post/smaa.slang", "blendMain")
+    end
+    if dlssOn then
+        pipelines.dlssInputs = rhi.compute_pipeline("post/dlss-inputs.slang", "inputsMain")
+    end
+    if fsrOn then
+        pipelines.fsrEasu = rhi.compute_pipeline("post/fsr1.slang", "easuMain")
+        pipelines.fsrRcas = rhi.compute_pipeline("post/fsr1.slang", "rcasMain")
     end
     if taaOn then
         pipelines.taa = rhi.compute_pipeline("post/taa.slang", "taaMain")
@@ -224,14 +251,14 @@ function renderer.build(ctx, systems)
     -- The views. An inset's image (and with captureMain, the main view's) is a texture;
     -- the main view's otherwise goes straight to the window.
     local function toTexture(view)
-        return view.inset ~= nil or ((renderer.captureMain or taaOn or fxaaOn or smaaOn) and view == ctx.views[1])
+        return view.inset ~= nil or ((renderer.captureMain or taaOn or fxaaOn or smaaOn or fsrOn or dlssOn) and view == ctx.views[1])
     end
     ctx.composites = {}
     for _, view in ipairs(ctx.views) do
-        view.targets = createTargets(view.inset)
+        view.targets = createTargets(view.inset, renderScale)
         -- Which point lights reach each of the view's tiles, before anything shades.
         if lightsOn then
-            local scale = view.inset or 1
+            local scale = viewScale(view)
             local capacity = math.ceil(LIGHT_TILE_CAPACITY * scale * scale)
             view.lightTiles = rhi.buffer((4 + capacity * LIGHT_TILE_STRIDE) * 4)
             view.block.lightTiles = view.lightTiles
@@ -258,7 +285,7 @@ function renderer.build(ctx, systems)
             view.historyFrames = 0
             -- What moved since the frame before (the bodies; the SDFs' spin is worked out
             -- from their block), so that the effects' history follows it.
-            local scale, shape = view.inset or 1, view.inset and "square" or nil
+            local scale, shape = viewScale(view), view.inset and "square" or nil
             view.targets.meshMotion = rhi.render_target("rgba16f", scale, shape)
             view.targets.motionDepth = rhi.depth_target(scale, shape)
             local motion = graph:render_pass {
@@ -271,8 +298,8 @@ function renderer.build(ctx, systems)
         end
         if effectsOn and fx.giMethod == "Cascades" and not view.inset then
             -- The bodies' albedo, for the GI's G-buffer (what the indirect light lights).
-            view.targets.meshAlbedo = rhi.render_target("rgba16f")
-            view.targets.albedoDepth = rhi.depth_target()
+            view.targets.meshAlbedo = rhi.render_target("rgba16f", renderScale)
+            view.targets.albedoDepth = rhi.depth_target(renderScale)
             local albedo = graph:render_pass {
                 name = view.name .. ": albedo",
                 target = view.targets.meshAlbedo,
@@ -289,7 +316,7 @@ function renderer.build(ctx, systems)
             for _, chain in ipairs(effectChains(fx)) do
                 if chain.gi then giScale = chain.scale end
             end
-            view.splatGi = rhi.render_target("rgba16f", (view.inset or 1) * giScale, view.inset and "square" or nil)
+            view.splatGi = rhi.render_target("rgba16f", viewScale(view) * giScale, view.inset and "square" or nil)
             ctx.splatGiSampler = ctx.splatGiSampler or rhi.sampler { filter = "linear", address = "clamp" }
             view.splatGiParams = { splatGi = view.splatGi, splatGiSampler = ctx.splatGiSampler,
                                    splatGiStrength = renderer.EFFECT_PARAMS.giStrength, splatGiIrradiance = 0 }
@@ -299,7 +326,7 @@ function renderer.build(ctx, systems)
         -- the view (its blended depth does), cached per splat it doesn't. The cascades write
         -- their result into this texture (gi.addView).
         if effectsOn and fx.giMethod == "Cascades" and ctx.splats and not view.inset then
-            view.splatGi = rhi.render_target("rgba16f", 1 / (gi.SPACING0[fx.quality] or 8))
+            view.splatGi = rhi.render_target("rgba16f", renderScale / (gi.SPACING0[fx.quality] or 8))
             ctx.splatGiSampler = ctx.splatGiSampler or rhi.sampler { filter = "linear", address = "clamp" }
             view.splatGiParams = { splatGi = view.splatGi, splatGiSampler = ctx.splatGiSampler,
                                    splatGiStrength = renderer.EFFECT_PARAMS.cascadeStrength, splatGiIrradiance = 1 }
@@ -329,11 +356,11 @@ function renderer.build(ctx, systems)
             lightTiles = view.lightTiles or ctx.noLightTiles,
         }
         ctx.composites[#ctx.composites + 1] = view.composite
-        local scale, shape = view.inset or 1, view.inset and "square" or nil
+        local scale, shape = viewScale(view), view.inset and "square" or nil
         if view.inset then
             view.image = rhi.render_target("rgba16f", view.inset, "square")
         elseif toTexture(view) then
-            view.image = rhi.render_target("rgba16f")
+            view.image = rhi.render_target("rgba16f", renderScale)
         end
         if effectsOn then
             view.litImage = rhi.render_target("rgba16f", scale, shape)
@@ -426,8 +453,8 @@ function renderer.build(ctx, systems)
         -- The main view's image, stabilized against the frames before (post/taa.slang).
         view.taaResolved = nil
         if taaOn and view == ctx.views[1] then
-            view.taaResolved = rhi.render_target("rgba16f")
-            view.taaHistory = rhi.render_target("rgba16f")
+            view.taaResolved = rhi.render_target("rgba16f", renderScale)
+            view.taaHistory = rhi.render_target("rgba16f", renderScale)
             local inputs = { meshDepth = t.meshDepth, splatDepth = t.splatDepth, sdfDepth = t.sdfDepth,
                              depthNear = 0.1, depthFar = 100, meshMotion = t.meshMotion, splatMotion = t.splatMotion,
                              taaCurrent = view.image }
@@ -449,7 +476,7 @@ function renderer.build(ctx, systems)
         -- ...or smoothed along its edges, within the frame (post/fxaa.slang).
         view.fxaaResolved = nil
         if fxaaOn and view == ctx.views[1] then
-            view.fxaaResolved = rhi.render_target("rgba16f")
+            view.fxaaResolved = rhi.render_target("rgba16f", renderScale)
             ctx.fxaaNode = graph:dispatch {
                 name = view.name .. ": FXAA",
                 pipeline = pipelines.fxaa,
@@ -461,9 +488,9 @@ function renderer.build(ctx, systems)
         -- ...or morphologically, SMAA's three passes (post/smaa.slang).
         view.smaaResolved = nil
         if smaaOn and view == ctx.views[1] then
-            view.smaaEdges = rhi.render_target("rgba16f")
-            view.smaaWeights = rhi.render_target("rgba16f")
-            view.smaaResolved = rhi.render_target("rgba16f")
+            view.smaaEdges = rhi.render_target("rgba16f", renderScale)
+            view.smaaWeights = rhi.render_target("rgba16f", renderScale)
+            view.smaaResolved = rhi.render_target("rgba16f", renderScale)
             ctx.smaaNodes = {
                 graph:dispatch { name = view.name .. ": SMAA edges", pipeline = pipelines.smaaEdges,
                                  params = { { smaaInput = view.image, smaaEdges = view.smaaEdges } },
@@ -479,14 +506,59 @@ function renderer.build(ctx, systems)
         end
     end
 
-    -- A main view drawn into a texture (anti-aliased, or captured), onto the window.
+    -- A main view drawn smaller: upscaled to the window's size (FSR 1: post/fsr1.slang), its
+    -- anti-aliased image.
     local main = ctx.views[1]
+    main.fsrOutput = nil
+    if fsrOn and not main.inset then
+        local drawn = main.taaResolved or main.fxaaResolved or main.smaaResolved or main.image
+        main.fsrUpscaled = rhi.render_target("rgba16f")
+        main.fsrOutput = rhi.render_target("rgba16f")
+        main.fsrBlock = rhi.params { fsrInputSize = { 1, 1 }, fsrSharpness = up.sharpness }
+        ctx.fsrNodes = {
+            graph:dispatch { name = main.name .. ": FSR 1 upscale (EASU)", pipeline = pipelines.fsrEasu,
+                             params = { main.fsrBlock, { fsrInput = drawn, fsrUpscaled = main.fsrUpscaled } },
+                             threads = main.fsrUpscaled, timed = true },
+            graph:dispatch { name = main.name .. ": FSR 1 sharpen (RCAS)", pipeline = pipelines.fsrRcas,
+                             params = { main.fsrBlock, { fsrUpscaledIn = main.fsrUpscaled, fsrOutput = main.fsrOutput } },
+                             threads = main.fsrOutput, timed = true },
+        }
+    end
+
+    -- ...or by DLSS (lib/dlss.h in the host): the drawn image, its depth and its motion
+    -- vectors (post/dlss-inputs.slang) to the window's size, anti-aliased as it goes.
+    main.dlssOutput = nil
+    ctx.dlssNode = nil
+    if dlssOn and not main.inset then
+        local t = main.targets
+        main.dlssDepth = rhi.render_target("r32f", renderScale)
+        main.dlssMotion = rhi.render_target("rgba16f", renderScale) -- xy: the motion (DLSS reads two channels)
+        main.dlssOutput = rhi.render_target("rgba16f")
+        ctx.dlssInputsNode = graph:dispatch {
+            name = main.name .. ": DLSS inputs",
+            pipeline = pipelines.dlssInputs,
+            params = { main.block, ctx.shadowBlock, main.temporal,
+                       { meshDepth = t.meshDepth, splatDepth = t.splatDepth, sdfDepth = t.sdfDepth,
+                         depthNear = 0.1, depthFar = 100, meshMotion = t.meshMotion, splatMotion = t.splatMotion,
+                         dlssDepth = main.dlssDepth, dlssMotion = main.dlssMotion } },
+            threads = main.dlssDepth,
+            timed = true,
+        }
+        ctx.dlssNode = graph:dlss {
+            name = main.name .. ": DLSS",
+            color = main.image, depth = main.dlssDepth, motion = main.dlssMotion, output = main.dlssOutput,
+            quality = up.quality,
+        }
+    end
+
+    -- A main view drawn into a texture (anti-aliased, upscaled, or captured), onto the window.
     if toTexture(main) and not main.inset then
         local copy = graph:render_pass { name = main.name .. ": to the window" }
         copy:draw {
             pipeline = pipelines.frame,
             count = 3,
-            params = { source = main.taaResolved or main.fxaaResolved or main.smaaResolved or main.image,
+            params = { source = main.dlssOutput or main.fsrOutput or main.taaResolved or main.fxaaResolved or main.smaaResolved
+                           or main.image,
                        borderColor = { 0, 0, 0, 1 }, borderWidth = 0,
                        encodeGamma = srgb and 0 or 1, decodeGamma = 0 },
         }
@@ -547,6 +619,24 @@ function renderer.updateFrame(ctx)
             view.lastCamera = now
         end
     end
+end
+
+-- A target's size at `scale` of `size` pixels, as the host makes it (rhi.render_target).
+local function scaledSize(size, scale)
+    return math.max(1, math.floor(size * scale + 0.5))
+end
+
+-- For a window of `width` x `height`: the main view drawn at its render scale -- its block's
+-- viewport size (what dispatches not over one of its textures see, the splats'), and the
+-- upscaler's input size.
+function renderer.layout(ctx, width, height)
+    local main = ctx.views and ctx.views[1]
+    if not main or main.inset or width <= 0 or height <= 0 then return end
+    local scale = ctx.renderScale or 1
+    local drawn = { scaledSize(width, scale), scaledSize(height, scale) }
+    if scale ~= 1 then main.block.viewportSize = drawn end
+    if main.fsrBlock then main.fsrBlock.fsrInputSize = drawn end
+    -- (DLSS starts over by itself at a new size: it is made again for it.)
 end
 
 -- After a resize the effects' textures hold nothing: start their history over.

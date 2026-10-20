@@ -10,6 +10,9 @@
 #include "audio.h"
 #include "physics.h"
 #include "splat-lod.h"
+#if SLANG_RHI_LUA_DLSS
+#include "dlss.h"
+#endif
 
 // Lua is built as C++ (see CMakeLists.txt), so its headers are included without the
 // extern "C" wrapper that lua.hpp adds.
@@ -25,6 +28,9 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <atomic>
 #include <iterator>
 #include <set>
 #include <sstream>
@@ -386,19 +392,21 @@ struct CompiledProgram
     uint32_t threadGroupSize[3] = {1, 1, 1};
 };
 
-// Compiles source text under a module name and path that are new on every build: the
-// session keys loaded modules by both, and holding either against an already-loaded
-// module is an error ("The key already exists in Dictionary").
+// Compiles source text under a module name and path made from `tag`, which the caller makes
+// new for every module the session loads: the session keys loaded modules by both, and
+// holding either against an already-loaded module is an error ("The key already exists in
+// Dictionary"). The name goes into the shader cache's keys, so the same build should get
+// the same tag on every device (see LuaApp::moduleTag).
 Result compileProgram(
     IDevice* device,
     const std::string& path,
     const std::string& source,
     const std::vector<std::string>& entryPointNames,
-    uint32_t serial,
+    const std::string& tag,
     CompiledProgram& out
 )
 {
-    std::string suffix = "-build" + std::to_string(serial);
+    std::string suffix = "-" + tag;
     std::string moduleName = fs::path(path).filename().string() + suffix;
     std::string virtualPath = path + suffix;
 
@@ -730,6 +738,12 @@ struct GraphNode
     double gpuTime = -1.0;
     bool pending = true;
     uint32_t ranVersion = 0;
+
+    // DLSS (graph:dlss): `target` its output; these its inputs (dlss.h).
+    bool isDlss = false;
+    std::shared_ptr<Texture> dlssColor, dlssDepth, dlssMotion;
+    int dlssQuality = 0; // dlss::Quality
+    bool dlssReset = true; // the next run starts over (node.reset = true: a cut)
 };
 
 struct Graph
@@ -821,21 +835,67 @@ int traceback(lua_State* L)
 // Host
 // ---------------------------------------------------------------------------------------
 
+// The compiled shaders, in memory for the process's life, shared by every device it makes:
+// a device made on another GPU (LuaApp::switchDevice) builds its pipelines from them rather
+// than compiling them again (slang-rhi keys them by Slang's hash of the entry point and its
+// options, so only what a device compiles differently is compiled again).
+class ShaderCache : public IPersistentCache
+{
+public:
+    SLANG_NO_THROW SlangResult SLANG_MCALL queryInterface(const SlangUUID& uuid, void** outObject) override
+    {
+        if (uuid == ISlangUnknown::getTypeGuid() || uuid == IPersistentCache::getTypeGuid())
+        {
+            *outObject = static_cast<IPersistentCache*>(this);
+            return SLANG_OK;
+        }
+        *outObject = nullptr;
+        return SLANG_E_NO_INTERFACE;
+    }
+    // A static object: not counted.
+    SLANG_NO_THROW uint32_t SLANG_MCALL addRef() override { return 1; }
+    SLANG_NO_THROW uint32_t SLANG_MCALL release() override { return 1; }
+
+    SLANG_NO_THROW Result SLANG_MCALL writeCache(ISlangBlob* key, ISlangBlob* data) override
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_entries[keyOf(key)] = ComPtr<ISlangBlob>(data);
+        return SLANG_OK;
+    }
+
+    SLANG_NO_THROW Result SLANG_MCALL queryCache(ISlangBlob* key, ISlangBlob** outData) override
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_entries.find(keyOf(key));
+        if (it == m_entries.end())
+        {
+            *outData = nullptr;
+            return SLANG_E_NOT_FOUND;
+        }
+        *outData = it->second.get();
+        (*outData)->addRef();
+        return SLANG_OK;
+    }
+
+private:
+    static std::string keyOf(ISlangBlob* key)
+    {
+        return std::string(static_cast<const char*>(key->getBufferPointer()), key->getBufferSize());
+    }
+    std::mutex m_mutex;
+    std::map<std::string, ComPtr<ISlangBlob>> m_entries;
+};
+static ShaderCache g_shaderCache;
+
 // The engine runs on Vulkan only, for now: the graphics device to pick is the GPU.
 static const DeviceType kEngineDeviceType = DeviceType::Vulkan;
-
-// A restart on another GPU, asked for by rhi.restart: main() runs the script again on it.
-struct RestartRequest
-{
-    bool pending = false;
-    std::string adapter;
-};
-static RestartRequest g_restart;
 
 // Runs one script on one device, in its own window and Lua state.
 class LuaApp : public ExampleBase
 {
 public:
+    struct PreparedDevice; // a device made ready on another thread (prepareDevice)
+
     // `adapterName`: the graphics adapter to run on, by name; empty (or not found): the
     // device type's default.
     explicit LuaApp(fs::path scriptPath, std::string adapterName = {})
@@ -861,19 +921,11 @@ public:
         int height = 360;
         std::vector<Feature> features = {Feature::Surface};
         readConfig(title, width, height, features);
+        m_features = features;
 
-        IAdapter* adapter = nullptr;
-        for (uint32_t i = 0; !m_adapterName.empty(); ++i)
-        {
-            IAdapter* candidate = getRHI()->getAdapter(deviceType, i);
-            if (!candidate)
-                break;
-            if (m_adapterName == candidate->getInfo().name)
-            {
-                adapter = candidate;
-                break;
-            }
-        }
+        IAdapter* adapter = deviceType == kEngineDeviceType ? findAdapter(m_adapterName) : nullptr;
+        DeviceExtensions extensions;
+        extensionsFor(adapter, extensions);
         if (!m_adapterName.empty() && !adapter)
         {
             printf("[lua] no adapter '%s' for %s: the default one\n", m_adapterName.c_str(), getRHI()->getDeviceTypeName(deviceType));
@@ -884,7 +936,9 @@ public:
             {},
             m_device.writeRef(),
             {m_scriptDir.string(), LUA_SHADERS_DIR},
-            adapter
+            adapter,
+            &g_shaderCache,
+            extensions.next()
         ));
         SLANG_RETURN_ON_FAIL(createWindow(m_device, title.c_str(), width, height));
         SLANG_RETURN_ON_FAIL(createSurface(m_device, Format::Undefined, m_surface.writeRef()));
@@ -903,8 +957,466 @@ public:
         return SLANG_OK;
     }
 
+    // The adapter named `name` for the engine's API; if empty or none, the default one: the
+    // first discrete GPU, else the first (picked here, not left to slang-rhi, so that what
+    // the device is made with -- DLSS's extensions -- is for the GPU it is made on).
+    static IAdapter* findAdapter(const std::string& name)
+    {
+        IAdapter* first = nullptr;
+        IAdapter* discrete = nullptr;
+        for (uint32_t i = 0;; ++i)
+        {
+            IAdapter* candidate = getRHI()->getAdapter(kEngineDeviceType, i);
+            if (!candidate)
+                break;
+            if (!name.empty() && name == candidate->getInfo().name)
+                return candidate;
+            if (candidate->getInfo().adapterType == AdapterType::Software)
+                continue;
+            if (!first)
+                first = candidate;
+            if (!discrete && candidate->getInfo().adapterType == AdapterType::Discrete)
+                discrete = candidate;
+        }
+        return discrete ? discrete : first;
+    }
+
+    // What a device on `adapter` is made with beyond the defaults: the instance and device
+    // extensions DLSS needs, on GPUs it may run on (dlss.h). Kept alive for the call.
+    struct DeviceExtensions
+    {
+        std::vector<const char*> instance, device;
+        VulkanDeviceExtendedDesc desc;
+        const void* next() { return instance.empty() && device.empty() ? nullptr : &desc; }
+    };
+    static void extensionsFor(IAdapter* adapter, DeviceExtensions& out)
+    {
+#if SLANG_RHI_LUA_DLSS
+        if (adapter)
+            dlss::requiredExtensions(adapter->getInfo(), out.instance, out.device);
+#endif
+        out.desc.instanceExtensionCount = uint32_t(out.instance.size());
+        out.desc.instanceExtensions = out.instance.data();
+        out.desc.deviceExtensionCount = uint32_t(out.device.size());
+        out.desc.deviceExtensions = out.device.data();
+    }
+
+    // DLSS on this device: made the first time it is asked for (NGX starts in a few tens of
+    // milliseconds), once per device.
+    void ensureDlss()
+    {
+#if SLANG_RHI_LUA_DLSS
+        if (m_dlssTried)
+            return;
+        m_dlssTried = true;
+        m_dlss = dlss::Context::create(m_device, m_queue, m_dlssWhy);
+        if (!m_dlss)
+            printf("[lua] no DLSS on %s: %s\n", m_device->getInfo().adapterName, m_dlssWhy.c_str());
+#endif
+    }
+
+    // A DLSS node (graph:dlss), between the frame's two submissions.
+    void runDlss(GraphNode& node)
+    {
+#if SLANG_RHI_LUA_DLSS
+        ensureDlss();
+        if (!m_dlss)
+        {
+            report(node.reported, node.name, ("no DLSS: " + m_dlssWhy).c_str());
+            return;
+        }
+        if (!node.dlssColor || !node.dlssDepth || !node.dlssMotion || !node.target)
+            return;
+        dlss::Inputs inputs;
+        inputs.color = node.dlssColor->texture;
+        inputs.depth = node.dlssDepth->texture;
+        inputs.motion = node.dlssMotion->texture;
+        inputs.output = node.target->texture;
+        inputs.quality = dlss::Quality(node.dlssQuality);
+        inputs.reset = node.dlssReset;
+        node.dlssReset = false;
+        std::string error;
+        if (!m_dlss->evaluate(inputs, error))
+            report(node.reported, node.name, error.c_str());
+#else
+        report(node.reported, node.name, "this build has no DLSS SDK (external/dlss)");
+#endif
+    }
+
+    // Starts making a device on the GPU `adapterName` ready, on a thread of its own: the
+    // device, and every pipeline built on it (the shader cache has what was compiled before
+    // with the same options). The frames go on on this one meanwhile. False if there is no
+    // such GPU, or a switch is being made ready already.
+    bool prepareDevice(const std::string& adapterName)
+    {
+        if (m_prepared)
+            return false;
+        IAdapter* adapter = findAdapter(adapterName);
+        if (!adapter)
+        {
+            printf("[lua] no GPU '%s': staying on %s\n", adapterName.c_str(), m_device->getInfo().adapterName);
+            return false;
+        }
+        auto prepared = std::make_shared<PreparedDevice>();
+        prepared->adapter = adapterName;
+        prepared->windowFormat = m_surface->getInfo().preferredFormat;
+        for (auto& [key, pipeline] : m_pipelines)
+        {
+            Pipeline description = *pipeline;
+            description.compute.setNull();
+            description.render.setNull();
+            prepared->pipelines.push_back({pipeline, std::move(description)});
+            prepared->versions.push_back(pipeline->version);
+        }
+        prepared->built.resize(prepared->pipelines.size());
+        m_prepared = prepared;
+        m_preparing = std::thread(
+            [this, prepared, adapter]()
+            {
+                auto started = std::chrono::steady_clock::now();
+                DeviceExtensions extensions;
+                extensionsFor(adapter, extensions);
+                if (SLANG_SUCCEEDED(createDevice(
+                        kEngineDeviceType,
+                        m_features,
+                        {},
+                        prepared->device.writeRef(),
+                        {m_scriptDir.string(), LUA_SHADERS_DIR},
+                        adapter,
+                        &g_shaderCache,
+                        extensions.next()
+                    )))
+                {
+                    prepared->deviceMade = true;
+                    for (size_t i = 0; i < prepared->pipelines.size(); ++i)
+                    {
+                        makePipeline(
+                            prepared->device,
+                            prepared->windowFormat,
+                            prepared->moduleTags,
+                            prepared->pipelines[i].second,
+                            prepared->built[i]
+                        );
+                        prepared->pipelinesBuilt = uint32_t(i + 1);
+                    }
+                }
+                prepared->seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+                prepared->done = true;
+            }
+        );
+        printf("[lua] making %s ready\n", adapter->getInfo().name);
+        fflush(stdout);
+        return true;
+    }
+
+    // Moves the script onto the device `prepared` made ready, without stopping it: everything
+    // the script made, made again there as it is now -- the buffers read back from the old
+    // GPU and uploaded to the new one (the script's handles stay the same: only what they
+    // hold changes), the textures (drawn again: they start over), the samplers, the
+    // pipelines (built on the other thread; those made or changed since, now), the window's
+    // surface. If its surface can't be made, the old device goes on. Returns whether it
+    // switched.
+    bool switchDevice(PreparedDevice& prepared)
+    {
+        auto started = std::chrono::steady_clock::now();
+        const auto ms = [&]()
+        { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(); };
+        m_queue->waitOnHost();
+        const std::string adapterName = prepared.adapter;
+        ComPtr<IDevice> device = prepared.device;
+        double made = 0;
+
+        // What the old GPU holds, read back while it is there: the buffers' contents (the
+        // splats, the trees, what the script uploaded, and what shaders keep from frame to
+        // frame). The textures are drawn or computed again every frame (render targets,
+        // the GI's volumes): they start over, as a history does after a cut.
+        struct SavedTexture
+        {
+            std::shared_ptr<Texture> texture;
+            TextureDesc desc;
+            std::string label;
+        };
+        struct SavedBuffer
+        {
+            std::shared_ptr<Buffer> buffer;
+            BufferDesc desc;
+            std::string label;
+            std::vector<uint8_t> contents; // empty: start over (not readable)
+        };
+        std::vector<SavedTexture> textures;
+        std::vector<SavedBuffer> buffers;
+        const auto saveTextures = [&](std::vector<std::weak_ptr<Texture>>& list)
+        {
+            for (const std::weak_ptr<Texture>& weak : list)
+            {
+                std::shared_ptr<Texture> texture = weak.lock();
+                if (!texture || !texture->texture)
+                    continue;
+                SavedTexture saved;
+                saved.texture = texture;
+                saved.desc = texture->texture->getDesc();
+                saved.label = saved.desc.label ? saved.desc.label : "";
+                textures.push_back(std::move(saved));
+            }
+        };
+        saveTextures(m_renderTargets);
+        saveTextures(m_textures);
+        for (const std::weak_ptr<Buffer>& weak : m_buffers)
+        {
+            std::shared_ptr<Buffer> buffer = weak.lock();
+            if (!buffer || !buffer->buffer)
+                continue;
+            SavedBuffer saved;
+            saved.buffer = buffer;
+            saved.desc = buffer->buffer->getDesc();
+            saved.label = saved.desc.label ? saved.desc.label : "";
+            buffers.push_back(std::move(saved));
+        }
+        // Read back in batches of up to kReadBackBatch bytes (a larger buffer alone): copied
+        // into one readback buffer, one submission and one wait a batch -- not one a buffer.
+        static constexpr uint64_t kReadBackBatch = 256ull << 20;
+        for (size_t first = 0; first < buffers.size();)
+        {
+            size_t last = first;
+            uint64_t total = 0;
+            std::vector<uint64_t> offsets;
+            while (last < buffers.size())
+            {
+                SavedBuffer& saved = buffers[last];
+                uint64_t size = is_set(saved.desc.usage, BufferUsage::CopySource) ? saved.desc.size : 0;
+                if (total > 0 && total + size > kReadBackBatch)
+                    break;
+                offsets.push_back(total);
+                total += (size + 255) & ~uint64_t(255);
+                ++last;
+            }
+            ComPtr<IBuffer> readBack;
+            BufferDesc desc = {};
+            desc.size = std::max<uint64_t>(total, 256);
+            desc.memoryType = MemoryType::ReadBack;
+            desc.usage = BufferUsage::CopyDestination;
+            desc.defaultState = ResourceState::CopyDestination;
+            desc.label = "Device switch read back";
+            if (SLANG_SUCCEEDED(m_device->createBuffer(desc, nullptr, readBack.writeRef())))
+            {
+                ComPtr<ICommandEncoder> encoder = m_queue->createCommandEncoder();
+                for (size_t i = first; i < last; ++i)
+                {
+                    SavedBuffer& saved = buffers[i];
+                    if (is_set(saved.desc.usage, BufferUsage::CopySource))
+                        encoder->copyBuffer(readBack, offsets[i - first], saved.buffer->buffer, 0, saved.desc.size);
+                }
+                m_queue->submit(encoder->finish());
+                m_queue->waitOnHost();
+                void* mapped = nullptr;
+                if (SLANG_SUCCEEDED(m_device->mapBuffer(readBack, CpuAccessMode::Read, &mapped)))
+                {
+                    for (size_t i = first; i < last; ++i)
+                    {
+                        SavedBuffer& saved = buffers[i];
+                        if (!is_set(saved.desc.usage, BufferUsage::CopySource))
+                            continue;
+                        saved.contents.resize(saved.desc.size);
+                        memcpy(saved.contents.data(), static_cast<const uint8_t*>(mapped) + offsets[i - first], saved.desc.size);
+                    }
+                    m_device->unmapBuffer(readBack);
+                }
+            }
+            first = last;
+        }
+
+        double readBack = ms();
+        uint64_t movedBytes = 0;
+        for (const SavedBuffer& saved : buffers)
+            movedBytes += saved.contents.size();
+        // The window's surface: one swapchain a window, so the old one goes first.
+        Format surfaceFormat = m_surface->getConfig() ? m_surface->getConfig()->format : Format::Undefined;
+        m_surface.setNull();
+        ComPtr<ISurface> surface;
+        ComPtr<ICommandQueue> queue;
+        if (SLANG_FAILED(createSurface(device, surfaceFormat, surface.writeRef())) &&
+            SLANG_FAILED(createSurface(device, Format::Undefined, surface.writeRef())))
+        {
+            printf("[lua] could not draw into the window on '%s': staying on %s\n", adapterName.c_str(), m_device->getInfo().adapterName);
+            createSurface(m_device, surfaceFormat, m_surface.writeRef());
+            return false;
+        }
+        if (SLANG_FAILED(device->getQueue(QueueType::Graphics, queue.writeRef())))
+        {
+            printf("[lua] no queue on '%s': staying on %s\n", adapterName.c_str(), m_device->getInfo().adapterName);
+            surface.setNull();
+            createSurface(m_device, surfaceFormat, m_surface.writeRef());
+            return false;
+        }
+
+        // Everything made again on the new device, into the same handles.
+        for (SavedTexture& saved : textures)
+        {
+            saved.desc.label = saved.label.c_str();
+            ComPtr<ITexture> created;
+            if (SLANG_FAILED(device->createTexture(saved.desc, nullptr, created.writeRef())))
+            {
+                printf("[lua] could not make a %ux%u texture again on '%s'\n", saved.desc.size.width, saved.desc.size.height, adapterName.c_str());
+            }
+            saved.texture->texture = created;
+            saved.texture->depth.setNull(); // its draws' depth buffer: made on first use
+        }
+        // The buffers made empty, then their contents uploaded in batches of up to
+        // kReadBackBatch bytes: staged in one upload buffer, one submission a batch (one
+        // wait for them all) -- not one a buffer.
+        for (SavedBuffer& saved : buffers)
+        {
+            saved.desc.label = saved.label.c_str();
+            if (!saved.contents.empty())
+                saved.desc.usage |= BufferUsage::CopyDestination;
+            ComPtr<IBuffer> created;
+            if (SLANG_FAILED(device->createBuffer(saved.desc, nullptr, created.writeRef())))
+            {
+                printf("[lua] could not make a %llu-byte buffer again on '%s'\n", (unsigned long long)saved.desc.size, adapterName.c_str());
+            }
+            saved.buffer->buffer = created;
+        }
+        std::vector<ComPtr<IBuffer>> staging; // kept until the uploads are done
+        for (size_t first = 0; first < buffers.size();)
+        {
+            size_t last = first;
+            uint64_t total = 0;
+            std::vector<uint64_t> offsets;
+            while (last < buffers.size())
+            {
+                SavedBuffer& saved = buffers[last];
+                uint64_t size = saved.buffer->buffer ? saved.contents.size() : 0;
+                if (total > 0 && total + size > kReadBackBatch)
+                    break;
+                offsets.push_back(total);
+                total += (size + 255) & ~uint64_t(255);
+                ++last;
+            }
+            if (total > 0)
+            {
+                ComPtr<IBuffer> upload;
+                BufferDesc desc = {};
+                desc.size = total;
+                desc.memoryType = MemoryType::Upload;
+                desc.usage = BufferUsage::CopySource;
+                desc.defaultState = ResourceState::CopySource;
+                desc.label = "Device switch upload";
+                void* mapped = nullptr;
+                if (SLANG_SUCCEEDED(device->createBuffer(desc, nullptr, upload.writeRef())) &&
+                    SLANG_SUCCEEDED(device->mapBuffer(upload, CpuAccessMode::Write, &mapped)))
+                {
+                    for (size_t i = first; i < last; ++i)
+                    {
+                        SavedBuffer& saved = buffers[i];
+                        if (saved.buffer->buffer && !saved.contents.empty())
+                            memcpy(static_cast<uint8_t*>(mapped) + offsets[i - first], saved.contents.data(), saved.contents.size());
+                    }
+                    device->unmapBuffer(upload);
+                    ComPtr<ICommandEncoder> encoder = queue->createCommandEncoder();
+                    for (size_t i = first; i < last; ++i)
+                    {
+                        SavedBuffer& saved = buffers[i];
+                        if (saved.buffer->buffer && !saved.contents.empty())
+                            encoder->copyBuffer(saved.buffer->buffer, 0, upload, offsets[i - first], saved.contents.size());
+                    }
+                    queue->submit(encoder->finish());
+                    staging.push_back(upload);
+                }
+                else
+                {
+                    printf("[lua] could not stage %llu bytes on '%s': those buffers start over\n", (unsigned long long)total, adapterName.c_str());
+                }
+            }
+            first = last;
+        }
+        queue->waitOnHost();
+        staging.clear();
+        for (const std::weak_ptr<Sampler>& weak : m_samplers)
+        {
+            std::shared_ptr<Sampler> sampler = weak.lock();
+            if (!sampler || !sampler->sampler)
+                continue;
+            SamplerDesc desc = sampler->sampler->getDesc();
+            desc.label = nullptr;
+            ComPtr<ISampler> created;
+            device->createSampler(desc, created.writeRef());
+            sampler->sampler = created;
+        }
+
+        // The device itself, and what the host keeps of it.
+        for (auto& [key, pipeline] : m_pipelines)
+        {
+            pipeline->compute.setNull();
+            pipeline->render.setNull();
+        }
+        m_blitter.reset();
+        m_depthTexture.setNull();
+        m_timestamps.setNull();
+        m_timestampsTried = false;
+        for (auto& frame : m_timedNodes)
+            frame.clear();
+#if SLANG_RHI_LUA_DLSS
+        m_dlss.reset(); // NGX on the old device: made again on the new one when asked
+        m_dlssTried = false;
+#endif
+        m_queue = queue;
+        m_surface = surface;
+        m_device = device;
+        m_moduleTags.clear(); // a new Slang session: nothing loaded in it yet
+        m_blitter = std::make_unique<Blitter>(m_device);
+        double uploaded = ms();
+        // The pipelines built on the other thread, installed (their versions move on, so
+        // dispatches that run once run again); those made or rebuilt since it began, or
+        // whose window format the new surface doesn't have, built now.
+        m_moduleTags = prepared.moduleTags;
+        std::set<Pipeline*> installed;
+        for (size_t i = 0; i < prepared.pipelines.size(); ++i)
+        {
+            std::shared_ptr<Pipeline>& pipeline = prepared.pipelines[i].first;
+            bool windowFormatChanged = pipeline->colorFormat == Format::Undefined && !pipeline->isCompute &&
+                                       m_surface->getInfo().preferredFormat != prepared.windowFormat;
+            if (pipeline->version == prepared.versions[i] && !windowFormatChanged)
+            {
+                installPipeline(*pipeline, prepared.built[i]);
+                installed.insert(pipeline.get());
+            }
+        }
+        uint32_t builtNow = 0;
+        for (auto& [key, pipeline] : m_pipelines)
+        {
+            if (installed.count(pipeline.get()))
+                continue;
+            ++builtNow;
+            if (SLANG_FAILED(buildPipeline(*pipeline)))
+                printf("[lua] '%s' failed to build on '%s'\n", pipeline->path.filename().string().c_str(), adapterName.c_str());
+        }
+        m_adapterName = adapterName;
+        printf(
+            "[lua] switched to %s: made ready in %.1f s while drawing, then %.0f ms (%zu buffers, %.0f MB, read back "
+            "%.0f, made again %.0f, pipelines %.0f: %u built now)\n",
+            m_device->getInfo().adapterName,
+            prepared.seconds,
+            ms(),
+            buffers.size(),
+            movedBytes / 1048576.0,
+            readBack - made,
+            uploaded - readBack,
+            ms() - uploaded,
+            builtNow
+        );
+        fflush(stdout);
+        return true;
+    }
+
     void shutdown() override
     {
+        if (m_preparing.joinable())
+            m_preparing.join();
+        m_prepared.reset();
+#if SLANG_RHI_LUA_DLSS
+        m_queue->waitOnHost();
+        m_dlss.reset();
+#endif
         m_queue->waitOnHost();
         callScript("shutdown");
         closeScript();
@@ -921,6 +1433,21 @@ public:
 
     Result update(double time) override
     {
+        if (m_prepared && m_prepared->done && m_prepared->device && !m_prepared->announced)
+        {
+            // One more frame on this device first, showing that the switch is next.
+            m_prepared->announced = true;
+        }
+        else if (m_prepared && m_prepared->done)
+        {
+            m_preparing.join();
+            std::shared_ptr<PreparedDevice> prepared = std::move(m_prepared);
+            m_prepared.reset();
+            if (prepared->device)
+                switchDevice(*prepared);
+            else
+                printf("[lua] could not make a device on '%s': staying on %s\n", prepared->adapter.c_str(), m_device->getInfo().adapterName);
+        }
         if (m_time == 0.0)
         {
             m_time = time;
@@ -1043,6 +1570,45 @@ public:
             return SLANG_OK;
         }
 
+        // A graph with DLSS in it runs in two parts: what comes before it, submitted before
+        // the window's image is acquired (the first submission after that is the one the
+        // image waits on), then DLSS in a submission of its own, then the rest.
+        size_t dlssAt = SIZE_MAX;
+        for (size_t i = 0; m_graph && i < m_graph->nodes.size(); ++i)
+        {
+            if (m_graph->nodes[i]->enabled && m_graph->nodes[i]->isDlss)
+            {
+                dlssAt = i;
+                break;
+            }
+        }
+        std::set<ITexture*> validDepth;
+        if (dlssAt != SIZE_MAX)
+        {
+            const SurfaceConfig* config = m_surface->getConfig();
+            resizeRenderTargets(config->width, config->height);
+            ComPtr<ICommandEncoder> before = m_queue->createCommandEncoder();
+            m_frame.encoder = before;
+            m_frame.image = nullptr;
+            m_frame.width = config->width;
+            m_frame.height = config->height;
+            m_frame.active = true;
+            uploadBodies(before);
+            uploadBufferWrites(before);
+            runGraph(*m_graph, 0, dlssAt);
+            GraphNode& node = *m_graph->nodes[dlssAt];
+            // DLSS's inputs in the states it reads them in, its output in the one it writes.
+            for (const std::shared_ptr<Texture>& input : {node.dlssColor, node.dlssDepth, node.dlssMotion})
+                if (input && input->texture)
+                    before->setTextureState(input->texture, ResourceState::ShaderResource);
+            if (node.target && node.target->texture)
+                before->setTextureState(node.target->texture, ResourceState::UnorderedAccess);
+            m_queue->submit(before->finish());
+            runDlss(node);
+            validDepth = m_frame.validDepth;
+            m_frame = {};
+        }
+
         ComPtr<ITexture> image;
         m_surface->acquireNextImage(image.writeRef());
         if (!image)
@@ -1060,11 +1626,19 @@ public:
         m_frame.width = width;
         m_frame.height = height;
         m_frame.active = true;
-        uploadBodies(commandEncoder);
-        uploadBufferWrites(commandEncoder);
-        if (m_graph)
+        m_frame.validDepth = validDepth;
+        if (dlssAt == SIZE_MAX)
         {
-            runGraph(*m_graph);
+            uploadBodies(commandEncoder);
+            uploadBufferWrites(commandEncoder);
+            if (m_graph)
+            {
+                runGraph(*m_graph);
+            }
+        }
+        else
+        {
+            runGraph(*m_graph, dlssAt + 1, m_graph->nodes.size());
         }
         callScript("draw", FrameArg{});
         m_frame = {};
@@ -1361,28 +1935,43 @@ public:
 
     // Builds (or rebuilds) a pipeline from its source files. On failure the previous
     // build, if any, stays in place.
-    Result buildPipeline(Pipeline& pipeline)
+    // A pipeline built on a device (of `pipeline`'s description), not yet installed.
+    struct BuiltPipeline
+    {
+        ComPtr<IComputePipeline> compute;
+        ComPtr<IRenderPipeline> render;
+        uint32_t threadGroupSize[3] = {1, 1, 1};
+        std::vector<std::string> files; // what the build read
+    };
+
+    // Builds `pipeline` on `device`, drawing into `windowFormat` where its format is the
+    // window's, its modules tagged from `moduleTags` (that device's session's: moduleTag).
+    // Touches nothing of the app's: a device being made ready on another thread
+    // (prepareDevice) builds its pipelines with it while the frames go on.
+    Result makePipeline(
+        IDevice* device,
+        Format windowFormat,
+        std::map<std::string, uint32_t>& moduleTags,
+        const Pipeline& pipeline,
+        BuiltPipeline& out
+    ) const
     {
         ShaderSource source;
         bool read = readShaderSource(pipeline.path, {m_scriptDir, fs::path(LUA_SHADERS_DIR)}, source);
-        pipeline.files = source.files;
-        for (const std::string& file : source.files)
-        {
-            m_watcher.watch(file);
-        }
+        out.files = source.files;
         if (!read)
         {
             return SLANG_FAIL;
         }
 
-        SLANG_RHI_DEVICE_SCOPE(m_device);
+        SLANG_RHI_DEVICE_SCOPE(device);
         CompiledProgram compiled;
         SLANG_RETURN_ON_FAIL(compileProgram(
-            m_device,
+            device,
             pathKey(pipeline.path),
             source.text,
             pipeline.entryPoints,
-            ++m_buildSerial,
+            moduleTag(moduleTags, pipeline, source.text),
             compiled
         ));
 
@@ -1390,11 +1979,8 @@ public:
         {
             ComputePipelineDesc desc = {};
             desc.program = compiled.program;
-            ComPtr<IComputePipeline> compute;
-            SLANG_RETURN_ON_FAIL(m_device->createComputePipeline(desc, compute.writeRef()));
-            pipeline.compute = compute;
-            std::copy_n(compiled.threadGroupSize, 3, pipeline.threadGroupSize);
-            pipeline.version += 1;
+            SLANG_RETURN_ON_FAIL(device->createComputePipeline(desc, out.compute.writeRef()));
+            std::copy_n(compiled.threadGroupSize, 3, out.threadGroupSize);
             return SLANG_OK;
         }
 
@@ -1412,11 +1998,11 @@ public:
             layoutDesc.inputElementCount = uint32_t(elements.size());
             layoutDesc.vertexStreams = &stream;
             layoutDesc.vertexStreamCount = 1;
-            SLANG_RETURN_ON_FAIL(m_device->createInputLayout(layoutDesc, inputLayout.writeRef()));
+            SLANG_RETURN_ON_FAIL(device->createInputLayout(layoutDesc, inputLayout.writeRef()));
         }
 
         ColorTargetDesc colorTarget = {};
-        colorTarget.format = resolveColorFormat(pipeline);
+        colorTarget.format = pipeline.colorFormat == Format::Undefined ? windowFormat : pipeline.colorFormat;
         if (pipeline.blend != Pipeline::Blend::None)
         {
             colorTarget.enableBlend = true;
@@ -1454,11 +2040,33 @@ public:
             desc.depthStencil.depthTestEnable = false;
             desc.depthStencil.depthWriteEnable = false;
         }
-        ComPtr<IRenderPipeline> render;
-        SLANG_RETURN_ON_FAIL(m_device->createRenderPipeline(desc, render.writeRef()));
-        pipeline.render = render;
-        pipeline.version += 1;
+        SLANG_RETURN_ON_FAIL(device->createRenderPipeline(desc, out.render.writeRef()));
         return SLANG_OK;
+    }
+
+    // A built pipeline into its handle: the files it read watched, its version moved on (so
+    // that dispatches that run once run again).
+    void installPipeline(Pipeline& pipeline, BuiltPipeline& built)
+    {
+        pipeline.files = built.files;
+        for (const std::string& file : built.files)
+        {
+            m_watcher.watch(file);
+        }
+        if (!built.compute && !built.render)
+            return;
+        pipeline.compute = built.compute;
+        pipeline.render = built.render;
+        std::copy_n(built.threadGroupSize, 3, pipeline.threadGroupSize);
+        pipeline.version += 1;
+    }
+
+    Result buildPipeline(Pipeline& pipeline)
+    {
+        BuiltPipeline built;
+        Result result = makePipeline(m_device, m_surface->getInfo().preferredFormat, m_moduleTags, pipeline, built);
+        installPipeline(pipeline, built);
+        return result;
     }
 
     // Returns the cached pipeline matching `desc`, building it on first use. A pipeline
@@ -2085,6 +2693,11 @@ public:
 
     void runRenderPass(GraphNode& node)
     {
+        if (!node.target && !node.depthOnly && !m_frame.image)
+        {
+            report(node.reported, node.name, "draws into the window before DLSS, which splits the frame there: it can't");
+            return;
+        }
         Destination destination = node.target ? textureDestination(*node.target) : windowDestination();
         if (node.depthTarget)
         {
@@ -2230,7 +2843,11 @@ public:
         return !pipeline || !pipeline->compute || (node.once && !node.pending && node.ranVersion == pipeline->version);
     }
 
-    void runGraph(Graph& graph)
+    void runGraph(Graph& graph) { runGraph(graph, 0, graph.nodes.size()); }
+
+    // Nodes begin .. end of the graph (a frame split at DLSS runs it in two parts; the
+    // timings are collected with the first).
+    void runGraph(Graph& graph, size_t begin, size_t end)
     {
         IQueryPool* pool = nullptr;
         uint32_t ring = uint32_t(m_frameIndex % kTimingFrames);
@@ -2242,12 +2859,13 @@ public:
                 break;
             }
         }
-        if (pool)
+        if (pool && begin == 0)
             collectTimings(ring);
 
-        for (const std::shared_ptr<GraphNode>& node : graph.nodes)
+        for (size_t index = begin; index < end && index < graph.nodes.size(); ++index)
         {
-            if (!node->enabled)
+            const std::shared_ptr<GraphNode>& node = graph.nodes[index];
+            if (!node->enabled || node->isDlss)
             {
                 continue;
             }
@@ -2564,6 +3182,7 @@ public:
         {
             luaL_error(L, "could not create texture");
         }
+        app->m_textures.push_back(texture);
         pushHandle(L, texture, kTextureType);
         return 1;
     }
@@ -2589,7 +3208,7 @@ public:
         auto buffer = std::make_shared<Buffer>();
         BufferDesc desc = {};
         desc.size = std::max<size_t>(data.size(), 1) * sizeof(float);
-        desc.usage = BufferUsage::VertexBuffer;
+        desc.usage = BufferUsage::VertexBuffer | BufferUsage::CopySource; // CopySource: switchDevice reads it back
         desc.defaultState = ResourceState::VertexBuffer;
         desc.label = "Vertex Buffer";
         data.resize(desc.size / sizeof(float));
@@ -2598,6 +3217,7 @@ public:
             luaL_error(L, "could not create vertex buffer");
         }
         buffer->size = desc.size;
+        app->m_buffers.push_back(buffer);
         pushHandle(L, buffer, kBufferType);
         return 1;
     }
@@ -2627,6 +3247,7 @@ public:
             luaL_error(L, "could not create buffer");
         }
         buffer->size = desc.size;
+        app->m_buffers.push_back(buffer);
         pushHandle(L, buffer, kBufferType);
         return 1;
     }
@@ -2676,18 +3297,72 @@ public:
         return 1;
     }
 
-    // rhi.restart{ adapter = name }: closes the window, and runs the script again on that
-    // GPU (a new device, window and Lua state). The adapter may be left out (the default).
-    static int apiRestart(lua_State* L)
+    // rhi.switch_device{ adapter = name }: moves the script onto that GPU without stopping
+    // it: the device and its pipelines are made ready on another thread while the frames go
+    // on (prepareDevice), then it switches between two frames (switchDevice): the window,
+    // the Lua state and everything the script made stay. True if it began; rhi.switching()
+    // says while it is under way, rhi.adapter() whether it happened (a GPU that can't be
+    // used leaves it where it was).
+    static int apiSwitchDevice(lua_State* L)
     {
         LuaApp* app = get(L);
         luaL_checktype(L, 1, LUA_TTABLE);
         lua_getfield(L, 1, "adapter");
-        g_restart.adapter = luaL_optstring(L, -1, "");
-        g_restart.pending = true;
-        if (app->m_window)
-            glfwSetWindowShouldClose(app->m_window, GLFW_TRUE);
-        return 0;
+        lua_pushboolean(L, app->prepareDevice(luaL_checkstring(L, -1)));
+        return 1;
+    }
+
+    // rhi.dlss_available(): whether DLSS runs on this device (an NVIDIA RTX GPU, with NGX's
+    // runtime, in a build with DLSS's SDK); and if not, why.
+    static int apiDlssAvailable(lua_State* L)
+    {
+        LuaApp* app = get(L);
+#if SLANG_RHI_LUA_DLSS
+        app->ensureDlss();
+        lua_pushboolean(L, app->m_dlss != nullptr);
+        lua_pushstring(L, app->m_dlssWhy.c_str());
+#else
+        SLANG_UNUSED(app);
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "this build has no DLSS SDK (external/dlss)");
+#endif
+        return 2;
+    }
+
+    // rhi.switching(): the GPU a switch is under way to (rhi.switch_device), or nil; and how
+    // far it is: a fraction (0 to 1), the stage -- "device" (being made), "pipelines"
+    // (being built on it), "moving" (the next frame switches: what the script made goes
+    // over, which holds that frame up) -- and the pipelines built and to build.
+    static int apiSwitching(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        const std::shared_ptr<PreparedDevice>& prepared = app->m_prepared;
+        if (!prepared)
+        {
+            lua_pushnil(L);
+            return 1;
+        }
+        uint32_t total = uint32_t(prepared->pipelines.size());
+        uint32_t built = prepared->pipelinesBuilt;
+        const char* stage = "device";
+        // The device about a tenth of the way, the pipelines most of it, the move the rest.
+        double fraction = 0.0;
+        if (prepared->done && prepared->device)
+        {
+            stage = "moving";
+            fraction = 0.95;
+        }
+        else if (prepared->deviceMade)
+        {
+            stage = "pipelines";
+            fraction = 0.1 + 0.85 * (total ? double(built) / total : 1.0);
+        }
+        lua_pushstring(L, prepared->adapter.c_str());
+        lua_pushnumber(L, fraction);
+        lua_pushstring(L, stage);
+        lua_pushinteger(L, built);
+        lua_pushinteger(L, total);
+        return 5;
     }
 
     static int apiTime(lua_State* L)
@@ -3041,6 +3716,45 @@ public:
         return 1;
     }
 
+    // graph:dlss{ name, color, depth, motion, output, quality = "Quality" }: NVIDIA DLSS
+    // Super Resolution (dlss.h), run in the graph's order: `color` (the drawn image, rgba16f),
+    // `depth` (r32f, z/w) and `motion` (xy of rgba16f or rg32f: pixels to where each was before),
+    // all the drawn size, upscaled into `output` (rgba16f). `quality`: "Quality",
+    // "Balanced", "Performance" or "Ultra Performance". The frame is split at it: what comes
+    // before it may not draw into the window. node.reset = true starts it over (a cut).
+    static int graphDlss(lua_State* L)
+    {
+        auto graph = checkShared<Graph>(L, 1, kGraphType);
+        luaL_checktype(L, 2, LUA_TTABLE);
+        auto node = std::make_shared<GraphNode>();
+        node->isDlss = true;
+        node->name = "DLSS";
+        if (lua_getfield(L, 2, "name") == LUA_TSTRING)
+            node->name = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "color");
+        node->dlssColor = checkColorTexture(L, -1);
+        lua_getfield(L, 2, "depth");
+        node->dlssDepth = checkColorTexture(L, -1);
+        lua_getfield(L, 2, "motion");
+        node->dlssMotion = checkColorTexture(L, -1);
+        lua_getfield(L, 2, "output");
+        node->target = checkColorTexture(L, -1);
+        lua_pop(L, 4);
+        static const char* kQualities[] = {"Quality", "Balanced", "Performance", "Ultra Performance"};
+        if (lua_getfield(L, 2, "quality") == LUA_TSTRING)
+        {
+            const char* quality = lua_tostring(L, -1);
+            for (int i = 0; i < 4; ++i)
+                if (strcmp(quality, kQualities[i]) == 0)
+                    node->dlssQuality = i;
+        }
+        lua_pop(L, 1);
+        graph->nodes.push_back(node);
+        pushHandle(L, node, kNodeType);
+        return 1;
+    }
+
     // pass:draw{ pipeline, vertices, count = 3, params }
     static int nodeDraw(lua_State* L)
     {
@@ -3117,6 +3831,8 @@ public:
         const char* key = luaL_checkstring(L, 2);
         if (strcmp(key, "enabled") == 0)
             node->enabled = lua_toboolean(L, 3);
+        else if (strcmp(key, "reset") == 0)
+            node->dlssReset = lua_toboolean(L, 3);
         else if (strcmp(key, "timed") == 0)
             node->timed = lua_toboolean(L, 3);
         else if (strcmp(key, "threads") == 0)
@@ -3247,12 +3963,13 @@ public:
         group->buffer = std::make_shared<Buffer>();
         BufferDesc desc = {};
         desc.size = group->capacity * kBodyFloats * sizeof(float);
-        desc.usage = BufferUsage::ShaderResource | BufferUsage::CopyDestination;
+        desc.usage = BufferUsage::ShaderResource | BufferUsage::CopyDestination | BufferUsage::CopySource;
         desc.defaultState = ResourceState::ShaderResource;
         desc.label = "Body transforms";
         if (SLANG_FAILED(app->m_device->createBuffer(desc, nullptr, group->buffer->buffer.writeRef())))
             luaL_error(L, "could not create a body group's buffer");
         group->buffer->size = desc.size;
+        app->m_buffers.push_back(group->buffer);
         world->groups.push_back(group);
         pushHandle(L, group, kBodyGroupType);
         return 1;
@@ -3630,7 +4347,7 @@ public:
         auto buffer = std::make_shared<Buffer>();
         BufferDesc desc = {};
         desc.size = std::max<size_t>(bytes, 4);
-        desc.usage = BufferUsage::ShaderResource | BufferUsage::CopyDestination;
+        desc.usage = BufferUsage::ShaderResource | BufferUsage::CopyDestination | BufferUsage::CopySource;
         desc.defaultState = ResourceState::ShaderResource;
         desc.label = label;
         if (SLANG_FAILED(app->m_device->createBuffer(desc, bytes ? contents : nullptr, buffer->buffer.writeRef())))
@@ -3638,6 +4355,7 @@ public:
             luaL_error(L, "could not create a buffer for %s", label);
         }
         buffer->size = desc.size;
+        app->m_buffers.push_back(buffer);
         return buffer;
     }
 
@@ -4358,6 +5076,7 @@ public:
         auto sampler = std::make_shared<Sampler>();
         if (SLANG_FAILED(app->m_device->createSampler(desc, sampler->sampler.writeRef())))
             luaL_error(L, "could not create a sampler");
+        app->m_samplers.push_back(sampler);
         pushHandle(L, sampler, kSamplerType);
         return 1;
     }
@@ -4612,7 +5331,9 @@ public:
             {"device", apiDevice},
             {"adapter", apiAdapter},
             {"devices", apiDevices},
-            {"restart", apiRestart},
+            {"switch_device", apiSwitchDevice},
+            {"switching", apiSwitching},
+            {"dlss_available", apiDlssAvailable},
             {"time", apiTime},
             {"set_title", apiSetTitle},
             {"set_paused", apiSetPaused},
@@ -4788,6 +5509,7 @@ public:
         static const luaL_Reg kGraphMethods[] = {
             {"render_pass", graphRenderPass},
             {"dispatch", graphDispatch},
+            {"dlss", graphDlss},
             {nullptr, nullptr},
         };
         newType(L, kGraphType, paramsIndex, kGraphMethods, collectHandle<Graph>);
@@ -4865,6 +5587,43 @@ public:
     std::set<std::string> m_includedScripts;
     std::set<std::string> m_warnedAssets; // missing assets already reported
     std::vector<std::weak_ptr<Texture>> m_renderTargets;
+    // Every other GPU object the script made, so that a switch to another GPU
+    // (switchDevice) can make them again there: rhi.texture's, the buffers, the samplers.
+    std::vector<std::weak_ptr<Texture>> m_textures;
+    std::vector<std::weak_ptr<Buffer>> m_buffers;
+    std::vector<std::weak_ptr<Sampler>> m_samplers;
+    // The device's required features (the script's config), for a device made again.
+    std::vector<Feature> m_features;
+    // A device being made ready on another GPU (rhi.switch_device): made, and every
+    // pipeline built on it, on a thread of its own while the frames go on; switched to
+    // (switchDevice) at the start of the first frame after it is done.
+    struct PreparedDevice
+    {
+        std::string adapter;
+        ComPtr<IDevice> device;
+        Format windowFormat = Format::Undefined;
+        // The pipelines, as they were when it began (descriptions, and their versions then).
+        std::vector<std::pair<std::shared_ptr<Pipeline>, Pipeline>> pipelines;
+        std::vector<uint32_t> versions;
+        std::vector<BuiltPipeline> built;
+        std::map<std::string, uint32_t> moduleTags; // its session's (moduleTag)
+        double seconds = 0;
+        // How far it is, for rhi.switching (written by its thread, read by the frames).
+        std::atomic<bool> deviceMade{false};
+        std::atomic<uint32_t> pipelinesBuilt{0};
+        std::atomic<bool> done{false};
+        // Done, and the frame after that shown first (rhi.switching's "moving" stage: the
+        // switch itself holds up the next frame, so it is said before, not after).
+        bool announced = false;
+    };
+    std::shared_ptr<PreparedDevice> m_prepared;
+    std::thread m_preparing;
+#if SLANG_RHI_LUA_DLSS
+    // DLSS on this device, made the first time it is asked for (ensureDlss).
+    std::unique_ptr<dlss::Context> m_dlss;
+    bool m_dlssTried = false;
+    std::string m_dlssWhy; // why it can't run, if it can't
+#endif
 
     // The frame being recorded; only valid during the script's draw().
     struct Frame
@@ -4892,7 +5651,31 @@ public:
     static constexpr double kWatchInterval = 0.15; // seconds between checks
     FileWatcher m_watcher;
     double m_lastWatchTime = 0.0;
-    uint32_t m_buildSerial = 0;
+    // How many modules of each tag the device's Slang session has loaded (moduleTag).
+    std::map<std::string, uint32_t> m_moduleTags;
+
+    // A module's tag (compileProgram): what it is built from (the path, the entry points,
+    // the source), hashed, and how many of those this session has loaded before -- new for
+    // every load, and the same on every device for the same build, so that a device made
+    // again (switchDevice) finds its shaders in the shader cache.
+    static std::string moduleTag(std::map<std::string, uint32_t>& moduleTags, const Pipeline& pipeline, const std::string& source)
+    {
+        uint64_t hash = 1469598103934665603ull; // FNV-1a
+        const auto mix = [&](const std::string& text)
+        {
+            for (unsigned char c : text)
+                hash = (hash ^ c) * 1099511628211ull;
+            hash = (hash ^ 0xff) * 1099511628211ull;
+        };
+        mix(pathKey(pipeline.path));
+        for (const std::string& entryPoint : pipeline.entryPoints)
+            mix(entryPoint);
+        mix(source);
+        char text[32];
+        snprintf(text, sizeof(text), "%016llx", (unsigned long long)hash);
+        uint32_t& count = moduleTags[text];
+        return std::string(text) + "-" + std::to_string(count++);
+    }
 };
 
 // ---------------------------------------------------------------------------------------
@@ -4989,8 +5772,8 @@ int main(int argc, const char** argv)
     }
 
     // One window, on Vulkan (the engine's only API, for now), on the GPU picked in the
-    // settings, else the default one. rhi.restart runs the script again on another; a GPU
-    // that can't start falls back to the one before, a saved one to the default.
+    // settings, else the default one (also if the saved one can't start). The script moves
+    // onto another GPU while it runs (rhi.switch_device), in the same window.
     if (!api.empty())
     {
         DeviceType asked;
@@ -5005,10 +5788,7 @@ int main(int argc, const char** argv)
         printf("Vulkan is not supported by this build or machine\n");
         return 1;
     }
-    std::string savedAdapter = LuaApp(script).readSavedAdapter();
-    std::string adapter = savedAdapter;
-    std::string previousAdapter;
-    bool restarted = false;
+    std::string adapter = LuaApp(script).readSavedAdapter();
     int result = 0;
     while (true)
     {
@@ -5024,25 +5804,9 @@ int main(int argc, const char** argv)
                 adapter.empty() ? "the default GPU" : adapter.c_str()
             );
         }
-        if (g_restart.pending)
-        {
-            g_restart.pending = false;
-            previousAdapter = adapter;
-            adapter = g_restart.adapter;
-            restarted = true;
-            continue;
-        }
-        if (result != 0 && restarted)
-        {
-            // The GPU restarted on didn't start: back to the one before.
-            adapter = previousAdapter;
-            restarted = false;
-            continue;
-        }
-        if (result != 0 && !savedAdapter.empty() && adapter == savedAdapter)
+        if (result != 0 && !adapter.empty())
         {
             // The GPU picked in the settings didn't start: the default one.
-            savedAdapter.clear();
             adapter.clear();
             continue;
         }

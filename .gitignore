@@ -3,6 +3,7 @@
 build/
 CMakeUserPresets.json
 external/optix
+external/dlss
 
 .vs/
 .idea/

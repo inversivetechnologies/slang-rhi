@@ -119,6 +119,7 @@ return function(setTitle, order)
         scenes.renderer.shadowFaceSize = settings.SHADOW_FACE_SIZES[values.shadowQuality]
         scenes.renderer.effects = effectsOf(values)
         scenes.renderer.antiAliasing = values.antiAliasing
+        scenes.renderer.upscaling = settings.upscalingOf(values)
         menu = menu or pauseMenu.new {
             settings = values,
             onPause = function(paused)
@@ -135,6 +136,16 @@ return function(setTitle, order)
                 elseif name == "antiAliasing" then
                     scenes.renderer.antiAliasing = values.antiAliasing
                     load(index) -- the AA's passes are part of the scene's graph
+                elseif name == "graphicsDevice" then
+                    -- On another GPU: DLSS may not run there (settings.upscalingOf: Off then).
+                    local up = settings.upscalingOf(values)
+                    if up.method ~= scenes.renderer.upscaling.method then
+                        scenes.renderer.upscaling = up
+                        load(index)
+                    end
+                elseif name == "upscaling" or name == "upscalingQuality" then
+                    scenes.renderer.upscaling = settings.upscalingOf(values)
+                    load(index) -- so are the upscaler's, and the drawn size of every target
                 elseif name == "ambientOcclusion" or name == "globalIllumination" or name == "effectsQuality" then
                     scenes.renderer.effects = effectsOf(values)
                     if showMode > 5 then

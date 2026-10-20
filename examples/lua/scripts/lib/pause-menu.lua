@@ -2,8 +2,8 @@
 -- is shown, and pauses it. Resume, Settings, Quit; the settings are on three pages
 -- (lib/settings.lua keeps them between runs):
 --
---   Display    the graphics device (the GPU: Enter restarts on it), the resolution,
---              fullscreen
+--   Display    the graphics device (the GPU: Enter switches to it while the script runs),
+--              the resolution, fullscreen
 --   Graphics   the most splats drawn, the shadows' quality, the ambient occlusion, the
 --              global illumination, the effects' quality, the anti-aliasing
 --   Controls   the mouse's and the controller's look sensitivity, invert Y
@@ -36,6 +36,7 @@ local COLORS = {
     border = { 0.45, 0.55, 0.85, 0.45 },
     selected = { 0.22, 0.38, 0.85, 0.95 },
     hover = { 1, 1, 1, 0.07 },
+    track = { 1, 1, 1, 0.14 }, -- a progress bar's unfilled part
     title = { 1, 1, 1, 1 },
     text = { 0.88, 0.9, 0.95, 1 },
     value = { 0.6, 0.78, 1.0, 1 },
@@ -82,7 +83,8 @@ end
 
 -- The settings' pages, and which settings each has.
 local PAGES = {
-    { name = "display", title = "Display", keys = { "graphicsDevice", "resolution", "fullscreen" } },
+    { name = "display", title = "Display",
+      keys = { "graphicsDevice", "resolution", "fullscreen", "upscaling", "upscalingQuality" } },
     { name = "graphics", title = "Graphics",
       keys = { "splatBudget", "shadowQuality", "ambientOcclusion", "globalIllumination", "effectsQuality", "antiAliasing" } },
     { name = "controls", title = "Controls", keys = { "mouseSensitivity", "stickSensitivity", "invertY" } },
@@ -164,6 +166,14 @@ function Menu:settingRows()
           index = indexOf(settings.EFFECT_QUALITIES, v.effectsQuality),
           format = function(q) return q == "Mixed" and "Mixed (AO full)" or q end,
           apply = function(q) v.effectsQuality = q return "effectsQuality", q end },
+        upscaling = { label = "Upscaling", choices = settings.upscalers(),
+          index = indexOf(settings.upscalers(), v.upscaling),
+          format = function(m) return m end,
+          apply = function(m) v.upscaling = m return "upscaling", m end },
+        upscalingQuality = { label = "Upscaling quality", choices = settings.UPSCALING_QUALITIES,
+          index = indexOf(settings.UPSCALING_QUALITIES, v.upscalingQuality),
+          format = function(q) return string.format("%s (%gx)", q, settings.UPSCALING_RATIOS[q]) end,
+          apply = function(q) v.upscalingQuality = q return "upscalingQuality", q end },
         antiAliasing = { label = "Anti-aliasing", choices = settings.AA_METHODS,
           index = indexOf(settings.AA_METHODS, v.antiAliasing),
           format = function(m)
@@ -267,7 +277,8 @@ function Menu:setOpen(open)
     self.dirty = true
     rhi.set_paused(open)
     rhi.show_pointer(open)
-    for _, pass in ipairs(self.passes) do pass.enabled = open end
+    for _, pass in ipairs(self.passes) do pass.enabled = self:shown() end
+    self.wasShown = self:shown()
     self.onPause(open)
 end
 
@@ -296,20 +307,24 @@ function Menu:move(delta)
 end
 
 -- A setting by `delta` choices (wrapping round), or a button pressed. A setting to confirm
--- (the graphics device) only changes its pending choice; Enter applies it.
+-- (the graphics device) only changes its pending choice; Enter applies it: the script
+-- moves onto that GPU while it runs (rhi.switch_device), the device made ready while the
+-- frames go on (Menu:update keeps it once it is there).
 function Menu:activate(delta)
     local row = self:rows()[self.selected]
     if not row then return end
     if row.action then
         if delta == 0 then row.action() end
     elseif row.confirm then
-        if delta ~= 0 then
+        if rhi.switching() then
+            -- one switch at a time
+        elseif delta ~= 0 then
             self.pendingDevice = (row.index - 1 + delta) % #row.choices + 1
         elseif row.index ~= self.runningDevice then
             local name, value = row.apply(row.choices[row.index])
             settings.save(self.values)
             self.onChange(name, value)
-            rhi.restart(value)
+            if rhi.switch_device(value) then self.switchingTo = value.adapter end
         end
     else
         local i = (row.index - 1 + (delta == 0 and 1 or delta)) % #row.choices + 1
@@ -402,6 +417,53 @@ function Menu:on_mouse_button(button, action)
     return true
 end
 
+-- What a switch to another GPU is doing (rhi.switching): the GPU, what it is doing, and a
+-- fraction; nil if none is under way.
+local function switchStatus()
+    local adapter, fraction, stage, built, total = rhi.switching()
+    if not adapter then return nil end
+    local doing = stage == "device" and "making the device"
+        or stage == "pipelines" and string.format("building pipelines %d / %d", built, total)
+        or "moving the scene over"
+    return adapter, doing, fraction
+end
+
+-- A switch's progress: its line of text over a bar, `width` wide at (x, y); its height.
+-- Where the line doesn't fit, the GPU's name is shortened, not what it is doing.
+function Menu:buildProgress(x, y, width, s)
+    local adapter, doing, fraction = switchStatus()
+    local c = self.canvas
+    local textScale = 0.6 * s
+    local fits = math.max(3, math.floor(width / ui.textWidth("x", textScale)))
+    local prefix = "Switching to "
+    local room = fits - #prefix - #doing - 2
+    if #adapter > room then adapter = room >= 6 and adapter:sub(1, room - 2) .. ".." or "" end
+    local text = adapter ~= "" and prefix .. adapter .. ": " .. doing or "Switching: " .. doing
+    if #text > fits then text = text:sub(1, fits - 2) .. ".." end
+    c:text(x + width / 2, y, text, { scale = textScale, color = COLORS.text, align = "center" })
+    local barY = y + ui.CELL_HEIGHT * textScale + 8 * s
+    local barHeight = math.floor(12 * s)
+    c:rect(x, barY, width, barHeight, COLORS.track, { radius = barHeight / 2 })
+    c:rect(x, barY, math.max(barHeight, width * fraction), barHeight, COLORS.selected, { radius = barHeight / 2 })
+    return barY + barHeight - y
+end
+
+-- With the menu closed: only a switch's progress, in a panel at the top of the window (the
+-- insets are in the bottom corners).
+function Menu:buildStatus(width, height)
+    local c = self.canvas
+    c:clear()
+    local s = math.max(0.6, math.min(1.4, height / 900))
+    local panelWidth = math.floor(math.min(width - 32, 640 * s))
+    local panelHeight = math.floor(70 * s)
+    local px = math.floor((width - panelWidth) / 2)
+    local py = math.floor(24 * s)
+    c:rect(px, py, panelWidth, panelHeight, COLORS.panel, { radius = 10 * s })
+    c:rect(px, py, panelWidth, panelHeight, COLORS.border, { radius = 10 * s, border = 1.5 })
+    local margin = math.floor(20 * s)
+    self:buildProgress(px + margin, py + math.floor(14 * s), panelWidth - 2 * margin, s)
+end
+
 -- Lays the page out for a window of `width` x `height`.
 function Menu:build(width, height)
     local c = self.canvas
@@ -412,7 +474,9 @@ function Menu:build(width, height)
     local panelWidth = math.floor(((self.page == "main" or self.page == "settings") and 420 or 700) * s)
     local titleHeight = math.floor(90 * s)
     local hintHeight = math.floor(56 * s)
-    local panelHeight = titleHeight + #rows * rowHeight + hintHeight
+    -- A switch to another GPU under way: its progress, over the hint.
+    local progressHeight = switchStatus() and math.floor(64 * s) or 0
+    local panelHeight = titleHeight + #rows * rowHeight + progressHeight + hintHeight
     local px = math.floor((width - panelWidth) / 2)
     local py = math.floor((height - panelHeight) / 2)
     local textScale = 0.85 * s
@@ -456,22 +520,36 @@ function Menu:build(width, height)
         end
     end
 
+    if progressHeight > 0 then
+        local barMargin = math.floor(40 * s)
+        self:buildProgress(px + barMargin, py + titleHeight + #rows * rowHeight + math.floor(14 * s),
+            panelWidth - 2 * barMargin, s)
+    end
+
     local selectedRow = rows[self.selected]
     local hint = self.page == "main" and "Up/Down  Enter  Esc: resume"
         or self.page == "settings" and "Up/Down  Enter  Esc: back"
+        or (selectedRow and selectedRow.confirm and rhi.switching())
+            and "Up/Down  Esc: back (the switch goes on)"
         or (selectedRow and selectedRow.confirm and selectedRow.index ~= self.runningDevice)
-            and "Enter: restart on this GPU  Left/Right: change  Esc: back"
+            and "Enter: switch to this GPU  Left/Right: change  Esc: back"
         or "Up/Down  Left/Right: change  Esc: back"
     c:text(px + panelWidth / 2, py + panelHeight - hintHeight + (hintHeight - ui.CELL_HEIGHT * 0.6 * s) / 2 - 4 * s,
         hint, { scale = 0.6 * s, color = COLORS.hint, align = "center" })
 end
 
--- The menu's pass, in a scene's graph: last, over everything; on while the menu is open.
+-- Whether anything is shown: the menu, or a switch's progress.
+function Menu:shown()
+    return self.open or rhi.switching() ~= nil
+end
+
+-- The menu's pass, in a scene's graph: last, over everything; on while the menu is open
+-- (or a switch to another GPU is under way: its progress).
 function Menu:addPasses(graph)
     self:resources()
     local pass = graph:render_pass { name = "pause menu" }
     pass:draw { pipeline = self.pipeline, count = 3, params = self.block }
-    pass.enabled = self.open
+    pass.enabled = self:shown()
     self.passes = { pass } -- only the graph being built is shown
     self.dirty = true
 end
@@ -481,17 +559,43 @@ function Menu:layout()
 end
 
 function Menu:update()
-    if not self.open or not self.dirty then return end
+    -- A switch to another GPU, once it is over: the GPU kept as the one to start on if the
+    -- script is on it now (lib/settings.lua: graphicsDevice), forgotten if it couldn't be.
+    if self.switchingTo and not rhi.switching() then
+        local v = self.values
+        local switched = rhi.adapter() == self.switchingTo
+        if switched then v.graphicsDevice = { adapter = self.switchingTo } end
+        v.graphicsDeviceTrial = nil
+        settings.save(v)
+        self.switchingTo, self.pendingDevice = nil, nil
+        self.dirty = true
+        -- What depends on the GPU (DLSS: NVIDIA's RTX GPUs only) is looked at again.
+        if switched then self.onChange("graphicsDevice", v.graphicsDevice) end
+    end
+    -- While one is under way, its progress, drawn anew every frame (with the menu closed,
+    -- alone); the pass shown while there is something to show.
+    local shown = self:shown()
+    if shown ~= self.wasShown then
+        self.wasShown = shown
+        for _, pass in ipairs(self.passes) do pass.enabled = shown end
+        self.dirty = true
+    end
+    if rhi.switching() then self.dirty = true end
+    if not shown or not self.dirty then return end
     self:resources()
     self.dirty = false
-    self:build(rhi.window_size())
+    if self.open then
+        self:build(rhi.window_size())
+    else
+        self:buildStatus(rhi.window_size())
+    end
     self.params = self.canvas:params()
     self.block:set(self.params)
 end
 
 -- For a script that draws each frame itself (or over its graph, as draw runs after it).
 function Menu:draw(frame)
-    if not self.open then return end
+    if not self:shown() then return end
     self:update()
     frame:draw(self.pipeline, { count = 3, params = self.params })
 end

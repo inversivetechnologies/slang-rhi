@@ -382,7 +382,8 @@ Result DeviceImpl::createTexture(const TextureDesc& desc_, const SubresourceData
 
     // Allocate the memory
     VkMemoryPropertyFlags reqMemoryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    int memoryTypeIndex = m_api.findMemoryTypeIndex(memRequirements.memoryTypeBits, reqMemoryProperties);
+    int memoryTypeIndex =
+        m_api.findMemoryTypeIndex(memRequirements.memoryTypeBits, reqMemoryProperties, memRequirements.size);
     SLANG_RHI_ASSERT(memoryTypeIndex >= 0);
 
     VkMemoryAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -409,10 +410,24 @@ Result DeviceImpl::createTexture(const TextureDesc& desc_, const SubresourceData
         exportMemoryAllocateInfo.handleTypes = extMemoryHandleType;
         allocInfo.pNext = &exportMemoryAllocateInfo;
     }
-    SLANG_VK_RETURN_ON_FAIL_REPORT(
-        m_api.vkAllocateMemory(m_device, &allocInfo, nullptr, &texture->m_imageMemory),
-        this
-    );
+    VkResult allocResult = m_api.vkAllocateMemory(m_device, &allocInfo, nullptr, &texture->m_imageMemory);
+    // Device local memory full (an integrated GPU's carve-out is small): any memory the
+    // image can live in.
+    if (allocResult == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+    {
+        int fallback = m_api.findMemoryTypeIndex(
+            memRequirements.memoryTypeBits,
+            0,
+            memRequirements.size,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        );
+        if (fallback >= 0)
+        {
+            allocInfo.memoryTypeIndex = fallback;
+            allocResult = m_api.vkAllocateMemory(m_device, &allocInfo, nullptr, &texture->m_imageMemory);
+        }
+    }
+    SLANG_VK_RETURN_ON_FAIL_REPORT(allocResult, this);
 
     // Bind the memory to the image
     m_api.vkBindImageMemory(m_device, texture->m_image, texture->m_imageMemory, 0);

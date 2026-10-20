@@ -593,7 +593,17 @@ struct VulkanApi
     /// Type bits control which indices are tested against bit 0 for testing at index 0
     /// properties - a memory type must have all the bits set as passed in
     /// Returns -1 if couldn't find an appropriate memory type index
-    int findMemoryTypeIndex(uint32_t typeBits, VkMemoryPropertyFlags properties) const;
+    /// The first memory type in `typeBits` with `properties` whose heap can hold `size`
+    /// bytes (0: any). If none is device local and big enough (an integrated GPU's small
+    /// carve-out), one without VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT that is; failing that,
+    /// the first with `properties`, whatever its heap. Types with any of `excluded` are
+    /// skipped.
+    int findMemoryTypeIndex(
+        uint32_t typeBits,
+        VkMemoryPropertyFlags properties,
+        VkDeviceSize size = 0,
+        VkMemoryPropertyFlags excluded = 0
+    ) const;
 
     /// Given queue required flags, finds a queue
     int findQueue(VkQueueFlags reqFlags) const;

@@ -231,26 +231,42 @@ Result VulkanApi::initDeviceProcs(VkDevice device)
     return SLANG_OK;
 }
 
-int VulkanApi::findMemoryTypeIndex(uint32_t typeBits, VkMemoryPropertyFlags properties) const
+int VulkanApi::findMemoryTypeIndex(
+    uint32_t typeBits,
+    VkMemoryPropertyFlags properties,
+    VkDeviceSize size,
+    VkMemoryPropertyFlags excluded
+) const
 {
     SLANG_RHI_ASSERT(typeBits);
 
     const int numMemoryTypes = int(m_deviceMemoryProperties.memoryTypeCount);
 
-    // bit holds current test bit against typeBits. Ie bit == 1 << typeBits
-
-    uint32_t bit = 1;
-    for (int i = 0; i < numMemoryTypes; ++i, bit += bit)
+    const auto find = [&](VkMemoryPropertyFlags wanted, bool fitting) -> int
     {
-        const auto& memoryType = m_deviceMemoryProperties.memoryTypes[i];
-        if ((typeBits & bit) && (memoryType.propertyFlags & properties) == properties)
+        // bit holds current test bit against typeBits. Ie bit == 1 << typeBits
+        uint32_t bit = 1;
+        for (int i = 0; i < numMemoryTypes; ++i, bit += bit)
         {
+            const auto& memoryType = m_deviceMemoryProperties.memoryTypes[i];
+            if (!(typeBits & bit) || (memoryType.propertyFlags & wanted) != wanted ||
+                (memoryType.propertyFlags & excluded))
+                continue;
+            if (fitting && size > m_deviceMemoryProperties.memoryHeaps[memoryType.heapIndex].size)
+                continue;
             return i;
         }
-    }
+        return -1;
+    };
+
+    int index = find(properties, true);
+    if (index < 0 && (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        index = find(properties & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+    if (index < 0)
+        index = find(properties, false);
 
     // SLANG_RHI_ASSERT_FAILURE("Failed to find a usable memory type");
-    return -1;
+    return index;
 }
 
 int VulkanApi::findQueue(VkQueueFlags reqFlags) const

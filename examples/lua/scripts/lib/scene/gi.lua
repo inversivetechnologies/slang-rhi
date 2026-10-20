@@ -89,9 +89,12 @@ function gi.addView(ctx, graph, view, t, fx)
                      depthNear = 0.1, depthFar = 100 }
     g.depths = depths
 
+    -- The main view's size, of the window's (drawn smaller to be upscaled: renderer.upscaling).
+    local rs = ctx.renderScale or 1
+
     -- Phase 1: the G-buffer and the Hi-Z pyramid.
-    g.gbuffer = rhi.render_target("rgba16f")
-    g.albedo = rhi.render_target("rgba16f")
+    g.gbuffer = rhi.render_target("rgba16f", rs)
+    g.albedo = rhi.render_target("rgba16f", rs)
     graph:dispatch {
         name = view.name .. ": GI G-buffer",
         pipeline = p.gbuffer,
@@ -102,7 +105,7 @@ function gi.addView(ctx, graph, view, t, fx)
     }
     g.hiz = {}
     for level = 0, gi.HIZ_LEVELS - 1 do
-        g.hiz[level] = rhi.render_target("r32f", 0.5 ^ (level + 1))
+        g.hiz[level] = rhi.render_target("r32f", rs * 0.5 ^ (level + 1))
         graph:dispatch {
             name = view.name .. ": GI Hi-Z " .. level,
             pipeline = level == 0 and p.hizFirst or p.hizDown,
@@ -223,8 +226,8 @@ function gi.addView(ctx, graph, view, t, fx)
     local scale = gi.DIRECTIONS0 / spacing0 -- every cascade's atlas: probes x directions
     g.cascades, g.probes = {}, {}
     for i = 0, gi.CASCADES - 1 do
-        g.cascades[i] = rhi.render_target("rgba16f", scale)
-        g.probes[i] = rhi.render_target("rgba32f", 1 / (spacing0 * 2 ^ i)) -- a texel a probe
+        g.cascades[i] = rhi.render_target("rgba16f", rs * scale)
+        g.probes[i] = rhi.render_target("rgba32f", rs / (spacing0 * 2 ^ i)) -- a texel a probe
     end
     g.rcInputs = { gbuffer = g.gbuffer, hiz0 = g.hiz[0], hiz1 = g.hiz[1], hiz2 = g.hiz[2], hiz3 = g.hiz[3],
                    hiz4 = g.hiz[4], litImage = view.litImage,
@@ -257,7 +260,7 @@ function gi.addView(ctx, graph, view, t, fx)
 
     -- Phase 6: cascade 0 integrated, at its probes (one a cell of spacing0 pixels) -- into
     -- the splats' cache's texture, if they have one (the renderer's view.splatGi).
-    g.irradiance = view.splatGi or rhi.render_target("rgba16f", 1 / spacing0)
+    g.irradiance = view.splatGi or rhi.render_target("rgba16f", rs / spacing0)
     local params = { table.unpack(shared) }
     local own = rcParams(0)
     own.cascade0, own.irradianceOut = g.cascades[0], g.irradiance

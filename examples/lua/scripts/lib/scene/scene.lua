@@ -69,6 +69,7 @@ end
 
 function Scene:layout(width, height)
     each(self, "layout", width, height)
+    renderer.layout(self.ctx, width, height)
     renderer.resetHistory(self.ctx)
     for _, layer in ipairs(self.ctx.layers) do layer:layout(width, height) end
 end

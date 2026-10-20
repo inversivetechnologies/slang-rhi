@@ -1275,6 +1275,25 @@ if(SLANG_RHI_BUILD_EXAMPLES)
         FetchContent_MakeAvailable(miniaudio)
         target_sources(example-lua PRIVATE examples/lua/audio.cpp)
         target_include_directories(example-lua PRIVATE ${miniaudio_SOURCE_DIR})
+
+        # NVIDIA DLSS (examples/lua/dlss.cpp), if NVIDIA's DLSS SDK is in external/dlss: it
+        # isn't part of the repository (NVIDIA's license, and its size); see
+        # examples/lua/README.md for fetching it. Linked against NGX (the dynamic-runtime
+        # library), with NVIDIA's DLSS runtime copied next to the executable, where NGX
+        # looks for it.
+        set(SLANG_RHI_DLSS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/dlss)
+        if(WIN32 AND SLANG_RHI_ENABLE_VULKAN AND EXISTS ${SLANG_RHI_DLSS_DIR}/include/nvsdk_ngx_vk.h)
+            target_sources(example-lua PRIVATE examples/lua/dlss.cpp)
+            target_include_directories(example-lua PRIVATE ${SLANG_RHI_DLSS_DIR}/include)
+            target_compile_definitions(example-lua PRIVATE SLANG_RHI_LUA_DLSS=1)
+            # Debug: the debug runtime without debug iterators, as the Debug builds here are.
+            target_link_libraries(example-lua PRIVATE slang-rhi-vulkan-headers
+                $<IF:$<CONFIG:Debug>,${SLANG_RHI_DLSS_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg_iterator0.lib,${SLANG_RHI_DLSS_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib>)
+            add_custom_command(TARGET example-lua POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${SLANG_RHI_DLSS_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll $<TARGET_FILE_DIR:example-lua>)
+            message(STATUS "example-lua: DLSS from ${SLANG_RHI_DLSS_DIR}")
+        endif()
         if(UNIX AND NOT APPLE)
             target_link_libraries(example-lua PRIVATE dl pthread m)
         endif()

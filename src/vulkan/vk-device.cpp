@@ -704,6 +704,42 @@ Result DeviceImpl::initVulkanDevice(
 
         m_api.vkGetPhysicalDeviceFeatures2(m_api.m_physicalDevice, &deviceFeatures2);
 
+        // A feature struct of an extension the device doesn't have is chained into the query
+        // all the same, and what comes back is undefined (some drivers leave it set). The ray
+        // tracing ones are read below and elsewhere as "available" (descriptor types, buffer
+        // usage, pipeline stages), so they're cleared unless their extension is there.
+        const auto clearUnlessExtension = [&](auto& featureStruct, const char* extension)
+        {
+            if (extensionNames.count(extension))
+                return;
+            const VkStructureType sType = featureStruct.sType;
+            void* next = featureStruct.pNext;
+            featureStruct = {};
+            featureStruct.sType = sType;
+            featureStruct.pNext = next;
+        };
+        clearUnlessExtension(extendedFeatures.accelerationStructureFeatures, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+        clearUnlessExtension(extendedFeatures.rayTracingPipelineFeatures, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+        clearUnlessExtension(extendedFeatures.rayQueryFeatures, VK_KHR_RAY_QUERY_EXTENSION_NAME);
+        clearUnlessExtension(
+            extendedFeatures.rayTracingPositionFetchFeatures,
+            VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME
+        );
+        clearUnlessExtension(extendedFeatures.rayTracingMotionBlurFeatures, VK_NV_RAY_TRACING_MOTION_BLUR_EXTENSION_NAME);
+        clearUnlessExtension(
+            extendedFeatures.rayTracingInvocationReorderFeatures,
+            VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME
+        );
+        clearUnlessExtension(extendedFeatures.opacityMicromapFeatures, VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
+        clearUnlessExtension(
+            extendedFeatures.rayTracingLinearSweptSpheresFeatures,
+            VK_NV_RAY_TRACING_LINEAR_SWEPT_SPHERES_EXTENSION_NAME
+        );
+        clearUnlessExtension(
+            extendedFeatures.clusterAccelerationStructureFeatures,
+            VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME
+        );
+
         if (deviceFeatures2.features.shaderResourceMinLod)
         {
             availableFeatures.push_back(Feature::ShaderResourceMinLod);

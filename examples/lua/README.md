@@ -94,6 +94,51 @@ feature the script requires, the program says so and exits.
 UAV limit -- from when the engine ran on them; the measurements below say which API they
 were taken on.)
 
+#### Switching GPUs
+
+The pause menu's Graphics device (or `rhi.switch_device{ adapter }`) moves the running
+script onto another GPU without stopping it: the window, the Lua state, the scene and the
+script's handles stay; only what the handles hold moves.
+
+1. **Made ready while the frames go on** (`prepareDevice`, on a thread of its own): the
+   new device, and every pipeline built on it. Its shaders come from an in-memory shader
+   cache shared by every device the process makes (keyed by Slang's hash of each entry
+   point, so a GPU switched to before, or one compiling with the same options, compiles
+   nothing again); the module names are made from what is compiled, not a build counter,
+   so that the keys are the same on every device.
+2. **Then switched to between two frames** (`switchDevice`): the buffers read back from
+   the old GPU (in batches, into cached host memory) and uploaded to the new one, the
+   textures and depth buffers made again empty (drawn or computed again every frame;
+   histories start over, as after a cut), the samplers, the window's surface, the
+   pipelines built on the other thread installed (those made or reloaded since, built
+   then). Dispatches that run once run again.
+
+**Progress:** while a switch is under way the pause menu shows a bar -- making the
+device, building pipelines n / N, then moving the scene over -- in its panel, or with the
+menu closed alone at the top of the window (`rhi.switching()` gives the stage and the
+fraction). The host lets one frame show "moving the scene over" before it switches, as the
+switch itself holds up the next frame.
+
+If the new device or its surface can't be made, the script stays where it was. Measured
+(Release, the composite scene, RTX 3050 Laptop GPU and the integrated Radeon): made ready in
+3.6 to 6.7 s while drawing, then a pause of 1.2 to 1.7 s -- moving 861 MB in 39 buffers,
+about half each way (the splats and their trees are most of it).
+
+The slang-rhi Vulkan backend (`src/vulkan`) was fixed for the integrated Radeon, which
+couldn't be used before:
+
+- calibrated timestamps are queried through the extension the device has (the KHR entry
+  point on an EXT-only driver crashed the loader);
+- ray tracing features whose extensions the device doesn't list are cleared after the
+  feature query (they read as available -- and were used, in descriptor pools, buffer usage
+  and pipeline stages -- on a GPU without them);
+- memory types too small for an allocation are passed over (its 256 MB device local heap
+  can't hold the splats: they go in system memory, as an allocation does when that heap is
+  full);
+- readback buffers go in cached host memory where there is some (the CPU reads the first
+  host visible type, which can be device local memory over the bus, about ten times
+  slower).
+
 ### The showcase
 
 The showcase is the [scene viewer](#the-scenes): the scene files in `assets/scenes/`, one at
@@ -125,9 +170,11 @@ and the shaders' `time` stops, so everything animated by it holds still too.
 
 | Page | Setting | Choices | |
 | --- | --- | --- | --- |
-| Display | Graphics device | the GPUs Vulkan has (`rhi.devices()`: hardware only, no software renderers) | the GPU to run on. Left / Right picks one, Enter restarts the script on it (a new device, window and Lua state: `rhi.restart`). It is kept only once it has started, so a GPU that crashes on its way up (a driver's) leaves the next start on the one before |
+| Display | Graphics device | the GPUs Vulkan has (`rhi.devices()`: hardware only, no software renderers) | the GPU to run on. Left / Right picks one, Enter switches to it while the script runs, in the same window, with the scene as it is ([switching GPUs](#switching-gpus)). It is kept (for the next start) only once the switch is done, so a GPU that crashes on its way up (a driver's) leaves the next start on the one before |
 | Display | Resolution | the monitor's video modes from 800 x 600 | the window's size; with fullscreen, the monitor's video mode |
 | Display | Fullscreen | Off, On | fullscreen on the primary monitor, at the resolution |
+| Display | Upscaling | Off, FSR 1, DLSS (NVIDIA RTX GPUs only) | the main view drawn smaller and [upscaled](#upscaling) to the window |
+| Display | Upscaling quality | Quality (1.5x), Balanced (1.7x), Performance (2x), Ultra Performance (3x) | how much smaller it is drawn |
 | Graphics | Max splats | 250,000 .. 6,000,000 | the splats' budget (1,500,000 by default): the levels of detail fit what is drawn to it (a scene's own `splatBudget`, if lower, still holds). The per-splat buffers and the sort are sized for it, a power of two of at least 2^21 (about 0.5 GB at 6M); a budget past them reloads the script or the scene |
 | Graphics | Shadow quality | Low (256), Medium (512), High (1024), Ultra (2048) | the shadow maps' texels per cube face; the scene (or script) is loaded again with them |
 | Graphics | Ambient occlusion | GTAO, Off, SSAO | [GTAO or SSAO](#ambient-occlusion-and-indirect-light): darker where surfaces are close to others; GTAO by default. With radiance cascades, the AO is theirs (any setting but Off) |
@@ -277,6 +324,55 @@ watched, so the scene reloads when it turns up), with a warning:
 | a prefab file | a blue checkered box (a `mesh`, `pattern` 3); the instance's components that need the prefab's fields are left out |
 | a sound file | nothing: silence |
 | a behavior | nothing: the entity runs no behavior |
+
+#### Upscaling
+
+The Display page's Upscaling draws the main view smaller than the window -- every target
+it renders into, the GI's and the effects' too, at 1 / the quality's ratio
+(`renderer.upscaling`, `ctx.renderScale`) -- and upscales the result:
+
+- **FSR 1** (AMD FidelityFX Super Resolution 1.0, `shaders/post/fsr1.slang`, after AMD's
+  MIT-licensed reference): spatial, two compute passes -- EASU (edge-adaptive upsampling: a
+  Lanczos-like kernel over 12 pixels, stretched along the local edge, clamped to the
+  nearest four) then RCAS (sharpening, as far as the neighborhood allows without clipping),
+  in a perceptual space. It runs after the anti-aliasing, at the drawn size: it adds no
+  detail and smooths no stairs itself, so it wants an anti-aliased input -- SMAA or FXAA
+  (TAA without jitter leaves geometric edges stepped, and FSR then scallops them). Works on
+  every GPU; 0.36 ms at 1600 x 900 (Performance, RTX 3050 Laptop GPU).
+- **DLSS** (NVIDIA DLSS Super Resolution, through NGX on Vulkan: `examples/lua/dlss.cpp`):
+  temporal, and anti-aliasing as it upscales (the AA setting is set aside). It reads the
+  drawn image, its depth (the nearest of the three depth buffers) and its motion vectors in
+  pixels, made by `shaders/post/dlss-inputs.slang` (0.04 ms) from the camera's motion and
+  each surface's own -- the same reprojection as TAA's (`shaders/post/reprojection.slang`).
+  Only on NVIDIA's RTX GPUs (`rhi.dlss_available()`); after a switch to a GPU without it,
+  the scene viewer goes back to no upscaling.
+
+**DLSS in the host.** NGX needs Vulkan extensions of its own, so devices on NVIDIA GPUs are
+made with them (`dlss::requiredExtensions`, less `VK_EXT_buffer_device_address`, which
+slang-rhi has as Vulkan 1.2's). `graph:dlss{}` is a graph node; the frame is split there:
+what comes before it is submitted before the window's image is acquired (so that the
+submission the swapchain waits on is the last), DLSS runs in a submission of its own on the
+same queue (memory barriers on both sides, its inputs put in the states it reads them in),
+then the rest. The DLSS feature is made again when the sizes or the quality change.
+
+**Not (yet):** the camera isn't jittered, so DLSS has no subpixel samples to accumulate: it
+anti-aliases and upscales, but doesn't recover detail finer than the drawn pixels.
+NVIDIA's runtime reports a validation error about its own internal images on the first
+frame after each start-over (`nv.ngx.dlss.resource`, VUID-vkCmdDraw-None-09600) -- inside
+NGX, not anything the host records.
+
+**The DLSS SDK** isn't in the repository (NVIDIA's RTX SDK license, and 374 MB): the build
+uses it if it is in `external/dlss` (git-ignored), and leaves DLSS out otherwise. To fetch
+the headers and the Windows libraries (NVIDIA's license applies):
+
+```
+git clone --depth 1 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/dlss
+cd external/dlss
+git sparse-checkout set --no-cone "/include/*" "/lib/Windows_x86_64/*" /LICENSE.txt
+```
+
+(In Git Bash, prefix the last line with `MSYS_NO_PATHCONV=1`.) Then configure again; the
+build links NGX and copies `nvngx_dlss.dll` next to `example-lua.exe`.
 
 #### Radiance cascades GI
 
@@ -668,7 +764,9 @@ pass's shader, to combine images by depth, or for any screen-space effect.
 | `rhi.device()` | the backend's name, e.g. `"Vulkan"` |
 | `rhi.adapter()` | the GPU's name, e.g. `"NVIDIA GeForce RTX 3050 Laptop GPU"` |
 | `rhi.devices()` | the GPUs the script could run on: `{ { adapter = name, type = "discrete" \| "integrated" \| "unknown" }, ... }`, Vulkan's hardware adapters, each once by name |
-| `rhi.restart{ adapter }` | closes the window and runs the script again on that GPU (adapter optional: the default); one that can't start falls back to the one before |
+| `rhi.switch_device{ adapter }` | moves the running script onto that GPU ([switching GPUs](#switching-gpus)); true if the switch began (false: no such GPU, or one under way) |
+| `rhi.dlss_available()` | whether DLSS runs on this device, and if not why |
+| `rhi.switching()` | the GPU a switch is under way to, or nil; then its fraction done (0 to 1), its stage (`"device"`, `"pipelines"`, `"moving"`: the next frame switches), and the pipelines built and to build |
 | `rhi.time()` | seconds since start |
 | `rhi.set_title(text)` | sets the window title; the backend and GPU are appended |
 | `rhi.set_paused(paused)`, `rhi.paused()` | stops (or restarts) the shaders' `time` and the physics; `update` and input still run, with real time. A reload unpauses |
@@ -902,6 +1000,7 @@ end
 | `graph:render_pass{ name, target \| targets, depth_target, color, clear, viewport \| viewport_fraction }` | adds a render pass, run in the order added |
 | `pass:draw{ pipeline, count, vertices, params, instances }` | adds a draw to a render pass, run in the order added; `instances` is a number, or a body group (as many as it has bodies, frame by frame) |
 | `graph:dispatch{ name, pipeline, params, threads = {x, y, z} \| "window" \| texture, once, timed }` | adds a compute dispatch; `"window"` runs one thread per window pixel, a texture one per texel, both following resizes |
+| `graph:dlss{ name, color, depth, motion, output, quality }` | adds NVIDIA DLSS ([upscaling](#upscaling)): `color` (rgba16f), `depth` (r32f, z/w) and `motion` (pixels to where each was the frame before) at the drawn size, upscaled into `output`; `quality` "Quality" .. "Ultra Performance". Nothing before it may draw into the window; `node.reset = true` starts it over |
 | `rhi.set_graph(graph)` | makes the host run `graph` every frame, before `draw`; `nil` stops it |
 
 - **`render_pass` options:**
