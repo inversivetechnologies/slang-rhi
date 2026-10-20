@@ -37,6 +37,8 @@
 --   + / -           sphere radius           Space                 pause the light
 --   Tab             show / hide the second camera
 
+local settings = rhi.include("lib/settings.lua") -- the controls (look sensitivity)
+
 return function(setTitle)
     local scene = { name = "Scene" }
     setTitle = setTitle or function(details)
@@ -489,8 +491,9 @@ return function(setTitle)
 
     function scene.on_mouse_move(x, y)
         if not drag then return end
-        camera.yaw = camera.yaw - (x - drag[1]) * 0.008
-        camera.pitch = math.max(0.05, math.min(1.45, camera.pitch + (y - drag[2]) * 0.008))
+        local dx, dy = settings.mouseLook(x - drag[1], y - drag[2]) -- the controls' sensitivity
+        camera.yaw = camera.yaw - dx * 0.008
+        camera.pitch = math.max(0.05, math.min(1.45, camera.pitch + dy * 0.008))
         drag = { x, y }
         blocks.mainCamera.camera = scene.orbitCamera(camera)
     end

@@ -4,6 +4,7 @@
 --
 --   rhi.include("lib/pause.lua").install {
 --       only = { "resolution", "fullscreen", "splatBudget" }, -- the settings it has
+--       controls = false,                     -- no camera: no Controls page
 --       onPause = function(paused) end,       -- e.g. pause its music
 --       apply = function(values) end,         -- after init, and when a setting changes:
 --   }                                         -- make the script follow `values`
@@ -30,6 +31,7 @@ function pause.install(options)
     local menu = pauseMenu.new {
         settings = values,
         only = only,
+        controls = options.controls,
         onPause = onPause,
         onChange = function(name)
             if name == "resolution" or name == "fullscreen" then

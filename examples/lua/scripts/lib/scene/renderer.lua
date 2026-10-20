@@ -64,6 +64,8 @@ local function createTargets(inset)
         -- The splats' depth (z/w, as a depth buffer's), resolved from their blended depth.
         splatDepth = rhi.render_target("r32f", scale, shape),
         splatDepthBlend = rhi.render_target("rgba16f", scale, shape),
+        -- Their motion (the effects'), blended alike: rgb where it was before x alpha, a alpha.
+        splatMotion = rhi.render_target("rgba16f", scale, shape),
         sdfColor = rhi.render_target("rgba16f", scale, shape),
         sdfDepth = rhi.render_target("r32f", scale, shape),
         sdfAlbedo = rhi.render_target("rgba16f", scale, shape), -- the SDFs' albedo (for the GI)
@@ -79,10 +81,17 @@ renderer.shadowFaceSize = 512
 -- `ctx.views[1].image`, which is then copied to the window.
 renderer.captureMain = false
 
--- Temporal stabilization of the main view's final image (post/taa.slang: TAA without
--- jitter), against the shimmer of detail finer than a pixel, the splats' above all. The
--- settings change it, for the graphs built after.
-renderer.taa = true
+-- The main view's anti-aliasing, for the graphs built after (the settings change it):
+--   "TAA"   temporal (post/taa.slang: without jitter): each pixel blended with where its
+--           surface was the frame before (the bodies', the SDFs', the splats' motion),
+--           against the shimmer of detail finer than a pixel, the splats' above all
+--   "FXAA"  spatial (post/fxaa.slang): edges smoothed within the frame -- no history, so
+--           nothing lags, but nothing is stabilized either
+--   "SMAA"  spatial too (post/smaa.slang: SMAA 1x's passes): edges found, followed to their
+--           ends and blended by the area of the silhouette they stand for -- sharper than
+--           FXAA (only what is on an edge changes)
+--   "Off"
+renderer.antiAliasing = "TAA"
 
 -- Screen-space effects on every view (post/ssao.slang): ambient occlusion (by `aoMethod`,
 -- "GTAO" or "SSAO") and global illumination (by `giMethod`, "SSGI" or "Cascades"), at a
@@ -159,9 +168,20 @@ function renderer.build(ctx, systems)
     ctx.noLightTiles = ctx.noLightTiles or rhi.buffer(16)
     local fx = renderer.effects
     local effectsOn = fx.ao or fx.gi
-    local taaOn = renderer.taa
+    local taaOn = renderer.antiAliasing == "TAA"
+    local fxaaOn = renderer.antiAliasing == "FXAA"
+    local smaaOn = renderer.antiAliasing == "SMAA"
     -- What the temporal passes (the effects', TAA's) need: the bodies' motion, the camera's.
     local temporalOn = effectsOn or taaOn
+    if fxaaOn then
+        pipelines.fxaa = rhi.compute_pipeline("post/fxaa.slang", "fxaaMain")
+        pipelines.fxaaSampler = rhi.sampler { filter = "linear", address = "clamp" }
+    end
+    if smaaOn then
+        pipelines.smaaEdges = rhi.compute_pipeline("post/smaa.slang", "edgesMain")
+        pipelines.smaaWeights = rhi.compute_pipeline("post/smaa.slang", "weightsMain")
+        pipelines.smaaBlend = rhi.compute_pipeline("post/smaa.slang", "blendMain")
+    end
     if taaOn then
         pipelines.taa = rhi.compute_pipeline("post/taa.slang", "taaMain")
         pipelines.taaKeep = rhi.compute_pipeline("post/taa.slang", "taaKeepMain")
@@ -204,7 +224,7 @@ function renderer.build(ctx, systems)
     -- The views. An inset's image (and with captureMain, the main view's) is a texture;
     -- the main view's otherwise goes straight to the window.
     local function toTexture(view)
-        return view.inset ~= nil or ((renderer.captureMain or taaOn) and view == ctx.views[1])
+        return view.inset ~= nil or ((renderer.captureMain or taaOn or fxaaOn or smaaOn) and view == ctx.views[1])
     end
     ctx.composites = {}
     for _, view in ipairs(ctx.views) do
@@ -409,7 +429,8 @@ function renderer.build(ctx, systems)
             view.taaResolved = rhi.render_target("rgba16f")
             view.taaHistory = rhi.render_target("rgba16f")
             local inputs = { meshDepth = t.meshDepth, splatDepth = t.splatDepth, sdfDepth = t.sdfDepth,
-                             depthNear = 0.1, depthFar = 100, meshMotion = t.meshMotion, taaCurrent = view.image }
+                             depthNear = 0.1, depthFar = 100, meshMotion = t.meshMotion, splatMotion = t.splatMotion,
+                             taaCurrent = view.image }
             ctx.taaNode = graph:dispatch {
                 name = view.name .. ": temporal AA",
                 pipeline = pipelines.taa,
@@ -425,16 +446,48 @@ function renderer.build(ctx, systems)
                 threads = view.taaHistory,
             }
         end
+        -- ...or smoothed along its edges, within the frame (post/fxaa.slang).
+        view.fxaaResolved = nil
+        if fxaaOn and view == ctx.views[1] then
+            view.fxaaResolved = rhi.render_target("rgba16f")
+            ctx.fxaaNode = graph:dispatch {
+                name = view.name .. ": FXAA",
+                pipeline = pipelines.fxaa,
+                params = { { fxaaInput = view.image, fxaaSampler = pipelines.fxaaSampler, fxaaOutput = view.fxaaResolved } },
+                threads = view.fxaaResolved,
+                timed = true,
+            }
+        end
+        -- ...or morphologically, SMAA's three passes (post/smaa.slang).
+        view.smaaResolved = nil
+        if smaaOn and view == ctx.views[1] then
+            view.smaaEdges = rhi.render_target("rgba16f")
+            view.smaaWeights = rhi.render_target("rgba16f")
+            view.smaaResolved = rhi.render_target("rgba16f")
+            ctx.smaaNodes = {
+                graph:dispatch { name = view.name .. ": SMAA edges", pipeline = pipelines.smaaEdges,
+                                 params = { { smaaInput = view.image, smaaEdges = view.smaaEdges } },
+                                 threads = view.smaaEdges, timed = true },
+                graph:dispatch { name = view.name .. ": SMAA weights", pipeline = pipelines.smaaWeights,
+                                 params = { { smaaEdgesIn = view.smaaEdges, smaaWeights = view.smaaWeights } },
+                                 threads = view.smaaWeights, timed = true },
+                graph:dispatch { name = view.name .. ": SMAA blend", pipeline = pipelines.smaaBlend,
+                                 params = { { smaaInput = view.image, smaaWeightsIn = view.smaaWeights,
+                                              smaaOutput = view.smaaResolved } },
+                                 threads = view.smaaResolved, timed = true },
+            }
+        end
     end
 
-    -- A main view drawn into a texture (TAA's, or captured), onto the window.
+    -- A main view drawn into a texture (anti-aliased, or captured), onto the window.
     local main = ctx.views[1]
     if toTexture(main) and not main.inset then
         local copy = graph:render_pass { name = main.name .. ": to the window" }
         copy:draw {
             pipeline = pipelines.frame,
             count = 3,
-            params = { source = main.taaResolved or main.image, borderColor = { 0, 0, 0, 1 }, borderWidth = 0,
+            params = { source = main.taaResolved or main.fxaaResolved or main.smaaResolved or main.image,
+                       borderColor = { 0, 0, 0, 1 }, borderWidth = 0,
                        encodeGamma = srgb and 0 or 1, decodeGamma = 0 },
         }
     end

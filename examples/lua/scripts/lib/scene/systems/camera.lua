@@ -15,6 +15,7 @@
 -- behavior's camera (behaviors/player.lua). Without a main camera, an orbit camera looks
 -- at the origin.
 
+local settings = rhi.include("lib/settings.lua") -- the controls (look sensitivity)
 local system = {
     name = "camera",
     components = {
@@ -141,8 +142,9 @@ function system.on_mouse_move(ctx, x, y)
     local main = ctx.views[1]
     if not drag or main.camera.controller ~= "orbit" then return false end
     local c = main.camera
-    c.yaw = c.yaw - (x - drag[1]) * 0.35
-    c.pitch = math.max(-80, math.min(85, c.pitch + (y - drag[2]) * 0.35))
+    local dx, dy = settings.mouseLook(x - drag[1], y - drag[2]) -- the controls' sensitivity
+    c.yaw = c.yaw - dx * 0.35
+    c.pitch = math.max(-80, math.min(85, c.pitch + dy * 0.35))
     drag = { x, y }
     setCamera(main, cameraParams(ctx, main))
     return true

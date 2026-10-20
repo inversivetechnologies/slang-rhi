@@ -31,6 +31,7 @@
 #include "scene/shadow-lookup.slang"
 #include "splat/ply.slang"
 #include "splat/clip.slang"
+#include "splat/effect-field.slang"
 
 StructuredBuffer<float4> shadowCasters; // see shadow-casters.slang: in the file's frame
 StructuredBuffer<uint2> shadowList;     // the splats to draw and their instances (shadow-select.slang)
@@ -49,7 +50,9 @@ struct VertexOutput
     nointerpolation uint clipSlot : CLIP;
 };
 
-// A picked splat's center and covariance in the world: its caster, placed by its instance.
+// A picked splat's center and covariance in the world: its caster, placed by its instance
+// -- and moved by the effects if the instance is dynamic, as preprocess.slang moves it in
+// view.
 void placedCaster(uint2 picked, out float4 centerOpacity, out float3x3 covariance)
 {
     centerOpacity = shadowCasters[3 * picked.x];
@@ -58,6 +61,8 @@ void placedCaster(uint2 picked, out float4 centerOpacity, out float3x3 covarianc
     float3x3 fileCovariance = float3x3(c0.x, c0.y, c0.z, c0.y, c0.w, c1.x, c0.z, c1.x, c1.y);
     beginInstance(picked.y);
     centerOpacity.xyz = splatPlace(centerOpacity.xyz);
+    if (placementDynamic)
+        centerOpacity.xyz += effectDisplacement(centerOpacity.xyz);
     float3x3 yaw = splatYaw();
     covariance = mul(yaw, mul(fileCovariance, transpose(yaw))) * (placement.scale * placement.scale);
 }

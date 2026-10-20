@@ -515,6 +515,8 @@ struct Pipeline
     bool depth = false;
     // Color target format; Undefined means the window's.
     Format colorFormat = Format::Undefined;
+    // More color targets (SV_Target1, ...: `formats`), blended as the first.
+    std::vector<Format> extraFormats;
     enum class Blend
     {
         None,
@@ -696,6 +698,7 @@ struct GraphNode
 
     // Render pass.
     std::shared_ptr<Texture> target;      // null: the window
+    std::vector<std::shared_ptr<Texture>> extraTargets; // more color targets (`targets`), the size of the first
     std::shared_ptr<Texture> depthTarget; // null: the host's depth buffer for the target
     bool depthOnly = false;               // no color attachment; needs depthTarget
     bool clear = false;
@@ -818,13 +821,27 @@ int traceback(lua_State* L)
 // Host
 // ---------------------------------------------------------------------------------------
 
+// The engine runs on Vulkan only, for now: the graphics device to pick is the GPU.
+static const DeviceType kEngineDeviceType = DeviceType::Vulkan;
+
+// A restart on another GPU, asked for by rhi.restart: main() runs the script again on it.
+struct RestartRequest
+{
+    bool pending = false;
+    std::string adapter;
+};
+static RestartRequest g_restart;
+
 // Runs one script on one device, in its own window and Lua state.
 class LuaApp : public ExampleBase
 {
 public:
-    explicit LuaApp(fs::path scriptPath)
+    // `adapterName`: the graphics adapter to run on, by name; empty (or not found): the
+    // device type's default.
+    explicit LuaApp(fs::path scriptPath, std::string adapterName = {})
         : m_scriptPath(std::move(scriptPath))
         , m_scriptDir(m_scriptPath.parent_path())
+        , m_adapterName(std::move(adapterName))
     {
     }
 
@@ -845,9 +862,30 @@ public:
         std::vector<Feature> features = {Feature::Surface};
         readConfig(title, width, height, features);
 
-        SLANG_RETURN_ON_FAIL(
-            createDevice(deviceType, features, {}, m_device.writeRef(), {m_scriptDir.string(), LUA_SHADERS_DIR})
-        );
+        IAdapter* adapter = nullptr;
+        for (uint32_t i = 0; !m_adapterName.empty(); ++i)
+        {
+            IAdapter* candidate = getRHI()->getAdapter(deviceType, i);
+            if (!candidate)
+                break;
+            if (m_adapterName == candidate->getInfo().name)
+            {
+                adapter = candidate;
+                break;
+            }
+        }
+        if (!m_adapterName.empty() && !adapter)
+        {
+            printf("[lua] no adapter '%s' for %s: the default one\n", m_adapterName.c_str(), getRHI()->getDeviceTypeName(deviceType));
+        }
+        SLANG_RETURN_ON_FAIL(createDevice(
+            deviceType,
+            features,
+            {},
+            m_device.writeRef(),
+            {m_scriptDir.string(), LUA_SHADERS_DIR},
+            adapter
+        ));
         SLANG_RETURN_ON_FAIL(createWindow(m_device, title.c_str(), width, height));
         SLANG_RETURN_ON_FAIL(createSurface(m_device, Format::Undefined, m_surface.writeRef()));
         SLANG_RETURN_ON_FAIL(m_device->getQueue(QueueType::Graphics, m_queue.writeRef()));
@@ -1143,7 +1181,7 @@ public:
     }
 
     // Reads the window and device settings from the script's global `config` table.
-    // (`config.device` is read up front by main(), see readConfiguredDevice().)
+    // (The engine runs on Vulkan only, for now: `config.device` isn't read.)
     void readConfig(std::string& title, int& width, int& height, std::vector<Feature>& features)
     {
         lua_State* L = m_lua;
@@ -1194,23 +1232,29 @@ public:
         lua_pop(L, 2);
     }
 
-    // Returns the script's `config.device`, or an empty string if it doesn't set one (or
-    // doesn't load). Runs the script's top level in a state of its own, before any window
-    // exists, so the backend can be picked before anything is created.
-    std::string readConfiguredDevice()
+    // The GPU the user picked in the settings (lib/settings.lua's graphicsDevice: an
+    // adapter's name), if there is a settings file and the script can include
+    // lib/settings.lua; empty: none. Runs the script's top level in a state of its own,
+    // before any window exists, so the GPU can be picked before anything is created.
+    std::string readSavedAdapter()
     {
         lua_State* L = openScript();
         if (!L)
         {
             return {};
         }
-        std::string device;
-        if (lua_getglobal(L, "config") == LUA_TTABLE && lua_getfield(L, -1, "device") == LUA_TSTRING)
+        lua_settop(L, 0);
+        static const char* kSaved =
+            "local ok, values = pcall(function() return rhi.include('lib/settings.lua').load() end)\n"
+            "local d = ok and type(values) == 'table' and values.graphicsDevice\n"
+            "if type(d) == 'table' then return d.adapter end\n";
+        std::string adapter;
+        if (luaL_dostring(L, kSaved) == LUA_OK && lua_type(L, 1) == LUA_TSTRING)
         {
-            device = lua_tostring(L, -1);
+            adapter = lua_tostring(L, 1);
         }
         lua_close(L);
-        return device;
+        return adapter;
     }
 
     // Tag for passing the frame object to draw().
@@ -1386,12 +1430,18 @@ public:
                 colorTarget.alpha = {BlendFactor::One, BlendFactor::One, BlendOp::Min};
             }
         }
+        std::vector<ColorTargetDesc> colorTargets = {colorTarget};
+        for (Format format : pipeline.extraFormats)
+        {
+            colorTargets.push_back(colorTarget);
+            colorTargets.back().format = format;
+        }
         RenderPipelineDesc desc = {};
         desc.program = compiled.program;
         desc.inputLayout = inputLayout;
         desc.primitiveTopology = pipeline.topology;
-        desc.targets = pipeline.depthOnly ? nullptr : &colorTarget;
-        desc.targetCount = pipeline.depthOnly ? 0 : 1;
+        desc.targets = pipeline.depthOnly ? nullptr : colorTargets.data();
+        desc.targetCount = pipeline.depthOnly ? 0 : uint32_t(colorTargets.size());
         if (pipeline.depth)
         {
             desc.depthStencil.format = kDepthFormat;
@@ -1427,6 +1477,10 @@ public:
         key += "|" + std::to_string(int(desc->topology));
         key += desc->depth ? "|depth" : "";
         key += "|" + std::to_string(int(desc->colorFormat));
+        for (Format format : desc->extraFormats)
+        {
+            key += "+" + std::to_string(int(format));
+        }
         key += "|blend" + std::to_string(int(desc->blend));
         key += desc->depthOnly ? "|depthonly" : "";
 
@@ -1583,20 +1637,36 @@ public:
     // Begins a pass on a destination. A clear color clears it (and its depth buffer, if
     // the pass uses it); otherwise the pass draws over what is there. A depth buffer is
     // also cleared the first time it is used in a frame.
-    IRenderPassEncoder* beginRenderPass(const Destination& destination, const float* clearColor, bool depth = false)
+    IRenderPassEncoder* beginRenderPass(
+        const Destination& destination,
+        const float* clearColor,
+        bool depth = false,
+        const std::vector<std::shared_ptr<Texture>>* extraTargets = nullptr
+    )
     {
-        RenderPassColorAttachment colorAttachment = {};
+        std::vector<RenderPassColorAttachment> colorAttachments;
         RenderPassDesc renderPass = {};
         if (destination.color)
         {
-            colorAttachment.view = destination.color->getDefaultView();
-            colorAttachment.loadOp = clearColor ? LoadOp::Clear : LoadOp::Load;
-            if (clearColor)
+            std::vector<ITexture*> textures = {destination.color};
+            if (extraTargets)
             {
-                std::copy_n(clearColor, 4, colorAttachment.clearValue);
+                for (const std::shared_ptr<Texture>& extra : *extraTargets)
+                    textures.push_back(extra->texture);
             }
-            renderPass.colorAttachments = &colorAttachment;
-            renderPass.colorAttachmentCount = 1;
+            for (ITexture* texture : textures)
+            {
+                RenderPassColorAttachment colorAttachment = {};
+                colorAttachment.view = texture->getDefaultView();
+                colorAttachment.loadOp = clearColor ? LoadOp::Clear : LoadOp::Load;
+                if (clearColor)
+                {
+                    std::copy_n(clearColor, 4, colorAttachment.clearValue);
+                }
+                colorAttachments.push_back(colorAttachment);
+            }
+            renderPass.colorAttachments = colorAttachments.data();
+            renderPass.colorAttachmentCount = uint32_t(colorAttachments.size());
         }
         if (clearColor && *destination.depth)
         {
@@ -2051,7 +2121,7 @@ public:
             depth = depth || (draw->enabled && draw->pipeline->depth);
         }
 
-        IRenderPassEncoder* pass = beginRenderPass(destination, node.clear ? node.clearColor : nullptr, depth);
+        IRenderPassEncoder* pass = beginRenderPass(destination, node.clear ? node.clearColor : nullptr, depth, &node.extraTargets);
         PassScope<IRenderPassEncoder> scope{pass};
         for (const std::shared_ptr<GraphDraw>& draw : node.draws)
         {
@@ -2061,8 +2131,13 @@ public:
             {
                 continue;
             }
+            bool extrasMatch = pipeline->extraFormats.size() == node.extraTargets.size();
+            for (size_t i = 0; extrasMatch && i < node.extraTargets.size(); ++i)
+            {
+                extrasMatch = pipeline->extraFormats[i] == node.extraTargets[i]->format;
+            }
             if (pipeline->depthOnly != node.depthOnly ||
-                (!pipeline->depthOnly && resolveColorFormat(*pipeline) != destination.format))
+                (!pipeline->depthOnly && (resolveColorFormat(*pipeline) != destination.format || !extrasMatch)))
             {
                 report(draw->reported, node.name, "a draw's pipeline format doesn't match the pass's target");
                 continue;
@@ -2278,7 +2353,9 @@ public:
     }
 
     // rhi.render_pipeline{ shader = path, vertex = "vertexMain", fragment = "fragmentMain",
-    //                      layout = { {semantic, format}, ... }, topology = "triangles" }
+    //                      layout = { {semantic, format}, ... }, topology = "triangles",
+    //                      format = "rgba16f" | formats = { "rgba16f", ... } (more targets:
+    //                      SV_Target1, ..., blended as the first), depth, blend }
     static int apiRenderPipeline(lua_State* L)
     {
         LuaApp* app = requireDevice(L);
@@ -2332,6 +2409,24 @@ public:
 
         lua_getfield(L, 1, "depth");
         desc->depth = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+
+        if (lua_getfield(L, 1, "formats") == LUA_TTABLE)
+        {
+            int count = int(lua_rawlen(L, -1));
+            if (count == 0)
+                luaL_error(L, "formats needs at least one format");
+            for (int i = 1; i <= count; ++i)
+            {
+                lua_rawgeti(L, -1, i);
+                Format format = checkFormat(L, luaL_checkstring(L, -1))->format;
+                if (i == 1)
+                    desc->colorFormat = format;
+                else
+                    desc->extraFormats.push_back(format);
+                lua_pop(L, 1);
+            }
+        }
         lua_pop(L, 1);
 
         if (lua_getfield(L, 1, "format") != LUA_TNIL)
@@ -2541,6 +2636,58 @@ public:
         LuaApp* app = get(L);
         lua_pushstring(L, app->m_device ? getRHI()->getDeviceTypeName(app->m_device->getInfo().deviceType) : "");
         return 1;
+    }
+
+    // rhi.adapter(): the name of the graphics adapter the device runs on.
+    static int apiAdapter(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        lua_pushstring(L, app->m_device ? app->m_device->getInfo().adapterName : "");
+        return 1;
+    }
+
+    // rhi.devices(): the GPUs the script could run on -- { { adapter = name, type =
+    // "discrete" | "integrated" | "unknown" }, ... }: the hardware adapters Vulkan has (no
+    // software renderers), each once by name (adapters are picked by name, and some
+    // drivers list one twice).
+    static int apiDevices(lua_State* L)
+    {
+        lua_newtable(L);
+        int n = 0;
+        std::set<std::string> seen;
+        for (uint32_t i = 0;; ++i)
+        {
+            IAdapter* adapter = getRHI()->getAdapter(kEngineDeviceType, i);
+            if (!adapter)
+                break;
+            const AdapterInfo& info = adapter->getInfo();
+            if (info.adapterType == AdapterType::Software || !seen.insert(info.name).second)
+                continue;
+            const char* kind = info.adapterType == AdapterType::Discrete     ? "discrete"
+                               : info.adapterType == AdapterType::Integrated ? "integrated"
+                                                                             : "unknown";
+            lua_newtable(L);
+            lua_pushstring(L, info.name);
+            lua_setfield(L, -2, "adapter");
+            lua_pushstring(L, kind);
+            lua_setfield(L, -2, "type");
+            lua_rawseti(L, -2, ++n);
+        }
+        return 1;
+    }
+
+    // rhi.restart{ adapter = name }: closes the window, and runs the script again on that
+    // GPU (a new device, window and Lua state). The adapter may be left out (the default).
+    static int apiRestart(lua_State* L)
+    {
+        LuaApp* app = get(L);
+        luaL_checktype(L, 1, LUA_TTABLE);
+        lua_getfield(L, 1, "adapter");
+        g_restart.adapter = luaL_optstring(L, -1, "");
+        g_restart.pending = true;
+        if (app->m_window)
+            glfwSetWindowShouldClose(app->m_window, GLFW_TRUE);
+        return 0;
     }
 
     static int apiTime(lua_State* L)
@@ -2779,7 +2926,9 @@ public:
         return texture;
     }
 
-    // graph:render_pass{ name, target = texture, depth_target = depthTexture, color = true,
+    // graph:render_pass{ name, target = texture | targets = { texture, ... } (more color
+    //                    targets, for pipelines with as many formats; the size of the
+    //                    first; cleared alike), depth_target = depthTexture, color = true,
     //                    clear = {r,g,b,a}, viewport = {x,y,w,h} | viewport_fraction = {x,y,w,h} }
     static int graphRenderPass(lua_State* L)
     {
@@ -2802,6 +2951,23 @@ public:
         lua_getfield(L, 2, "target");
         if (!lua_isnil(L, -1))
             node->target = checkColorTexture(L, -1);
+        lua_pop(L, 1);
+        if (lua_getfield(L, 2, "targets") == LUA_TTABLE)
+        {
+            int count = int(lua_rawlen(L, -1));
+            if (node->target || count == 0)
+                luaL_error(L, "a pass has a target or a list of targets (at least one)");
+            for (int i = 1; i <= count; ++i)
+            {
+                lua_rawgeti(L, -1, i);
+                auto texture = checkColorTexture(L, -1);
+                if (i == 1)
+                    node->target = texture;
+                else
+                    node->extraTargets.push_back(texture);
+                lua_pop(L, 1);
+            }
+        }
         lua_pop(L, 1);
         lua_getfield(L, 2, "depth_target");
         if (!lua_isnil(L, -1))
@@ -4444,6 +4610,9 @@ public:
             {"vertex_buffer", apiVertexBuffer},
             {"buffer", apiBuffer},
             {"device", apiDevice},
+            {"adapter", apiAdapter},
+            {"devices", apiDevices},
+            {"restart", apiRestart},
             {"time", apiTime},
             {"set_title", apiSetTitle},
             {"set_paused", apiSetPaused},
@@ -4676,6 +4845,7 @@ public:
 public:
     fs::path m_scriptPath;
     fs::path m_scriptDir;
+    std::string m_adapterName; // the adapter asked for (see the constructor)
     lua_State* m_lua = nullptr;
     bool m_scriptFailed = false;
 
@@ -4785,13 +4955,8 @@ static bool findDeviceType(const std::string& name, DeviceType& outType)
 
 static void printUsage()
 {
-    printf("usage: example-lua [--api <name>] [example name | path to .lua script]\n");
-    printf("apis:");
-    for (DeviceType type : kDeviceTypes)
-    {
-        printf(" %s", lowercase(getRHI()->getDeviceTypeName(type)).c_str());
-    }
-    printf(" (default: the script's config.device, else vulkan)\n");
+    printf("usage: example-lua [--api vulkan] [example name | path to .lua script]\n");
+    printf("the engine runs on Vulkan only, for now; the GPU is picked in the settings (Display)\n");
     listExamples();
 }
 
@@ -4823,32 +4988,65 @@ int main(int argc, const char** argv)
         return 1;
     }
 
-    // One window, on one graphics API: the command line's, else the script's, else Vulkan.
-    if (api.empty())
+    // One window, on Vulkan (the engine's only API, for now), on the GPU picked in the
+    // settings, else the default one. rhi.restart runs the script again on another; a GPU
+    // that can't start falls back to the one before, a saved one to the default.
+    if (!api.empty())
     {
-        api = LuaApp(script).readConfiguredDevice();
+        DeviceType asked;
+        if (!findDeviceType(api, asked) || asked != kEngineDeviceType)
+        {
+            printf("the engine runs on Vulkan only, for now (not '%s')\n", api.c_str());
+            return 1;
+        }
     }
-    if (api.empty())
+    if (!getRHI()->isDeviceTypeSupported(kEngineDeviceType))
     {
-        api = "vulkan";
-    }
-    DeviceType deviceType;
-    if (!findDeviceType(api, deviceType))
-    {
-        printf("unknown api '%s'\n", api.c_str());
-        printUsage();
+        printf("Vulkan is not supported by this build or machine\n");
         return 1;
     }
-    if (!getRHI()->isDeviceTypeSupported(deviceType))
+    std::string savedAdapter = LuaApp(script).readSavedAdapter();
+    std::string adapter = savedAdapter;
+    std::string previousAdapter;
+    bool restarted = false;
+    int result = 0;
+    while (true)
     {
-        printf("%s is not supported by this build or machine\n", getRHI()->getDeviceTypeName(deviceType));
-        return 1;
-    }
-
-    int result = rhi::detail::runExamples([&]() -> ExampleBase* { return new LuaApp(script); }, {deviceType});
-    if (result != 0)
-    {
-        printf("could not start '%s' on %s\n", script.filename().string().c_str(), getRHI()->getDeviceTypeName(deviceType));
+        result = rhi::detail::runExamples(
+            [&]() -> ExampleBase* { return new LuaApp(script, adapter); },
+            {kEngineDeviceType}
+        );
+        if (result != 0)
+        {
+            printf(
+                "could not start '%s' on %s\n",
+                script.filename().string().c_str(),
+                adapter.empty() ? "the default GPU" : adapter.c_str()
+            );
+        }
+        if (g_restart.pending)
+        {
+            g_restart.pending = false;
+            previousAdapter = adapter;
+            adapter = g_restart.adapter;
+            restarted = true;
+            continue;
+        }
+        if (result != 0 && restarted)
+        {
+            // The GPU restarted on didn't start: back to the one before.
+            adapter = previousAdapter;
+            restarted = false;
+            continue;
+        }
+        if (result != 0 && !savedAdapter.empty() && adapter == savedAdapter)
+        {
+            // The GPU picked in the settings didn't start: the default one.
+            savedAdapter.clear();
+            adapter.clear();
+            continue;
+        }
+        break;
     }
     return result;
 }

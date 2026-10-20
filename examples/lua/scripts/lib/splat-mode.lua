@@ -174,7 +174,7 @@ return function(setTitle, file)
         local floats = {}
         for _, m in ipairs(list) do
             local p = m.position
-            for _, v in ipairs { p[1], p[2], p[3], m.yaw, m.scale, 0, 0, 0 } do floats[#floats + 1] = v end
+            for _, v in ipairs { p[1], p[2], p[3], m.yaw, m.scale, m.dynamic and 1 or 0, 0, 0 } do floats[#floats + 1] = v end
         end
         return { instances = rhi.buffer(floats), instanceCount = #list }
     end
@@ -242,7 +242,8 @@ return function(setTitle, file)
             -- The same quads into a depth buffer only: no color target.
             renderDepth = rhi.render_pipeline { shader = "splat/render.slang", fragment = "depthFragmentMain", format = "none", depth = true },
             renderDepthBlend = rhi.render_pipeline { shader = "splat/render.slang", vertex = "depthBlendVertexMain",
-                                                     fragment = "depthBlendFragmentMain", format = "rgba16f", blend = "premultiplied" },
+                                                     fragment = "depthBlendFragmentMain", formats = { "rgba16f", "rgba16f" },
+                                                     blend = "premultiplied" }, -- the depth, the motion
             depthResolve = rhi.compute_pipeline("splat/depth-resolve.slang", "resolveMain"),
             -- Shadows: the splats' Gaussians drawn into a translucent shadow map, see
             -- shaders/splat/shadow.slang.
@@ -261,6 +262,8 @@ return function(setTitle, file)
             drawnSplats = rhi.buffer(capacity * 8),
             sortKeys = rhi.buffer(capacity * 4),
             sortValues = rhi.buffer(capacity * 4),
+            -- How far the effects moved it, and from where since the frame before (preprocess.slang).
+            offsets = rhi.buffer(capacity * 32),
             drawCount = rhi.buffer(16), -- [0]: the splats drawn this frame
         }
         -- The tree (or placeholders if there is none), and the budget's histogram and pick.
@@ -282,6 +285,7 @@ return function(setTitle, file)
         blocks.singleInstance = rhi.params(instanceParams { IDENTITY_MODEL })
         -- No clipping, for graphs that don't ask for it.
         blocks.noClip = rhi.params { clipMode = 0, clipShapeCount = 0, clipShapes = rhi.buffer(48) }
+        blocks.noEffects = rhi.params { effectCount = 0, effectShapes = rhi.buffer(64) }
         blocks.noGi = rhi.texture { width = 1, height = 1, format = "rgba16f" }
         blocks.giSampler = rhi.sampler { filter = "linear", address = "clamp" }
         blocks.view = rhi.params {
@@ -335,6 +339,18 @@ return function(setTitle, file)
         return rhi.params { clipMode = mode, clipShapes = rhi.buffer(floats), clipShapeCount = #shapes }
     end
 
+    -- The effects block for addPasses' `effects`: `shapes` as shaders/splat/effect-field.slang
+    -- lays them out (four float4s each: center and kind (0 color, 1 displace), color and
+    -- radius, movement and its speed, circle, its speed and the strength).
+    function splat.effectsBlock(shapes)
+        local floats = {}
+        for _, s in ipairs(shapes) do
+            for _, v in ipairs(s) do floats[#floats + 1] = v end
+        end
+        if #floats == 0 then floats = { 0, 0, 0, 0 } end
+        return rhi.params { effectShapes = rhi.buffer(floats), effectCount = #shapes }
+    end
+
     -- The splat budget (the most splats drawn per view), as , and . set it. Before
     -- createResources, it also sizes the buffers; after, it is held to what they hold, and
     -- this returns true if `splats` is more: the caller makes them again for it (a new
@@ -380,6 +396,8 @@ return function(setTitle, file)
     --                 view needs fewer splats for the same detail
     --   clip          a clip block (clipMode, clipShapes, clipShapeCount: see
     --                 shaders/splat/clip.slang), or nil for none
+    --   effects       an effects block (splat.effectsBlock: shaders/splat/effect-field.slang),
+    --                 or nil for none: it moves and colors the dynamic instances' splats
     --   gi            if given, with lighting: { splatGi, splatGiStrength, splatGiSampler },
     --                 the screen-space GI (last frame's) that the splats cache per splat
     --   lighting      if given, a list of parameter blocks with a light and shadow maps
@@ -389,7 +407,9 @@ return function(setTitle, file)
     --   clear         the color to clear it to first
     --   depthTarget   if given, the splats are also drawn into this depth target
     --   depthBlend    or if given (an rgba16f target), with depthResolved (an r32f one): their
-    --                 depth blended as their colors are, resolved into depthResolved as z/w
+    --                 depth blended as their colors are, resolved into depthResolved as z/w;
+    --                 and with motion (an rgba16f target, depthBlend's size), their motion
+    --                 blended alike (render.slang: where the effects moved them from, for TAA)
     --   depthClear    false: keep what is in it (other splats drawn before), not clear it
     -- Returns the dispatches and passes it added, in order (e.g. to switch them off), and
     -- those whose thread counts follow the number of instances.
@@ -418,6 +438,8 @@ return function(setTitle, file)
                 sortKeys = r.sortKeys,
                 sortValues = r.sortValues,
                 drawCount = r.drawCount,
+                splatOffsets = r.offsets,
+                splatEffectsOn = options.effects and 1 or 0,
             },
             blocks.lodData,
             blocks.lod,
@@ -426,6 +448,7 @@ return function(setTitle, file)
         }
         for _, block in ipairs(views) do splatParams[#splatParams + 1] = block end
         splatParams[#splatParams + 1] = clip
+        splatParams[#splatParams + 1] = options.effects or blocks.noEffects
 
         add(g:dispatch { name = name .. ": reset count", pipeline = r.resetCount, params = { drawCount = r.drawCount }, threads = { 1, 1, 1 } })
         local budgetBlock = blocks.lod
@@ -529,7 +552,7 @@ return function(setTitle, file)
             -- (splat/depth-resolve.slang): smooth, and wherever they cover a pixel together.
             local blendPass = add(g:render_pass {
                 name = name .. ": blended depth",
-                target = options.depthBlend,
+                targets = { options.depthBlend, options.motion },
                 clear = options.depthClear ~= false and { 0, 0, 0, 0 } or nil,
             })
             blendPass:draw { pipeline = r.renderDepthBlend, count = r.sortCount * 6, params = drawParams }
@@ -556,6 +579,8 @@ return function(setTitle, file)
     --   atlas      the rgba16f texture to draw the map into, layers the one for its deep
     --              opacity layers, faceSize the size of their cube-face cells
     --   clip       a clip block, as for addPasses (nil: none)
+    --   effects    an effects block, as for addPasses (nil: none): the dynamic instances'
+    --              splats cast their shadows where the effects moved them
     --   instances, instanceCount   as for addPasses (nil: one instance, the `model`'s)
     --   clearMaps  false: keep what other splats drew into the maps, not clear them
     function splat.addShadowPasses(g, options)
@@ -605,6 +630,7 @@ return function(setTitle, file)
         for _, block in ipairs(views) do selectParams[#selectParams + 1] = block end
         selectParams[#selectParams + 1] = options.light
         selectParams[#selectParams + 1] = clip
+        selectParams[#selectParams + 1] = options.effects or blocks.noEffects
         local function ignore(node) return node end
         addLodPick(g, name .. ": shadow", r.lodHistogramLight, selectParams, instanceCount, blocks.shadowLod, ignore)
         g:dispatch { name = name .. ": shadow reset", pipeline = r.resetShadow, params = { shadowCount = r.shadowCount }, threads = { 1, 1, 1 } }
@@ -616,6 +642,7 @@ return function(setTitle, file)
         for _, block in ipairs(views) do drawBlocks[#drawBlocks + 1] = block end
         drawBlocks[#drawBlocks + 1] = options.light
         drawBlocks[#drawBlocks + 1] = clip
+        drawBlocks[#drawBlocks + 1] = options.effects or blocks.noEffects
         local function drawParams(own)
             local list = { own }
             for _, block in ipairs(drawBlocks) do list[#list + 1] = block end
@@ -700,10 +727,10 @@ return function(setTitle, file)
     -- What a pass over every splat (the file's and the merged ones) of every instance needs
     -- to place them -- the GI's global SDF (shaders/gi/global-sdf-splats.slang): its
     -- parameter blocks, and the splats an instance has.
-    function splat.globalSdfParams(instances)
+    function splat.globalSdfParams(instances, effects)
         local r = splat.createResources()
         return { { plyData = r.ply.buffer, ply = plyLayout(r.ply), splatCount = r.entries },
-                 blocks.lodData, instances or blocks.singleInstance, blocks.view }, r.entries
+                 blocks.lodData, instances or blocks.singleInstance, blocks.view, effects or blocks.noEffects }, r.entries
     end
 
     -- Why the file couldn't be loaded, if it couldn't: rhi.load_ply shows a blue checkered
@@ -881,8 +908,9 @@ return function(setTitle, file)
 
     function splat.on_mouse_move(x, y)
         if not drag then return end
-        camera.yaw = camera.yaw - (x - drag[1]) * 0.006
-        camera.pitch = math.max(-1.5, math.min(1.5, camera.pitch + (y - drag[2]) * 0.006))
+        local dx, dy = settings.mouseLook(x - drag[1], y - drag[2]) -- the controls' sensitivity
+        camera.yaw = camera.yaw - dx * 0.006
+        camera.pitch = math.max(-1.5, math.min(1.5, camera.pitch + dy * 0.006))
         drag = { x, y }
         updateView()
     end

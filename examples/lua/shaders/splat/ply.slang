@@ -37,19 +37,23 @@ uniform SplatModel model; // where all the instances go
 uniform float splatScale; // multiplies every splat's size; 1 is as trained
 
 // Instances: copies of all the splats, each placed by its own SplatModel and then by
-// `model`. Two float4s per instance: position and yaw, then scale and three unused.
+// `model`. Two float4s per instance: position and yaw, then scale, dynamic (1: the
+// effects move and color it, effect-field.slang; 0: static, as captured) and two unused.
 StructuredBuffer<float4> instances;
 uniform uint instanceCount;
 
 // The placement the functions below use: set per thread, by beginInstance (or
 // beginFileFrame), before any of them.
 static SplatModel placement;
+static bool placementDynamic; // and whether the effects apply to it
 
 // Places the splats as instance `instance`, then `model`: the two placements composed.
 void beginInstance(uint instance)
 {
     float4 positionYaw = instances[2 * instance];
-    float scale = instances[2 * instance + 1].x;
+    float2 scaleDynamic = instances[2 * instance + 1].xy;
+    float scale = scaleDynamic.x;
+    placementDynamic = scaleDynamic.y != 0;
     float yawCos = cos(model.yaw), yawSin = sin(model.yaw);
     float3x3 modelYaw = float3x3(yawCos, 0, yawSin, 0, 1, 0, -yawSin, 0, yawCos);
     placement.position = mul(modelYaw, positionYaw.xyz * model.scale) + model.position;
@@ -63,6 +67,7 @@ void beginFileFrame()
     placement.position = float3(0, 0, 0);
     placement.yaw = 0;
     placement.scale = 1;
+    placementDynamic = false;
 }
 
 float3 loadFloat3(uint index)

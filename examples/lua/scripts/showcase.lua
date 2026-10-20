@@ -19,7 +19,6 @@
 
 config = {
     title = "Showcase",
-    device = "vulkan",              -- the graphics API; `--api d3d12` etc. overrides it
     features = { "rasterization" }, -- the meshes and the splats rasterize
 }
 

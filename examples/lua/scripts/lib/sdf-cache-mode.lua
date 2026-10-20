@@ -26,6 +26,7 @@
 --   Mouse drag orbit the camera     Mouse wheel   zoom
 
 local sdf = rhi.include("lib/sdf.lua")
+local settings = rhi.include("lib/settings.lua") -- the controls (look sensitivity)
 
 local COMPLEXITIES = { 4, 8, 16, 32, 64, 128 }
 local RESOLUTIONS = { 32, 64, 128, 256 }
@@ -289,8 +290,9 @@ return function(setTitle)
 
     function mode.on_mouse_move(x, y)
         if not drag then return end
-        camera.yaw = camera.yaw - (x - drag[1]) * 0.006
-        camera.pitch = math.max(-0.2, math.min(1.4, camera.pitch + (y - drag[2]) * 0.006))
+        local dx, dy = settings.mouseLook(x - drag[1], y - drag[2]) -- the controls' sensitivity
+        camera.yaw = camera.yaw - dx * 0.006
+        camera.pitch = math.max(-0.2, math.min(1.4, camera.pitch + dy * 0.006))
         drag = { x, y }
         blocks.view.camera = cameraParams()
     end

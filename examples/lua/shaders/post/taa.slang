@@ -4,9 +4,10 @@
 // footprints move.
 //
 //   taaMain      the pixel's surface is found where it was the frame before (moved back by
-//                its own motion: the bodies' motion vectors, scene/motion.slang, or the SDF
-//                composition's spin; the splats stand still) and where the last frame's
-//                camera saw it there; that frame's image there, filtered (Catmull-Rom, so
+//                its own motion: the bodies' motion vectors, scene/motion.slang, the SDF
+//                composition's spin, or the splats' -- what the effects move, blended as
+//                their depth is, splat/render.slang; the rest stand still) and where the
+//                last frame's camera saw it there; that frame's image there, filtered (Catmull-Rom, so
 //                the history doesn't blur), is taken -- if its depth agrees -- clipped to
 //                the current 3 x 3 neighborhood's color box (in YCoCg; a history outside it
 //                is out of date) and blended with the new frame, kTaaCurrent of it.
@@ -21,6 +22,7 @@ static const float kTaaCurrent = 0.1;
 
 Texture2D<float4> taaCurrent; // the view's final image, linear
 Texture2D<float4> meshMotion; // previous world position minus current, where a body is nearest
+Texture2D<float4> splatMotion; // the splats': the same times their alpha, and their alpha (blended)
 uniform EffectsCamera prevCamera;
 uniform uint historyValid;
 uniform float3 sdfOrigin;
@@ -114,6 +116,13 @@ float4 resolve(uint2 tid, Texture2D<float4> history)
             float a = -sdfSpin * timeDelta, c = cos(a), s = sin(a);
             float3 d = world - sdfOrigin;
             previous = sdfOrigin + float3(c * d.x + s * d.z, d.y, -s * d.x + c * d.z);
+        }
+        else
+        {
+            // The splats (nearest, as neither is): the motion of what the pixel shows, their
+            // blended motion over their blended alpha.
+            float4 m = splatMotion.Load(t);
+            previous += m.a > 1e-3 ? m.xyz / m.a : float3(0, 0, 0);
         }
     }
     float3 before = worldToView(prevCamera, previous);

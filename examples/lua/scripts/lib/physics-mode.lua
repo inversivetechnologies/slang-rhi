@@ -24,6 +24,7 @@
 
 local meshes = rhi.include("lib/meshes.lua")
 local createPlayer = rhi.include("lib/player.lua")
+local settings = rhi.include("lib/settings.lua") -- the controls (look sensitivity)
 
 return function(setTitle)
     local mode = { name = "Physics" }
@@ -299,7 +300,8 @@ return function(setTitle)
 
     function mode.on_mouse_move(x, y)
         if not drag then return end
-        player.look((x - drag[1]) * 0.006, (y - drag[2]) * 0.006)
+        local dx, dy = settings.mouseLook(x - drag[1], y - drag[2]) -- the controls' sensitivity
+        player.look(dx * 0.006, dy * 0.006)
         drag = { x, y }
     end
 

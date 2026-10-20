@@ -23,6 +23,7 @@
 -- Keyboard and mouse: WASD move, mouse drag camera, Space jump, Shift dodge, F combo,
 -- G launcher, Q aim mode, E throw, C camera behind.
 
+local settings = rhi.include("lib/settings.lua") -- the controls (look sensitivity)
 local AXIS_DEADZONE = 0.16
 -- The Steam Controller's gyro is reported in [-1, 1] over its full range, taken to be
 -- +-2000 degrees per second (as for the Steam Deck). Which axis is which follows SDL's
@@ -490,8 +491,9 @@ return function(world, options)
             local ls, rs = controller.left_stick, controller.right_stick
             i.moveX, i.moveY = deadzone(ls[1], ls[2])
             local lx, ly = deadzone(rs[1], rs[2])
-            -- A response curve: fine near the center, fast at the edge.
-            i.lookX, i.lookY = lx * math.abs(lx) ^ 0.6, ly * math.abs(ly) ^ 0.6
+            -- A response curve: fine near the center, fast at the edge; then the controls'
+            -- sensitivity (lib/settings.lua).
+            i.lookX, i.lookY = settings.stickLook(lx * math.abs(lx) ^ 0.6, ly * math.abs(ly) ^ 0.6)
             i.jumpHeld = controller:button(buttons.A)
             -- The triggers, as buttons with some hysteresis.
             local lt, rt = controller.left_trigger, controller.right_trigger
@@ -505,7 +507,7 @@ return function(world, options)
             local pad = controller.right_pad
             if controller:button(buttons.RightPadTouch) then
                 if camera.padLast then
-                    i.padX, i.padY = pad[1] - camera.padLast[1], pad[2] - camera.padLast[2]
+                    i.padX, i.padY = settings.stickLook(pad[1] - camera.padLast[1], pad[2] - camera.padLast[2])
                 end
                 camera.padLast = { pad[1], pad[2] }
             else

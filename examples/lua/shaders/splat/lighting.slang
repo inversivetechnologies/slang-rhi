@@ -39,6 +39,10 @@ uniform float shadowBias;         // how far any splat counts as nearer the ligh
 uniform float shadowBiasExtent;   // plus this much of its own extent (3 sigma, largest axis)
 uniform float shadowBiasTexels;   // plus this many shadow map texels
 uniform uint showVisibility;      // 1: show the light reaching each splat, not its color
+// The splats the effects moved (preprocess.slang): each drawn splat's offset from its own
+// place, at [2 slot].
+StructuredBuffer<float4> splatOffsets;
+uniform uint splatEffectsOn;      // 0: none moved (splatOffsets isn't read)
 
 // Each splat's shadow visibility, kept from frame to frame (per splat and instance), and
 // blended with the new one: the splats' shadow maps are drawn anew every frame, and the
@@ -101,7 +105,7 @@ void lightSplatsMain(uint3 tid: SV_DispatchThreadID)
     uint i = drawn.x;
     beginInstance(drawn.y);
     uint base = splatBase(i);
-    float3 world = splatWorldPosition(base);
+    float3 world = splatWorldPosition(base) + (splatEffectsOn != 0 ? splatOffsets[2 * slot].xyz : float3(0, 0, 0));
     float3 lightPos = lightPosition();
     float3 fromLight = world - lightPos;
     float3 scale = splatWorldScale(base);

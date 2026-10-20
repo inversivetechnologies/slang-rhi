@@ -76,24 +76,23 @@ example-lua                        # the showcase, on Vulkan
 example-lua scene                  # scripts/scene.lua
 example-lua showcase               # scripts/showcase.lua
 example-lua path/to/my.lua         # any script
-example-lua --api d3d12 scene      # pick the graphics API
-example-lua --help                 # usage, APIs and the list of examples
+example-lua --help                 # usage and the list of examples
 ```
 
 A name is looked up as `scripts/<name>.lua`.
 In Visual Studio, `example-lua` is the startup project and runs the showcase.
 
-### Graphics API
+### Graphics API and GPU
 
-The API is the first of:
+The engine runs on **Vulkan only**, for now (`--api` takes only `vulkan`; `config.device`
+isn't read). The GPU is the one picked in the [pause menu](#the-pause-menu) (Display:
+Graphics device), saved in the settings file, else Vulkan's default. A saved GPU that isn't
+there, or can't start, falls back to the default. If Vulkan is unavailable, or lacks a
+feature the script requires, the program says so and exits.
 
-1. **`--api <name>`** on the command line.
-2. **`config.device`** in the script.
-3. **`vulkan`**.
-
-Names are case-insensitive: `d3d11`, `d3d12`, `vulkan`, `metal`, `cpu`, `cuda`, `wgpu`. If
-the chosen API is unavailable, or lacks a feature the script requires, the program says so
-and exits. It doesn't fall back to another API.
+(The shaders and the host still carry the D3D11 and D3D12 paths -- fxc's workarounds, the
+UAV limit -- from when the engine ran on them; the measurements below say which API they
+were taken on.)
 
 ### The showcase
 
@@ -118,30 +117,37 @@ and 2D SDFs.
 #### The pause menu
 
 Escape (or the Steam Controller's Menu button) pauses the showcase, the scene viewer or any
-of the standalone scripts, and opens a menu over it: **Resume**, **Settings** and **Quit**. While it is open the scene
+of the standalone scripts, and opens a menu over it: **Resume**, **Settings** and **Quit**.
+Settings opens a list of pages -- **Display**, **Graphics** and **Controls** -- each with its
+own settings. While it is open the scene
 waits: its behaviors and cameras don't update, its physics doesn't step, its sounds pause,
 and the shaders' `time` stops, so everything animated by it holds still too.
 
-| Setting | Choices | |
-| --- | --- | --- |
-| Resolution | the monitor's video modes from 800 x 600 | the window's size; with fullscreen, the monitor's video mode |
-| Fullscreen | Off, On | fullscreen on the primary monitor, at the resolution |
-| Max splats | 250,000 .. 6,000,000 | the splats' budget (1,500,000 by default): the levels of detail fit what is drawn to it (a scene's own `splatBudget`, if lower, still holds). The per-splat buffers and the sort are sized for it, a power of two of at least 2^21 (about 0.5 GB at 6M); a budget past them reloads the script or the scene |
-| Shadow quality | Low (256), Medium (512), High (1024), Ultra (2048) | the shadow maps' texels per cube face; the scene (or script) is loaded again with them |
-| Ambient occlusion | GTAO, Off, SSAO | [GTAO or SSAO](#ambient-occlusion-and-indirect-light): darker where surfaces are close to others; GTAO by default. With radiance cascades, the AO is theirs (any setting but Off) |
-| Global illumination | Radiance cascades, Off, SSGI | light bounced from the surfaces around: [radiance cascades](#radiance-cascades-gi) (the default: no screen-space history) or [SSGI](#ambient-occlusion-and-indirect-light) |
-| Effects quality | Half, Mixed, Full | the resolution the AO and GI are computed at: both at half (the default); AO at full and GI at half; both at full. For radiance cascades, the probe spacing: 8 pixels at Half, 4 otherwise |
-| Temporal AA | On, Off | the main view's image stabilized over frames ([splat stability](#splat-stability)) |
+| Page | Setting | Choices | |
+| --- | --- | --- | --- |
+| Display | Graphics device | the GPUs Vulkan has (`rhi.devices()`: hardware only, no software renderers) | the GPU to run on. Left / Right picks one, Enter restarts the script on it (a new device, window and Lua state: `rhi.restart`). It is kept only once it has started, so a GPU that crashes on its way up (a driver's) leaves the next start on the one before |
+| Display | Resolution | the monitor's video modes from 800 x 600 | the window's size; with fullscreen, the monitor's video mode |
+| Display | Fullscreen | Off, On | fullscreen on the primary monitor, at the resolution |
+| Graphics | Max splats | 250,000 .. 6,000,000 | the splats' budget (1,500,000 by default): the levels of detail fit what is drawn to it (a scene's own `splatBudget`, if lower, still holds). The per-splat buffers and the sort are sized for it, a power of two of at least 2^21 (about 0.5 GB at 6M); a budget past them reloads the script or the scene |
+| Graphics | Shadow quality | Low (256), Medium (512), High (1024), Ultra (2048) | the shadow maps' texels per cube face; the scene (or script) is loaded again with them |
+| Graphics | Ambient occlusion | GTAO, Off, SSAO | [GTAO or SSAO](#ambient-occlusion-and-indirect-light): darker where surfaces are close to others; GTAO by default. With radiance cascades, the AO is theirs (any setting but Off) |
+| Graphics | Global illumination | Radiance cascades, Off, SSGI | light bounced from the surfaces around: [radiance cascades](#radiance-cascades-gi) (the default: no screen-space history) or [SSGI](#ambient-occlusion-and-indirect-light) |
+| Graphics | Effects quality | Half, Mixed, Full | the resolution the AO and GI are computed at: both at half (the default); AO at full and GI at half; both at full. For radiance cascades, the probe spacing: 8 pixels at Half, 4 otherwise |
+| Graphics | Anti-aliasing | TAA, Off, FXAA, SMAA | the main view's: TAA (temporal, the default: `post/taa.slang`) stabilizes it over frames, against the splats' shimmer ([splat stability](#splat-stability)), each pixel taken from where its surface was the frame before -- the bodies' motion vectors, the SDFs' spin, the splats' [effects](#effects); FXAA (spatial: `post/fxaa.slang`, after FXAA 3.11) smooths its edges within the frame, with no history to lag (0.09 ms at 1600 x 900), but nothing stabilized; SMAA (spatial too: `post/smaa.slang`, SMAA 1x's three passes -- luma edges with local contrast adaptation, each edge followed to its ends and blended by the area of the silhouette its pattern stands for, the areas computed rather than read from the reference's area texture, no diagonal patterns) changes only what is on an edge, so it stays sharper than FXAA (0.21 ms). Files with the old `temporalAA` are read as TAA or Off |
+| Controls | Mouse sensitivity | 0.25x .. 3x | times the mouse's turn of every camera (the orbit cameras, the player's) |
+| Controls | Controller look sensitivity | 0.25x .. 3x | times the controller's: the right stick and the right pad |
+| Controls | Invert Y | Off, On | moving up looks down, for the mouse and the controller |
 
-Each script shows the settings it has:
+Each script shows the settings it has (a page with none of them is left out):
 
 | Script | Settings |
 | --- | --- |
-| `showcase.lua`, `scenes.lua` | all eight |
-| `fusion.lua` | resolution, fullscreen, max splats, shadow quality |
-| `physics.lua`, `scene.lua` | resolution, fullscreen, shadow quality |
-| `splat.lua` | resolution, fullscreen, max splats |
-| `sdf-cache.lua`, `shader-toy.lua`, `surface.lua` | resolution, fullscreen |
+| `showcase.lua`, `scenes.lua` | all of them |
+| `fusion.lua` | resolution, fullscreen, max splats, shadow quality, the controls |
+| `physics.lua`, `scene.lua` | resolution, fullscreen, shadow quality, the controls |
+| `splat.lua` | resolution, fullscreen, max splats, the controls |
+| `sdf-cache.lua` | resolution, fullscreen, the controls |
+| `shader-toy.lua`, `surface.lua` | resolution, fullscreen (no camera: `controls = false`) |
 
 | Input | Action |
 | --- | --- |
@@ -156,11 +162,15 @@ Each script shows the settings it has:
   reload) starts with it. Delete the file to go back to the defaults.
 - **Files:** `scripts/lib/pause-menu.lua` (the menu), `scripts/lib/settings.lua` (the
   settings, their file and choices), `scripts/lib/ui.lua` and `shaders/ui/` (drawing).
+- **The controls in a camera of your own:** `settings.mouseLook(dx, dy)` and
+  `settings.stickLook(dx, dy)` (`lib/settings.lua`) scale a turn by the sensitivity and
+  flip its y with Invert Y; they read what was last saved, so a change applies at once.
 - **In a script of your own:** one call at the end of the script, after its callbacks:
 
   ```lua
   rhi.include("lib/pause.lua").install {
       only = { "resolution", "fullscreen", "splatBudget" }, -- default: the first two
+      controls = false,                -- no camera: no Controls page (default: shown)
       onPause = function(paused) end,  -- e.g. pause its music
       apply = function(values) end,    -- after init, and when max splats changes
   }
@@ -218,7 +228,7 @@ Each scene stands for one of the examples; its keys come from behaviors in the s
 | Scene | Example | | Keys |
 | --- | --- | --- | --- |
 | `physics.scene` | `physics.lua` | the ramp, the dominoes, the pyramid, the tower, the player | the player's; B drop boxes; P pause, T slow motion, R reset |
-| `splats.scene` | `splat.lua` | a grid of skulls carved per pixel by moving shapes, with music | `,` `.` budget, `/` LOD tint, `[` `]` size, L lighting, C clip mode, M mute |
+| `splats.scene` | `splat.lua` | three skulls, with music: one clipped per pixel by a slab sweeping through it, one colored and one displaced by the [effects](#effects) | `,` `.` budget, `/` LOD tint, `[` `]` size, L lighting, C clip mode, M mute |
 | `many-lights.scene` | | 256 colored lamps over meshes, the skull's splats and the SDF sculpture, culled per screen tile | the splats' and the SDFs' |
 | `composite.scene` | `fusion.lua` | meshes, the skull's splats and an SDF sculpture merged by depth, three colored lamps circling them, a second camera in the corner | the splats' (as above, but C), J K blend |
 | `sdf-benchmark.scene` | `sdf-cache.lua` | a turning spiral of 64 shapes around a core, 129 nodes, cached | C DAG / cache / cache error, `[` `]` resolution, B benchmark, J K blend, Space stop the camera |
@@ -278,7 +288,7 @@ on):
 | Phase | What | Passes | Debug view |
 | --- | --- | --- | --- |
 | 1 | the G-buffer: normals (rebuilt from the merged depth: on each axis the neighbor nearer in depth) and view depth; the albedo of the nearest surface; a Hi-Z pyramid of the nearest depth, half to a 32nd resolution | `gbuffer.slang`; the meshes' albedo pass (`scene/albedo.slang`), the raymarcher's albedo, the splats' albedo luminance in their blended depth | normals, Hi-Z, albedo |
-| 2 | the global SDF: a 96^3 volume of 0.2 m voxels about the camera (snapped to 4 voxels), narrow-band (0.8 m), with albedo -- rebuilt every frame from the bodies (boxes, spheres: analytic) and the SDF composition, over a static part: the splats, as ellipsoids (2 standard deviations, opacity at least 0.2) from a cut through their levels of detail at about 0.12 m, their color as captured for albedo -- baked again only when the volume moves. A voxel is one uint, its distance (16 bits) above its albedo (5:6:5), so one atomic min keeps the nearest and its color | `global-sdf-bake.slang`, `global-sdf-splats.slang`, read with `global-sdf.slang` | global SDF: the volume sphere-traced and lit |
+| 2 | the global SDF: a 96^3 volume of 0.2 m voxels about the camera (snapped to 4 voxels), narrow-band (0.8 m), with albedo -- rebuilt every frame from the bodies (boxes, spheres: analytic) and the SDF composition, over a static part: the static splats, as ellipsoids (2 standard deviations, opacity at least 0.2) from a cut through their levels of detail at about 0.12 m, their color as captured for albedo -- baked again only when the volume moves. The dynamic splats (moved and colored by the [effects](#effects)) are baked every frame, from a coarser cut (0.25 m) listed once. A voxel is one uint, its distance (16 bits) above its albedo (5:6:5), so one atomic min keeps the nearest and its color | `global-sdf-bake.slang`, `global-sdf-splats.slang`, read with `global-sdf.slang` | global SDF: the volume sphere-traced and lit |
 | 3 | world-space probes (DDGI) as the far field: 16 x 8 x 16, 1 m apart, about the camera (storage by world cell, so a probe's data stays with its place); 96 rays a probe a frame through the global SDF, the hits lit by the key light (shadow maps), the point lights and the probes themselves (further bounces); octahedral irradiance, radiance and depth moments (Chebyshev visibility), blended in world space (hysteresis 0.95) | `ddgi-update.slang`, read with `ddgi.slang` | DDGI: the probes' irradiance at each pixel's surface |
 | 4 | screen-space radiance cascades for the near field: 4 cascades of probes on the G-buffer's surfaces (a probe every 8 pixels in cascade 0 at Half quality, 4 at Full, doubling each cascade; each probe's depth and normal the means over its cell), 4 x 4 hemispherical octahedral directions in cascade 0, doubling each cascade (every atlas the same size), intervals 0.12 m long in cascade 0, 4 x longer each cascade. Each interval marched on the screen, the Hi-Z pyramid skipping what the ray is in front of; a hit within 0.35 m behind the depth takes the lit image's color there; off the screen, or behind a surface by more, the global SDF takes over (its hits lit by the key light and the probes) | `rc.slang`: `probesMain`, `cascadeMain` | cascade 0 .. 3: their atlases, each probe's directions a tile |
 | 5 | merged coarse to fine: each direction continued by the 4 probes of the cascade above (bilinear), weighted by depth (plane distance) and normal and whether the direction is in that probe's hemisphere, its ray traced to *that* probe's interval start (the bilinear fix: no gaps or overlaps between probes' intervals); the last cascade continued by the probes' radiance (the far field) | `cascadeMain` | (the cascade views show them merged) |
@@ -491,8 +501,8 @@ window updates.
 1. **Load.** The host runs the script's top level. This is where `config` and the callback
    functions are defined. GPU resources can't be created yet (there is no device).
 2. **Device and window.** The host reads `config`, then creates the device, the window and
-   its surface. (To pick the API, the host first runs the script's top level once on its
-   own to read `config.device`, so keep the top level free of side effects.)
+   its surface. (To pick the GPU, the host first runs the script's top level once on its
+   own to read the saved settings, so keep the top level free of side effects.)
 3. **`init()`** is called once the device exists. Create pipelines and resources here.
 4. **Every frame**: input events are delivered (`on_key`, `on_mouse_move`, ...), then
    `update(time, dt)`. Then the [render graph](#render-graphs) runs, if the script set one,
@@ -508,13 +518,13 @@ nothing.
 ```lua
 config = {
     title = "My example",            -- window title; the API and GPU are appended
-    device = "vulkan",               -- graphics API (default); --api overrides it
     features = { "rasterization" },  -- required device features
     width = 640, height = 360,       -- initial window size
 }
 ```
 
-- **`device`**: the graphics API, see [Graphics API](#graphics-api).
+- **`device`**: not read: the engine runs on Vulkan only, for now (see [Graphics API and
+  GPU](#graphics-api-and-gpu)).
 - **`features`**: slang-rhi feature names as returned by `IRHI::getFeatureName` (e.g.
   `rasterization`, `ray-tracing`, `ray-query`). `surface` is always required. Anything that
   draws (`frame:clear`, `frame:draw`) needs `rasterization`, which the CUDA and CPU
@@ -557,6 +567,7 @@ local draw = rhi.render_pipeline {
     topology = "triangles",         -- triangles | triangle-strip | lines | line-strip | points
     depth = false,                  -- test and write the target's depth buffer
     format = nil,                   -- color target format; default: the window's
+    formats = nil,                  -- or several: { "rgba16f", "rgba16f" } (SV_Target0, 1, ...)
     blend = "none",                 -- none | alpha | premultiplied | additive | accumulate
 }
 ```
@@ -583,6 +594,9 @@ local draw = rhi.render_pipeline {
   for the window and one for each texture drawn into, each the size of its destination.
   A render graph pass can use a depth target of the script's own instead (see
   [Depth targets](#depth-targets)). Without `depth`, depth testing is off.
+- **`formats`**: more than one color target (multiple render targets): the fragment shader
+  returns a struct with `SV_Target0`, `SV_Target1`, ...; every target is blended as
+  `blend` says. Its passes give as many textures, in `targets`, of those formats.
 - **`format = "none"`**: no color output at all, for depth-only passes; implies
   `depth = true`. The fragment shader returns nothing (`void`), and may `discard`.
 - **Caching**: the host caches pipelines. Asking for the same one again returns the
@@ -652,6 +666,9 @@ pass's shader, to combine images by depth, or for any screen-space effect.
 | Call | |
 | --- | --- |
 | `rhi.device()` | the backend's name, e.g. `"Vulkan"` |
+| `rhi.adapter()` | the GPU's name, e.g. `"NVIDIA GeForce RTX 3050 Laptop GPU"` |
+| `rhi.devices()` | the GPUs the script could run on: `{ { adapter = name, type = "discrete" \| "integrated" \| "unknown" }, ... }`, Vulkan's hardware adapters, each once by name |
+| `rhi.restart{ adapter }` | closes the window and runs the script again on that GPU (adapter optional: the default); one that can't start falls back to the one before |
 | `rhi.time()` | seconds since start |
 | `rhi.set_title(text)` | sets the window title; the backend and GPU are appended |
 | `rhi.set_paused(paused)`, `rhi.paused()` | stops (or restarts) the shaders' `time` and the physics; `update` and input still run, with real time. A reload unpauses |
@@ -882,13 +899,15 @@ end
 | Call | |
 | --- | --- |
 | `rhi.graph()` | a new, empty graph |
-| `graph:render_pass{ name, target, depth_target, color, clear, viewport \| viewport_fraction }` | adds a render pass, run in the order added |
+| `graph:render_pass{ name, target \| targets, depth_target, color, clear, viewport \| viewport_fraction }` | adds a render pass, run in the order added |
 | `pass:draw{ pipeline, count, vertices, params, instances }` | adds a draw to a render pass, run in the order added; `instances` is a number, or a body group (as many as it has bodies, frame by frame) |
 | `graph:dispatch{ name, pipeline, params, threads = {x, y, z} \| "window" \| texture, once, timed }` | adds a compute dispatch; `"window"` runs one thread per window pixel, a texture one per texel, both following resizes |
 | `rhi.set_graph(graph)` | makes the host run `graph` every frame, before `draw`; `nil` stops it |
 
 - **`render_pass` options:**
   - `target`: a texture to draw into. Leave it out to draw into the window.
+  - `targets`: several textures, for pipelines with as many `formats` (multiple render
+    targets): the first as `target`, the rest the same size. `clear` clears them all.
   - `depth_target`: a [depth target](#depth-targets) to use as the pass's depth buffer,
     instead of the host's buffer for the target. The pass then leaves its depth there for
     later passes to read.
@@ -1222,7 +1241,8 @@ rotation, scale, opacity, and degree-3 spherical harmonics for view-dependent co
 | `splat-lod.h/.cpp` | the host: builds the levels of detail when the file is loaded |
 | `shaders/splat/lod.slang` | compute: picks the cut through the levels of detail that fits the splat budget |
 | `shaders/splat/clip.slang` | clipping the splats per pixel by a signed distance field, the splats' `clip()` |
-| `shaders/splat/preprocess.slang` | compute: projects each splat in the cut, evaluates its color, packs the drawn ones |
+| `shaders/splat/preprocess.slang` | compute: projects each splat in the cut (moved and colored by the effects, if dynamic), evaluates its color, packs the drawn ones |
+| `shaders/splat/effect-field.slang` | the [effects](#effects): moving spheres that move and color the dynamic splats, in view, in the levels of detail, the shadows and the global SDF |
 | `shaders/sort/bitonic.slang` | compute: sorts the keys |
 | `shaders/splat/render.slang` | draws the sorted splats as blended quads |
 | `shaders/post/composite.slang` | puts the result on the window |
@@ -1320,7 +1340,7 @@ The measurements, over the splats (mean, the share above 4/255), from first to l
 | camera dollying 1 cm a frame | 1.457, 10.4% | 0.558, 2.66% |
 
 The dolly is what is left: splats changing size on screen. Temporal AA is the
-`Temporal AA` setting (on); the Mip filter is `splat.setMipFilter(0..1)`.
+`Anti-aliasing` setting's TAA (the default); the Mip filter is `splat.setMipFilter(0..1)`.
 
 ### Levels of detail
 
@@ -1411,7 +1431,7 @@ The frame time is GPU-bound. The usual next steps, not done here:
 
 ### Clipping
 
-`splat.lua` (and the showcase's `splats.scene`) cuts the skulls with a signed distance field, per pixel: the splats' equivalent of
+`splat.lua` (and the showcase's `splats.scene`, its first skull) cuts the skulls with a signed distance field, per pixel: the splats' equivalent of
 `clip()` in a fragment shader (`shaders/splat/clip.slang`). C carves the field's shapes out
 of the splats, keeps only what is inside them, or turns it off.
 
@@ -1470,6 +1490,55 @@ carving 16.8 ms, keeping inside 18.4 ms. The depth composite, without a field: 3
 shell: the inside of the far wall, and whatever the training left inside. Splats long
 along the ray are clipped by their densest point only, which is the same approximation a
 hard `clip()` makes on any volume.
+
+### Effects
+
+Moving spheres that move or color splats (`shaders/splat/effect-field.slang`). In a scene
+they are the `splat` component's `effects` (`splats.scene` has the second and third
+skulls'); in Lua, `splat.effectsBlock(shapes)` passed to `addPasses` (and
+`addShadowPasses`) as `effects`.
+
+- **The effects:** spheres, four `float4`s each (`effectShapes`): center and kind, color
+  and radius, movement and its speed, a circle about y with its speed, and the strength.
+  Like the clip shapes they move by `time` in the shader, so the Lua does nothing per frame.
+  - **color:** the splats inside take its color, by its strength, fading out over the
+    sphere's outer fifth. The lighting comes after, so the tint is lit as the splats' own
+    color.
+  - **displace:** the splats inside are pushed away from its center, by up to its strength
+    at the center, smoothly less out to the radius.
+- **Static and dynamic splats:** the effects apply only to dynamic instances (a flag per
+  instance, `ply.slang`'s `placementDynamic`; in a scene, the `splat` component's
+  `dynamic`, by default whether the entity has effects). Static splats stay as captured
+  wherever an effect reaches, so what is made of them can be kept: the global SDF bakes
+  them only when its volume moves.
+- **The field is shared,** so a dynamic splat is moved and colored the same everywhere:
+  - **in view:** the preprocess (`preprocess.slang`) moves and colors it before it culls
+    and projects it, so a splat pushed into the view is drawn, and its ellipse, depth and
+    sort key are those of where it went. The lighting takes its offset (`splatOffsets`, per
+    drawn splat), so it is lit and shadowed where it is.
+  - **in the levels of detail:** a node isn't counted as off screen (64 times smaller) if
+    the effects can move its splats into view: the frustum test is widened by the
+    strengths of the displacements that reach it (`effectReach`).
+  - **in the shadows it casts:** the shadow passes move its caster by the field, so its
+    shadow follows it (clipped where it went, too).
+  - **in the GI's global SDF:** the dynamic splats are baked every frame, displaced and
+    colored, after the bodies. Their cut through the levels of detail is listed once (it
+    depends only on the instances' scale) and coarser than the static splats' (0.25 m
+    against 0.12 m), so the bake is a few thousand Gaussians: the global SDF takes 0.67 ms
+    with `splats.scene`'s two dynamic skulls (RTX 3050 Laptop GPU, D3D12), against 6.6 ms
+    for the same bake over every splat and instance.
+  - **in the clipping:** the preprocess classifies it where it went; the per-pixel clip
+    (`render.slang`) reads its offset for its slot, so it clips along each ray at the
+    moved Gaussian; the levels of detail classify a node widened by the reach, as for the
+    view; the shadows clip the moved caster.
+  - **in the TAA's motion:** the preprocess also writes where the field had it the frame
+    before (the displacement at `time - timeDelta`, from where it is now); the blended
+    depth pass blends that into a second target as it blends the depth (motion times
+    alpha, and alpha), and TAA takes the ratio as the motion of what a pixel shows where
+    a splat is nearest -- as it takes the bodies' motion vectors. Measured with a fast
+    displacement (the third skull's, 0.8 m at 3 radians a second), time frozen at four
+    points and TAA left to settle: what lagged at the freeze, mean 0.35 against 0.58
+    without the motion, 0.58% of pixels off by more than 8/255 against 1.09%.
 
 ## The scene system
 
@@ -1554,7 +1623,7 @@ missing required field stops the load, with the entity and the field in the mess
 | `light` | `color`, `intensity` (9), `range` (14), `orbitRadius` (0), `speed` (0, radians per second), `phase`, `bob` | a point light, orbiting the entity's position: the scene's first is its key light, shadowing everything; up to 1024 more are [point lights without shadows](#more-lights), culled per screen tile,, and move a visual mesh of their entity along with them |
 | `mesh` | `shape` ("box" or "sphere"), `size` (a box's, whole: [1, 1, 1]), `radius` (0.5), `color`, `pattern` (0 plain, 1 stripes, 2 checker on the floor, 3 checker on every face, 4 emissive: its color, unlit) | instanced, lit and shadowed boxes and spheres |
 | `body` | `motion` ("dynamic", "static", "kinematic"), `density` (1000), `friction` (0.5), `restitution` (0), `velocity`, `angularVelocity` | a Jolt body for the mesh; without it, the mesh is visual (placed by Lua) |
-| `splat` | `file` (required), `fit` (a radius to scale to; 0: as is), `grid` ([nx, nz] copies), `spacing`, `turn` (degrees per copy), `clip` (`mode` "carve" or "keep", `shapes`: spheres and boxes with `position`, `move`, `speed`, `spin`) | Gaussian splats with LOD, lighting, shadows, clipping; one renderer per file, entities as its instances |
+| `splat` | `file` (required), `fit` (a radius to scale to; 0: as is), `grid` ([nx, nz] copies), `spacing`, `turn` (degrees per copy), `clip` (`mode` "carve" or "keep", `shapes`: spheres and boxes with `position`, `move`, `speed`, `spin`), `effects` (a list: `color` [r, g, b] with `strength`, or `displace` (a distance); `sphere` (radius), `position`, `move`, `speed`, `orbit`, `orbitSpeed`), `dynamic` (whether the effects apply to it; default: whether it has effects) | Gaussian splats with LOD, lighting, shadows, clipping, effects; one renderer per file, entities as its instances (the first entity's clip holds for all; all their effects are one list; both placed in the world) |
 | `sdf` | `shape` (required: a node, below), `cache` (0: the DAG; or voxels a side), `sharpness` (8, of soft shadows), `blend` (0: how smoothly the entities' shapes join one another) | all entities' shapes as one composition, raymarched (timed on the GPU), shadowing everything; cached if any asks |
 | `camera` | `fov` (50), `controller` ("orbit", "fixed", "player"), `target`, `distance`, `yaw`, `pitch` (degrees), `turn` (degrees per second: an orbit that turns by itself), `inset` (0: the main view; else a square of that fraction of the window's height), `corner` | the views |
 | `sound` | `file` (required), `loop` (true), `volume` (1), `autoplay` (true) | played while the scene shows |

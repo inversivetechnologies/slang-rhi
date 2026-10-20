@@ -17,7 +17,8 @@
 //
 // Clipping (clip.slang): a splat across the clip field's surface is clipped per pixel --
 // its vertices hand the fragments which splat it is, and each fragment finds where the
-// splat is densest along its own ray, and clips there.
+// splat is densest along its own ray, and clips there -- where the effects moved it, if
+// they did (effect-field.slang: the offset preprocess.slang wrote for its slot).
 
 #include "splat-common.slang"
 #include "ply.slang"
@@ -28,6 +29,10 @@ StructuredBuffer<float> sortKeys;
 StructuredBuffer<uint> sortValues;
 StructuredBuffer<uint2> drawnSplats; // per drawn splat: which splat and instance it is
 StructuredBuffer<uint> drawCount; // [0]: how many splats are drawn; the rest of the slots aren't
+// Per drawn splat (preprocess.slang): [2 slot] how far the effects moved it, [2 slot + 1]
+// where it was the frame before, from where it is.
+StructuredBuffer<float4> splatOffsets;
+uniform uint splatEffectsOn; // 0: none moved (splatOffsets isn't read)
 uniform float2 viewportSize; // provided by the host
 uniform SplatCamera camera;
 
@@ -59,11 +64,13 @@ bool clippedAway(VertexOutput input)
     {
         return false;
     }
-    uint2 drawn = drawnSplats[input.clipSlot - 1];
+    uint slot = input.clipSlot - 1;
+    uint2 drawn = drawnSplats[slot];
     beginInstance(drawn.y);
     uint base = splatBase(drawn.x);
+    float3 center = splatWorldPosition(base) + (splatEffectsOn != 0 ? splatOffsets[2 * slot].xyz : float3(0, 0, 0));
     float3 ray = pixelRay(input.position.xy);
-    return clipAtRay(camera.eye, ray, splatWorldPosition(base), splatWorldCovariance(base)) < 0;
+    return clipAtRay(camera.eye, ray, center, splatWorldCovariance(base)) < 0;
 }
 
 static const float2 kCorners[6] = {
@@ -114,7 +121,8 @@ VertexOutput vertexMain(uint vertexId: SV_VertexID)
     return splatVertex(vertexId);
 }
 
-// The blended depth pass's: the same, with the splat's albedo luminance (from axis2.w).
+// The blended depth pass's: the same, with the splat's albedo luminance (from axis2.w),
+// and its motion (the effects': splatOffsets) for the second target.
 struct BlendVertexOutput
 {
     float4 position : SV_Position;
@@ -122,6 +130,16 @@ struct BlendVertexOutput
     nointerpolation float4 color : COLOR;
     nointerpolation uint clipSlot : CLIP;
     nointerpolation float albedoLuminance : ALBEDO;
+    nointerpolation float3 motion : MOTION;
+};
+
+// Its two targets: the blended depth, and the blended motion -- rgb where what the pixel
+// shows was the frame before, from where it is (world units, as the meshes' motion), times
+// alpha, a alpha -- blended alike, so that their ratio is the motion of what is seen.
+struct BlendOutput
+{
+    float4 depth : SV_Target0;
+    float4 motion : SV_Target1;
 };
 
 [shader("vertex")]
@@ -134,17 +152,21 @@ BlendVertexOutput depthBlendVertexMain(uint vertexId: SV_VertexID)
     output.color = v.color;
     output.clipSlot = v.clipSlot;
     output.albedoLuminance = 0;
+    output.motion = float3(0, 0, 0);
     uint slot = vertexId / 6;
     if (slot < drawCount[0])
     {
-        float w = projected[sortValues[slot]].axis2.w;
+        uint drawn = sortValues[slot];
+        float w = projected[drawn].axis2.w;
         output.albedoLuminance = (w - floor(w)) / 0.49;
+        if (splatEffectsOn != 0)
+            output.motion = splatOffsets[2 * drawn + 1].xyz;
     }
     return output;
 }
 
 [shader("fragment")]
-float4 depthBlendFragmentMain(BlendVertexOutput input) : SV_Target
+BlendOutput depthBlendFragmentMain(BlendVertexOutput input)
 {
     VertexOutput v;
     v.position = input.position;
@@ -158,7 +180,10 @@ float4 depthBlendFragmentMain(BlendVertexOutput input) : SV_Target
     }
     // The splat's center's view depth: the quad's z/w (the same at every vertex), undone.
     float viewZ = kDepthNear * kDepthFar / (kDepthFar - input.position.z * (kDepthFar - kDepthNear));
-    return float4(viewZ * alpha, input.albedoLuminance * alpha, 0, alpha);
+    BlendOutput output;
+    output.depth = float4(viewZ * alpha, input.albedoLuminance * alpha, 0, alpha);
+    output.motion = float4(input.motion * alpha, alpha);
+    return output;
 }
 
 // How opaque a splat has to be at a pixel to count as a surface in the depth buffer.

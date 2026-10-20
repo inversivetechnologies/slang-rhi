@@ -45,33 +45,36 @@ static Result queryCalibratedTimestampSupport(
     outSupport = {};
 
     const char* calibratedTimestampExtension = nullptr;
+    bool khr = false;
     if (extensionNames.count(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME))
     {
         calibratedTimestampExtension = VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
+        khr = true;
     }
     else if (extensionNames.count(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME))
     {
         calibratedTimestampExtension = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
     }
 
-    if (!calibratedTimestampExtension || !api.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR)
+    // The entry point of the extension this device has: an instance-level function is the
+    // loader's for every device, and calling the KHR one on a device whose driver only has
+    // the EXT extension fails in the loader (and crashes some drivers).
+    PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR getTimeDomains =
+        khr ? api.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR : api.vkGetPhysicalDeviceCalibrateableTimeDomainsEXT;
+    if (!calibratedTimestampExtension || !getTimeDomains)
     {
         return SLANG_OK;
     }
 
     uint32_t timeDomainCount = 0;
-    SLANG_VK_RETURN_ON_FAIL(
-        api.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(api.m_physicalDevice, &timeDomainCount, nullptr)
-    );
+    SLANG_VK_RETURN_ON_FAIL(getTimeDomains(api.m_physicalDevice, &timeDomainCount, nullptr));
     if (timeDomainCount == 0)
     {
         return SLANG_OK;
     }
 
     std::vector<VkTimeDomainKHR> timeDomains(timeDomainCount);
-    SLANG_VK_RETURN_ON_FAIL(
-        api.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(api.m_physicalDevice, &timeDomainCount, timeDomains.data())
-    );
+    SLANG_VK_RETURN_ON_FAIL(getTimeDomains(api.m_physicalDevice, &timeDomainCount, timeDomains.data()));
 
     const auto hasTimeDomain = [&](VkTimeDomainKHR domain)
     {

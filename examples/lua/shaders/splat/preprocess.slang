@@ -27,6 +27,12 @@ RWStructuredBuffer<uint2> drawnSplats; // which splat and instance it is
 RWStructuredBuffer<float> sortKeys;    // sorted, with sortValues: the slots
 RWStructuredBuffer<uint> sortValues;
 RWStructuredBuffer<uint> drawCount; // [0]: splats drawn this frame (packed at the front)
+// Two float4s per drawn splat: [2 slot] xyz how far the effects moved it (effect-field.slang),
+// for the lighting and the clipping; [2 slot + 1] xyz where it was the frame before, from
+// where it is (the effects moved it since), for the TAA's motion (render.slang's blended
+// depth pass). One buffer: D3D11 has 8 UAVs.
+RWStructuredBuffer<float4> splatOffsets;
+uniform uint splatEffectsOn; // 0: no effects (splatOffsets isn't written)
 
 StructuredBuffer<uint> lodLevel; // per splat: 0 for the file's, the height above them for merged ones
 uniform uint lodShowLevels;      // 1: tint the splats by level
@@ -152,6 +158,15 @@ void preprocessMain(uint3 tid: SV_DispatchThreadID)
     float3 flip = splatFlip();
     float3x3 yaw = splatYaw();
     float3 world = splatWorldPosition(base);
+    // A dynamic instance's splat where the effects move it (effect-field.slang), before
+    // anything is culled or projected: what they push into view is drawn.
+    float3 offset = float3(0, 0, 0), motion = float3(0, 0, 0);
+    if (placementDynamic)
+    {
+        offset = effectDisplacement(world);
+        motion = effectDisplacementAt(world, time - timeDelta) - offset;
+    }
+    world += offset;
 
     // Clipping (clip.slang): cut away wholly, or flagged for render.slang to clip per pixel.
     float3 worldScale = splatWorldScale(base);
@@ -213,6 +228,10 @@ void preprocessMain(uint3 tid: SV_DispatchThreadID)
     // The color as seen from the camera; the harmonics are in the splat's own frame.
     float3 dir = mul(transpose(yaw), normalize(world - camera.eye)) * flip;
     float3 color = evaluateColor(base, dir);
+    if (placementDynamic)
+    {
+        color = effectColor(world - offset, color);
+    }
     if (lodShowLevels != 0)
     {
         color = lerp(color, levelColor(lodEnabled != 0 ? lodLevel[i] : 0), 0.7);
@@ -240,5 +259,11 @@ void preprocessMain(uint3 tid: SV_DispatchThreadID)
         // as the view turns (as StopThePop, Radl et al. 2024, notes of view-depth sorting).
         sortKeys[slot] = -length(t);
         sortValues[slot] = slot;
+        [branch]
+        if (splatEffectsOn != 0)
+        {
+            splatOffsets[2 * slot] = float4(offset, 0);
+            splatOffsets[2 * slot + 1] = float4(motion, 0);
+        }
     }
 }

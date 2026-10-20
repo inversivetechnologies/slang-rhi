@@ -14,4 +14,4 @@ function draw(frame)
 end
 
 -- Escape: the pause menu (lib/pause.lua): resume, settings, quit.
-rhi.include("lib/pause.lua").install()
+rhi.include("lib/pause.lua").install { controls = false } -- no camera to turn

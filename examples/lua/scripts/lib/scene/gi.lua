@@ -28,6 +28,9 @@ gi.GSDF_VOXEL = 0.2
 gi.GSDF_BAND = 0.8
 -- The splats in it: their levels of detail cut at bounds of about this radius.
 gi.GSDF_SPLAT_SIZE = 0.12
+-- The dynamic splats (baked every frame) cut coarser: about a quarter as many Gaussians.
+gi.GSDF_DYNAMIC_SPLAT_SIZE = 0.25
+gi.GSDF_CUT_CAPACITY = 1 << 18 -- the most dynamic splats in the cut (per file)
 
 -- The probes: how many each way, how far apart, what a frame's rays keep of the last
 -- (world space: a probe's own history), and the rays a probe traces a frame.
@@ -60,7 +63,10 @@ local function makePipelines()
         gsdfBodies = rhi.compute_pipeline("gi/global-sdf-bake.slang", "bodiesMain"),
         gsdfComposition = rhi.compute_pipeline("gi/global-sdf-bake.slang", "compositionMain"),
         gsdfResolve = rhi.compute_pipeline("gi/global-sdf-bake.slang", "resolveMain"),
-        gsdfSplats = rhi.compute_pipeline("gi/global-sdf-splats.slang", "splatsMain"),
+        gsdfSplats = rhi.compute_pipeline("gi/global-sdf-splats.slang", "staticMain"),
+        gsdfCutReset = rhi.compute_pipeline("gi/global-sdf-splats.slang", "cutResetMain"),
+        gsdfCutList = rhi.compute_pipeline("gi/global-sdf-splats.slang", "cutListMain"),
+        gsdfDynamic = rhi.compute_pipeline("gi/global-sdf-splats.slang", "dynamicMain"),
         ddgiTrace = rhi.compute_pipeline("gi/ddgi-update.slang", "traceMain"),
         ddgiIrradiance = rhi.compute_pipeline("gi/ddgi-update.slang", "irradianceMain"),
         ddgiDepth = rhi.compute_pipeline("gi/ddgi-update.slang", "depthMain"),
@@ -120,10 +126,11 @@ function gi.addView(ctx, graph, view, t, fx)
         compositionCorner = { 0, 0, 0 }, compositionSize = { 0, 0, 0 },
         gsdfStatic = g.gsdf.static, gsdfHasStatic = ctx.splats and 1 or 0,
     }
-    -- The splats don't move (their instances stay put; what clipping cuts away is only
-    -- not drawn): they go into the static part, baked again only when the volume follows
-    -- the camera to a new place (gi.updateFrame), a cut through their levels of detail as
-    -- ellipsoids. The clear then starts from it every frame.
+    -- The static splats don't move (their instances stay put; what clipping cuts away is
+    -- only not drawn): they go into the static part, baked again only when the volume
+    -- follows the camera to a new place (gi.updateFrame), a cut through their levels of
+    -- detail as ellipsoids. The clear then starts from it every frame. The dynamic ones
+    -- (the effects move and color them) are baked every frame, after the bodies.
     g.staticNodes = {}
     if ctx.splats then
         local toStatic = { gsdfVoxels = g.gsdf.static, gsdfStatic = g.gsdf.voxels, gsdfHasStatic = 0 }
@@ -131,8 +138,11 @@ function gi.addView(ctx, graph, view, t, fx)
             name = "GI global SDF: splats, clear", pipeline = p.gsdfClear, params = { g.gsdfBlock, toStatic },
             threads = { R * R * R, 1, 1 } }
         for _, f in ipairs(ctx.splats) do
-            local params, entries = f.module.globalSdfParams(f.instances)
+            local params, entries = f.module.globalSdfParams(f.instances, f.effects)
             params[#params + 1] = g.gsdfBlock
+            f.gsdfCut = f.gsdfCut or { gsdfCutList = rhi.buffer(gi.GSDF_CUT_CAPACITY * 8), gsdfCutCount = rhi.buffer(16),
+                                       gsdfCutCapacity = gi.GSDF_CUT_CAPACITY }
+            params[#params + 1] = f.gsdfCut
             params[#params + 1] = { gsdfSplatSize = gi.GSDF_SPLAT_SIZE, gsdfVoxels = g.gsdf.static }
             g.staticNodes[#g.staticNodes + 1] = graph:dispatch {
                 name = "GI global SDF: splats " .. f.file, pipeline = p.gsdfSplats, params = params,
@@ -156,6 +166,23 @@ function gi.addView(ctx, graph, view, t, fx)
         local params = { ctx.shadowBlock, g.gsdfBlock, block }
         graph:dispatch { name = "GI global SDF: bodies", pipeline = p.gsdfBodies, params = params,
                          threads = { d.group.capacity, R, 1 } }
+    end
+    g.dynamicNodes = {}
+    for _, f in ipairs(ctx.splats or {}) do
+        if f.hasDynamic then
+            -- The dynamic instances' splats in the cut, listed once; then every frame, those.
+            local params, entries = f.module.globalSdfParams(f.instances, f.effects)
+            params[#params + 1] = g.gsdfBlock
+            params[#params + 1] = f.gsdfCut
+            params[#params + 1] = { gsdfSplatSize = gi.GSDF_DYNAMIC_SPLAT_SIZE }
+            graph:dispatch { name = "GI global SDF: dynamic splats' cut, reset " .. f.file, pipeline = p.gsdfCutReset,
+                             params = params, threads = { 1, 1, 1 }, once = true }
+            graph:dispatch { name = "GI global SDF: dynamic splats' cut " .. f.file, pipeline = p.gsdfCutList,
+                             params = params, threads = { entries, f.instanceCount, 1 }, once = true }
+            g.dynamicNodes[#g.dynamicNodes + 1] = graph:dispatch {
+                name = "GI global SDF: dynamic splats " .. f.file, pipeline = p.gsdfDynamic, params = params,
+                threads = { gi.GSDF_CUT_CAPACITY, 1, 1 }, timed = true }
+        end
     end
     g.gsdfNode = graph:dispatch { name = "GI global SDF: resolve", pipeline = p.gsdfResolve,
                      params = { g.gsdfBlock, { gsdfVolumeOut = g.gsdf.volume } }, threads = { R, R, R }, timed = true }
@@ -308,6 +335,7 @@ function gi.describe(ctx)
     -- The global SDF's clear and resolve (its bake is between them, untimed), the probes'
     -- trace, the cascades with their integration.
     local sdf = (g.gsdfClearNode.gpu_time or 0) + (g.gsdfNode.gpu_time or 0)
+    for _, node in ipairs(g.dynamicNodes) do sdf = sdf + (node.gpu_time or 0) end
     return string.format("GI: SDF %.2f, probes %.2f, cascades %.2f ms", sdf, g.ddgiNode.gpu_time or 0,
         cascades + (g.integrateNode.gpu_time or 0))
 end

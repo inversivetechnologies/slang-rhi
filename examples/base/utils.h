@@ -86,11 +86,13 @@ inline Result createDevice(
     std::vector<Feature> requiredFeatures,
     std::vector<std::pair<std::string, std::string>> preprocessorMacros,
     IDevice** outDevice,
-    std::vector<std::string> slangSearchPaths = {EXAMPLE_DIR}
+    std::vector<std::string> slangSearchPaths = {EXAMPLE_DIR},
+    IAdapter* adapter = nullptr // null: the default one
 )
 {
     DeviceDesc deviceDesc = {};
     deviceDesc.deviceType = deviceType;
+    deviceDesc.adapter = adapter;
 #if SLANG_RHI_DEBUG
     DebugLayerOptions debugLayerOptions;
     debugLayerOptions.coreValidation = true;

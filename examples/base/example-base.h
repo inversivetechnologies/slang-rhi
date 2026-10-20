@@ -850,6 +850,9 @@ static int runExamples(
     getStartMenuGuard().uninstall();
     getCursorMotionGuard().uninstall();
     glfwTerminate();
+    // Ready to run again (a host that restarts on another device).
+    examples.clear();
+    mainExample = nullptr;
 
     return result;
 }

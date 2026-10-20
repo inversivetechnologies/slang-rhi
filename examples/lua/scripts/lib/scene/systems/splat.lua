@@ -7,11 +7,24 @@
 --              "clip": { "mode": "carve" | "keep",
 --                        "shapes": [ { "sphere": r } or { "box": [w, h, d] },
 --                                    with "position", "move" ([x, y, z]: to either side),
---                                    "speed" (radians per second), "spin" (a box's) ] } }
+--                                    "speed" (radians per second), "spin" (a box's) ] },
+--              "effects": [ { "color": [r, g, b] } or { "displace": distance },
+--                           with "sphere" (radius), "strength" (color: how much),
+--                           "position", "move", "speed" as the clip shapes',
+--                           "orbit" (a circle's radius, about y), "orbitSpeed" ],
+--              "dynamic": true / false (default: whether it has effects) }
 --
 -- The entity's position is where the splats' center goes, its yaw turns them about it
 -- (splats only turn about the vertical), its scale scales them. Entities with the same file
--- share one renderer and draw as its instances, in one set of passes.
+-- share one renderer and draw as its instances, in one set of passes: the first entity's
+-- clip holds for them all, and all their effects (shaders/splat/effect-field.slang: colored or
+-- pushed away inside moving spheres) are one list. Clip shapes and effects are placed in
+-- the world, not by the entity.
+--
+-- Static and dynamic splats: the effects move and color only the dynamic entities' splats
+-- (in view, in their shadows, in the GI's global SDF), wherever the effects reach. The
+-- static ones stay as captured, so what is made of them can be kept: the global SDF bakes
+-- them only when its volume moves, and the effects leave them as they are.
 
 local T = rhi.include("lib/scene/transform.lua")
 
@@ -25,9 +38,28 @@ local system = {
             spacing = { "number", 4 },
             turn = { "number", 0 },
             clip = { "object" },
+            effects = { "array" },
+            dynamic = { "boolean" },
         },
     },
 }
+
+-- An effects list in effect-field.slang's layout.
+local function effectShapes(effects, where, into)
+    for i, e in ipairs(effects) do
+        local p, m = e.position or { 0, 0, 0 }, e.move or { 0, 0, 0 }
+        local kind, color, strength
+        if e.color then
+            kind, color, strength = 0, e.color, e.strength or 1
+        elseif e.displace then
+            kind, color, strength = 1, { 0, 0, 0 }, e.displace
+        else
+            error(string.format("%s.effects[%d]: \"color\" or \"displace\"", where, i), 0)
+        end
+        into[#into + 1] = { p[1], p[2], p[3], kind, color[1], color[2], color[3], e.sphere or 1,
+                            m[1], m[2], m[3], e.speed or 0, e.orbit or 0, e.orbitSpeed or 0, strength, 0 }
+    end
+end
 
 -- A clip component's shapes in clip.slang's layout.
 local function clipShapes(clip, where)
@@ -71,6 +103,9 @@ function system.load(ctx)
         local list = {}
         for _, e in ipairs(f.entities) do
             local s = e.splat
+            local dynamic = s.dynamic
+            if dynamic == nil then dynamic = s.effects ~= nil and #s.effects > 0 end
+            f.hasDynamic = f.hasDynamic or dynamic
             local scale = e.transform.scale * (s.fit > 0 and s.fit / bounds.radius or 1)
             local yaw = T.yawOf(e.transform.rotation)
             local nx, nz = math.max(1, math.floor(s.grid[1])), math.max(1, math.floor(s.grid[2]))
@@ -83,14 +118,20 @@ function system.load(ctx)
                     local cy, sy = math.cos(turn), math.sin(turn)
                     local sc = { c[1] * scale, c[2] * scale, c[3] * scale }
                     local turned = { cy * sc[1] + sy * sc[3], sc[2], -sy * sc[1] + cy * sc[3] }
-                    list[#list + 1] = { position = { at[1] - turned[1], at[2] - turned[2], at[3] - turned[3] }, yaw = turn, scale = scale }
+                    list[#list + 1] = { position = { at[1] - turned[1], at[2] - turned[2], at[3] - turned[3] }, yaw = turn, scale = scale,
+                                        dynamic = dynamic }
                 end
             end
             if s.clip and not f.clip then
                 local mode = s.clip.mode == "keep" and 2 or 1
                 f.clip = f.module.clipBlock(mode, clipShapes(s.clip, ctx.world:name(e.id) .. ".splat"))
             end
+            if s.effects then
+                f.effectShapes = f.effectShapes or {}
+                effectShapes(s.effects, ctx.world:name(e.id) .. ".splat", f.effectShapes)
+            end
         end
+        if f.effectShapes then f.effects = f.module.effectsBlock(f.effectShapes) end
         f.instances, f.instanceCount = f.module.instanceBlock(list)
     end
     ctx.splats = order
@@ -112,6 +153,7 @@ function system.addShadowPasses(ctx, graph)
             instances = f.instances,
             instanceCount = f.instanceCount,
             clip = f.clip,
+            effects = f.effects,
             clearMaps = i == 1,
         })
     end
@@ -126,11 +168,13 @@ function system.addSurfaces(ctx, graph, view)
             instances = f.instances,
             instanceCount = f.instanceCount,
             clip = f.clip,
+            effects = f.effects,
             lighting = { ctx.light, ctx.shadowBlock },
             gi = view.splatGiParams, -- the renderer's, with SSGI on
             target = view.targets.splatColor,
             clear = i == 1 and { 0, 0, 0, 0 } or nil,
             depthBlend = view.targets.splatDepthBlend, -- blended, resolved into splatDepth
+            motion = view.targets.splatMotion, -- and their motion, blended alike (for TAA)
             depthResolved = view.targets.splatDepth,
             depthClear = i == 1,
             budgetScale = view.budgetScale,

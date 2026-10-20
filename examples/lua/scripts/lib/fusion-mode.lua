@@ -41,6 +41,7 @@
 --   other keys      as in the scene
 
 local sdf = rhi.include("lib/sdf.lua")
+local settings = rhi.include("lib/settings.lua") -- the controls (look sensitivity)
 
 -- The second camera's square: its side, as a fraction of the window's height, and its
 -- margin from the window's corner. 0.3125 is exact in binary, so the side computed here
@@ -348,8 +349,9 @@ return function(scene, splat, setTitle)
 
     function fusion.on_mouse_move(x, y)
         if not drag then return end
-        orbit.yaw = orbit.yaw - (x - drag[1]) * 0.008
-        orbit.pitch = math.max(0.02, math.min(1.45, orbit.pitch + (y - drag[2]) * 0.008))
+        local dx, dy = settings.mouseLook(x - drag[1], y - drag[2]) -- the controls' sensitivity
+        orbit.yaw = orbit.yaw - dx * 0.008
+        orbit.pitch = math.max(0.02, math.min(1.45, orbit.pitch + dy * 0.008))
         drag = { x, y }
         blocks.view.camera = scene.orbitCamera(orbit)
     end

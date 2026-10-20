@@ -25,6 +25,7 @@
 #include "splat-common.slang"
 #include "ply.slang"
 #include "clip.slang"
+#include "effect-field.slang"
 
 // Bins 1 .. kLodBins - 1 hold sizes from 2^kLodMinLog2 up, kLodBinsPerOctave per doubling.
 // Bin 0: the file's splats (always small enough). kLodBins: the root's parent (never).
@@ -103,13 +104,16 @@ uint lodBin(LodView v, float4 bounds)
         return kLodBins - 1; // around the viewer: as large as can be
     }
     float size = radius * v.focal / distance;
-    if (v.cull != 0 && lodOutside(v, center, radius))
+    // Off screen only if the effects can't move any of it into view (dynamic instances).
+    float reach = placementDynamic ? effectReach(center, radius) : 0.0;
+    if (v.cull != 0 && lodOutside(v, center, radius + reach))
     {
         size *= kLodOffscreen;
     }
     // Both of these keep sizes from growing parent to child: a sphere inside one wholly
     // cut away is cut away too, and one across the surface lies in a parent across it.
-    uint clipClass = clipClassify(center, radius);
+    // Widened as above, by how far the effects may move its splats.
+    uint clipClass = clipClassify(center, radius + reach);
     if (clipClass == 2)
     {
         size *= kLodOffscreen;
