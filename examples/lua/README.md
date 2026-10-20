@@ -126,11 +126,11 @@ and the shaders' `time` stops, so everything animated by it holds still too.
 | --- | --- | --- |
 | Resolution | the monitor's video modes from 800 x 600 | the window's size; with fullscreen, the monitor's video mode |
 | Fullscreen | Off, On | fullscreen on the primary monitor, at the resolution |
-| Max splats | 250,000 .. 2,000,000 | the splats' budget: the levels of detail fit what is drawn to it (a scene's own `splatBudget`, if lower, still holds) |
+| Max splats | 250,000 .. 6,000,000 | the splats' budget (1,500,000 by default): the levels of detail fit what is drawn to it (a scene's own `splatBudget`, if lower, still holds). The per-splat buffers and the sort are sized for it, a power of two of at least 2^21 (about 0.5 GB at 6M); a budget past them reloads the script or the scene |
 | Shadow quality | Low (256), Medium (512), High (1024), Ultra (2048) | the shadow maps' texels per cube face; the scene (or script) is loaded again with them |
 | Ambient occlusion | GTAO, Off, SSAO | [GTAO or SSAO](#ambient-occlusion-and-indirect-light): darker where surfaces are close to others; GTAO by default. With radiance cascades, the AO is theirs (any setting but Off) |
 | Global illumination | Radiance cascades, Off, SSGI | light bounced from the surfaces around: [radiance cascades](#radiance-cascades-gi) (the default: no screen-space history) or [SSGI](#ambient-occlusion-and-indirect-light) |
-| Effects quality | Half, Mixed, Full | the resolution SSAO and SSGI are computed at: both at half; AO at full and GI at half; both at full |
+| Effects quality | Half, Mixed, Full | the resolution the AO and GI are computed at: both at half (the default); AO at full and GI at half; both at full. For radiance cascades, the probe spacing: 8 pixels at Half, 4 otherwise |
 | Temporal AA | On, Off | the main view's image stabilized over frames ([splat stability](#splat-stability)) |
 
 Each script shows the settings it has:

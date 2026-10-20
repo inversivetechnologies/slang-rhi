@@ -86,8 +86,10 @@ float4 unpackGi(uint v)
     return float4(r * r * 4.0, float(v >> 24) / 255.0);
 }
 
+// 256 a group: one thread per slot, up to 2^23 of them, in at most 32768 groups (the
+// limit is 65535).
 [shader("compute")]
-[numthreads(64, 1, 1)]
+[numthreads(256, 1, 1)]
 void lightSplatsMain(uint3 tid: SV_DispatchThreadID)
 {
     uint slot = tid.x;

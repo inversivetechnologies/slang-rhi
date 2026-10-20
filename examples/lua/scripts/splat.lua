@@ -21,5 +21,6 @@ function on_scroll(x, y) splat.on_scroll(x, y) end
 rhi.include("lib/pause.lua").install {
     only = { "resolution", "fullscreen", "splatBudget" },
     onPause = function(paused) splat.setPaused(paused) end,
-    apply = function(values) splat.setBudget(values.splatBudget) end,
+    -- More than the buffers were made for: made again, the script reloaded.
+    apply = function(values) if splat.setBudget(values.splatBudget) then rhi.reload() end end,
 }

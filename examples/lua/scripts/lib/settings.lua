@@ -19,14 +19,14 @@ local settings = {}
 
 settings.SHADOW_QUALITIES = { "Low", "Medium", "High", "Ultra" }
 settings.SHADOW_FACE_SIZES = { Low = 256, Medium = 512, High = 1024, Ultra = 2048 }
-settings.SPLAT_BUDGETS = { 250000, 500000, 1000000, 1500000, 2000000 }
+settings.SPLAT_BUDGETS = { 250000, 500000, 1000000, 1500000, 2000000, 3000000, 4000000, 6000000 }
 settings.EFFECT_QUALITIES = { "Half", "Mixed", "Full" }
 settings.AO_METHODS = { "Off", "SSAO", "GTAO" }
 settings.GI_METHODS = { "Off", "SSGI", "Cascades" }
 
 local DEFAULTS = {
     fullscreen = false,
-    splatBudget = 1000000,
+    splatBudget = 1500000,
     shadowQuality = "Medium",
     ambientOcclusion = "GTAO",
     globalIllumination = "Cascades",
@@ -56,6 +56,7 @@ function settings.load()
             end
         end
     end
+    if type(values.splatBudget) ~= "number" then values.splatBudget = DEFAULTS.splatBudget end
     if not settings.SHADOW_FACE_SIZES[values.shadowQuality] then values.shadowQuality = DEFAULTS.shadowQuality end
     local known = false
     for _, q in ipairs(settings.EFFECT_QUALITIES) do known = known or q == values.effectsQuality end
@@ -63,9 +64,9 @@ function settings.load()
     -- Files from before the AO methods have `ssao` on or off: off stays off.
     if values.ssao == false and not (saved and saved.ambientOcclusion) then values.ambientOcclusion = "Off" end
     values.ssao = nil
-    -- And `ssgi` on or off: on is SSGI.
+    -- And `ssgi` on or off: on is the default method (radiance cascades), off stays off.
     if saved and saved.globalIllumination == nil and saved.ssgi ~= nil then
-        values.globalIllumination = saved.ssgi and "SSGI" or "Off"
+        values.globalIllumination = saved.ssgi and DEFAULTS.globalIllumination or "Off"
     end
     values.ssgi = nil
     known = false

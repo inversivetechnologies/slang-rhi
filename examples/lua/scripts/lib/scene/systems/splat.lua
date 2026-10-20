@@ -62,8 +62,10 @@ function system.load(ctx)
 
     for _, f in ipairs(order) do
         f.module = rhi.include("lib/splat-mode.lua")(function() end, f.file)
+        -- The scene's own budget, if lower than the settings' (the module's at first), before
+        -- the buffers are made: they are sized by it.
+        if ctx.settings.splatBudget then f.module.setBudget(math.min(ctx.settings.splatBudget, f.module.budget())) end
         f.module.createResources()
-        if ctx.settings.splatBudget then f.module.setBudget(ctx.settings.splatBudget) end
         local bounds = f.module.bounds()
         local c = bounds.center
         local list = {}

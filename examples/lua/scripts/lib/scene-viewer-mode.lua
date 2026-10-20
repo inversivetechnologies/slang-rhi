@@ -56,13 +56,16 @@ return function(setTitle, order)
         return { overlays, menu }
     end
 
-    -- The settings that a loaded scene takes.
+    -- The settings that a loaded scene takes. True if a budget is more than its splats'
+    -- buffers were made for (the scene is then loaded again).
     local function applyToScene()
-        if not current then return end
+        if not current then return false end
+        local again = false
         for _, f in ipairs(current.ctx.splats or {}) do
             local own = current.ctx.settings.splatBudget
-            f.module.setBudget(own and math.min(own, values.splatBudget) or values.splatBudget)
+            again = f.module.setBudget(own and math.min(own, values.splatBudget) or values.splatBudget) or again
         end
+        return again
     end
 
     local function updateTitle()
@@ -125,7 +128,7 @@ return function(setTitle, order)
                 if name == "resolution" or name == "fullscreen" then
                     displayPending = true
                 elseif name == "splatBudget" then
-                    applyToScene()
+                    if applyToScene() then load(index) end
                 elseif name == "shadowQuality" then
                     scenes.renderer.shadowFaceSize = settings.SHADOW_FACE_SIZES[values.shadowQuality]
                     load(index) -- the shadow maps are part of the scene's graph

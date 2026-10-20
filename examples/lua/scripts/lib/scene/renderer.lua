@@ -85,10 +85,10 @@ renderer.captureMain = false
 renderer.taa = true
 
 -- Screen-space effects on every view (post/ssao.slang): ambient occlusion (by `aoMethod`,
--- "GTAO" or "SSAO") and indirect light, at a quality: "Half" (both at half resolution),
--- "Mixed" (AO at full, GI at half) or "Full". The settings change them, for the graphs
--- built after.
-renderer.effects = { ao = true, aoMethod = "GTAO", gi = false, quality = "Half" }
+-- "GTAO" or "SSAO") and global illumination (by `giMethod`, "SSGI" or "Cascades"), at a
+-- quality: "Half" (both at half resolution), "Mixed" (AO at full, GI at half) or "Full".
+-- The settings change them, for the graphs built after.
+renderer.effects = { ao = true, aoMethod = "GTAO", gi = true, giMethod = "Cascades", quality = "Half" }
 renderer.EFFECT_PARAMS = {
     aoRadius = 1.0,   -- world units
     aoStrength = 1.6, -- SSAO's: 1 black where fully occluded

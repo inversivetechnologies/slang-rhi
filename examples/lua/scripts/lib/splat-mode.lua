@@ -43,6 +43,8 @@
 --                   only what is inside them / off (shaders/splat/clip.slang)
 --   /               tint the splats by LOD level
 
+local settings = rhi.include("lib/settings.lua")
+
 return function(setTitle, file)
     local splat = { name = "Gaussian Splats" }
     setTitle = setTitle or function(details)
@@ -68,7 +70,12 @@ return function(setTitle, file)
     -- through the tree that draws at most this many splats, over all instances, by their
     -- size as seen from the camera (shaders/splat/lod.slang). The shadows have their own
     -- budget, seen from the light.
-    local CAPACITY = 1 << 21 -- the most splats the buffers hold; the sort's size
+    -- The most splats the buffers hold, and the sort's size: the power of two that holds
+    -- the budget when they are made (createResources), at least MIN_CAPACITY. A larger
+    -- budget after that is held to it until they are made again (setBudget).
+    local MIN_CAPACITY = 1 << 21
+    local MAX_CAPACITY = 1 << 23
+    local capacity
     local SHADOW_CAPACITY = 1 << 20 -- the most the shadow maps draw
     -- The splats' shadow visibility, smoothed per splat across frames (splat/lighting.slang):
     -- the new frame's share, and the most splat-instances the history holds.
@@ -78,7 +85,8 @@ return function(setTitle, file)
     local MIN_BUDGET = 50000
     local CAMERA_FINEST = 0.5 -- pixels
     local SHADOW_FINEST = 1.0 -- shadow map texels
-    local budget = 1000000
+    -- At first the saved settings' (the pause menu's "Max splats").
+    local budget = math.max(MIN_BUDGET, math.min(MAX_CAPACITY, settings.load().splatBudget))
     local function shadowBudget() return math.min(SHADOW_CAPACITY, budget // 2) end
     -- Views drawn with a share of the budget (addPasses' budgetScale): { block, scale }.
     local scaledBudgets = {}
@@ -213,11 +221,13 @@ return function(setTitle, file)
         camera.target = center
         camera.distance = math.max(0.5, ply.radius * 3.0)
 
+        capacity = MIN_CAPACITY
+        while capacity < budget do capacity = capacity * 2 end
         resources = {
             ply = ply,
             center = center,
             radius = ply.radius,
-            sortCount = CAPACITY,
+            sortCount = capacity,
             entries = entries,
             -- Levels of detail: the budget's histogram and pick (shaders/splat/lod.slang).
             lodClear = rhi.compute_pipeline("splat/lod.slang", "lodClearMain"),
@@ -246,11 +256,11 @@ return function(setTitle, file)
             casters = rhi.buffer(entries * 48), -- three float4s per splat, merged ones included
             shadowList = rhi.buffer(SHADOW_CAPACITY * 8), -- the splats (and instances) the shadow passes draw
             shadowCount = rhi.buffer(16),
-            -- Per drawn splat: up to CAPACITY of them.
-            projected = rhi.buffer(CAPACITY * 48), -- sizeof(ProjectedSplat)
-            drawnSplats = rhi.buffer(CAPACITY * 8),
-            sortKeys = rhi.buffer(CAPACITY * 4),
-            sortValues = rhi.buffer(CAPACITY * 4),
+            -- Per drawn splat: up to capacity of them.
+            projected = rhi.buffer(capacity * 48), -- sizeof(ProjectedSplat)
+            drawnSplats = rhi.buffer(capacity * 8),
+            sortKeys = rhi.buffer(capacity * 4),
+            sortValues = rhi.buffer(capacity * 4),
             drawCount = rhi.buffer(16), -- [0]: the splats drawn this frame
         }
         -- The tree (or placeholders if there is none), and the budget's histogram and pick.
@@ -325,11 +335,15 @@ return function(setTitle, file)
         return rhi.params { clipMode = mode, clipShapes = rhi.buffer(floats), clipShapeCount = #shapes }
     end
 
-    -- The splat budget (the most splats drawn per view), as , and . set it.
+    -- The splat budget (the most splats drawn per view), as , and . set it. Before
+    -- createResources, it also sizes the buffers; after, it is held to what they hold, and
+    -- this returns true if `splats` is more: the caller makes them again for it (a new
+    -- graph: lib/pause.lua's scripts reload, the scene viewer loads the scene again).
     function splat.setBudget(splats)
-        splat.createResources()
-        budget = math.max(MIN_BUDGET, math.min(CAPACITY, math.floor(splats)))
-        updateBudgets()
+        local wanted = math.max(MIN_BUDGET, math.min(MAX_CAPACITY, math.floor(splats)))
+        budget = capacity and math.min(capacity, wanted) or wanted
+        if blocks.lod then updateBudgets() end
+        return capacity ~= nil and wanted > capacity
     end
 
     -- A view option as a list of blocks: one block, a list of them (a plain table with an
@@ -819,7 +833,7 @@ return function(setTitle, file)
             splatScale = math.max(0.05, splatScale / 1.1)
         elseif key == keys.COMMA or key == keys.PERIOD then
             local factor = key == keys.PERIOD and 1.25 or 1 / 1.25
-            budget = math.max(MIN_BUDGET, math.min(CAPACITY, math.floor(budget * factor + 0.5)))
+            budget = math.max(MIN_BUDGET, math.min(capacity, math.floor(budget * factor + 0.5)))
             updateBudgets()
             updateTitle()
             return

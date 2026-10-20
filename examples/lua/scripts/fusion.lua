@@ -20,5 +20,6 @@ function on_resize(width, height) fusion.on_resize(width, height) end
 -- Escape: the pause menu (lib/pause.lua): resume, settings, quit.
 rhi.include("lib/pause.lua").install {
     only = { "resolution", "fullscreen", "splatBudget", "shadowQuality" },
-    apply = function(values) splat.setBudget(values.splatBudget) end,
+    -- More than the buffers were made for: made again, the script reloaded.
+    apply = function(values) if splat.setBudget(values.splatBudget) then rhi.reload() end end,
 }
